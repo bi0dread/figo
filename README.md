@@ -134,6 +134,16 @@ func main() {
 ```text
 field:[operation:value,operation:value]|operator|field:[operation:value]|...
 ```
+## DSL Syntax
+
+The DSL syntax allows you to define query filters dynamically:
+
+- **Field Filters**: `field:[operation:value]`
+- **Logical Operations**: Combine filters using `and`, `or`, and `not`.
+- **Sorting**: `sort:[field=desc&field2=asc]`
+- **Pagination**: `page:[skip=0&take=10]`
+- **Preloading Relations**: `load:[relation1&relation2]`
+
 * Examples
 ```text
 
@@ -161,6 +171,25 @@ Complex Filters
 
     id:[eq:9,or,eq:10]|or|status:[eq:active]|and|price:[gte:100]|or|category:[in:electronics&home_appliances]
 ```
+## Supported Operations
+
+| Operation     | DSL Example                | Description             |
+|---------------|----------------------------|-------------------------|
+| `eq`          | `field:[eq:value]`         | Equals                  |
+| `gt`          | `field:[gt:value]`         | Greater Than            |
+| `gte`         | `field:[gte:value]`        | Greater Than or Equal   |
+| `lt`          | `field:[lt:value]`         | Less Than               |
+| `lte`         | `field:[lte:value]`        | Less Than or Equal      |
+| `neq`         | `field:[neq:value]`        | Not Equal               |
+| `in`          | `field:[in:value1&value2]` | Value in List           |
+| `notIn`       | `field:[notIn:value1&value2]` | Value not in List   |
+| `like`        | `field:[like:value]`       | Like (Partial Match)    |
+| `notLike`     | `field:[notLike:value]`    | Not Like                |
+| `between`     | `field:[between:val1&val2]`| Between Range           |
+| `and`         | `and`                      | Logical AND             |
+| `or`          | `or`                       | Logical OR              |
+| `not`         | `not`                      | Logical NOT             |
+
 # Extensibility
 * You can extend the package to support custom operations or additional parsing logic. Modify the operatorParser method for parsing custom DSL extensions.
 
