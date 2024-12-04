@@ -55,16 +55,16 @@ type filter struct {
 	Values     any
 	Field      string
 	Children   []*filter
-	Paretn     *filter
+	Parent     *filter
 }
 
 func New() Figo {
 	f := &figo{filters: make([]filter, 0), page: Page{
 		Skip: 0,
 		Take: 20,
-	}, preloads: make([]any, 0), mainFilter: &filter{}, banFields: map[string]bool{}}
+	}, preloads: make(map[string][]clause.Expression), mainFilter: &filter{}, banFields: map[string]bool{}}
 
-	currentParentFilter = &filter{Paretn: nil}
+	currentParentFilter = &filter{Parent: nil}
 	f.mainFilter = currentParentFilter
 
 	return f
@@ -77,7 +77,7 @@ type Figo interface {
 	GetBanFields() map[string]bool
 	GetMainFilter() *filter
 	GetClauses() []clause.Expression
-	GetPreloads() []any
+	GetPreloads() map[string][]clause.Expression
 	GetPage() Page
 	Apply(trx *gorm.DB) *gorm.DB
 	Build()
@@ -87,7 +87,7 @@ type figo struct {
 	filters    []filter
 	clauses    []clause.Expression
 	mainFilter *filter
-	preloads   []any
+	preloads   map[string][]clause.Expression
 	page       Page
 	banFields  map[string]bool
 }
@@ -110,10 +110,9 @@ func (f *figo) Apply(trx *gorm.DB) *gorm.DB {
 	trx = trx.Limit(f.GetPage().Take)
 	trx = trx.Offset(f.GetPage().Skip)
 
-	// TODO uncomment
-	/*	for _, preload := range f.preloads {
-		trx = trx.Preload((preload).(string))
-	}*/
+	for k, v := range f.preloads {
+		trx = trx.Preload(k, v)
+	}
 
 	trx = trx.Clauses(f.GetClauses()...)
 
@@ -125,7 +124,7 @@ func (f *figo) GetPage() Page {
 	return f.page
 }
 
-func (f *figo) GetPreloads() []any {
+func (f *figo) GetPreloads() map[string][]clause.Expression {
 
 	return f.preloads
 }
@@ -146,11 +145,70 @@ func (f *figo) GetClauses() []clause.Expression {
 }
 
 func (f *figo) AddFiltersFromString(input string) {
-	sectionSplit := strings.Split(input, "|")
-	for _, section := range sectionSplit {
-		f.operatorParser(section)
 
+	xx := strings.Split(input, "load:")
+	if len(xx) == 1 {
+		sectionSplit := strings.Split(xx[0], "|")
+		for _, section := range sectionSplit {
+			f.operatorParser(section)
+
+		}
+	} else {
+
+		var mainSectionSplit []string
+
+		for i, s := range xx {
+
+			if i == 0 {
+				mainSectionSplit = append(mainSectionSplit, strings.Split(s, "|")...)
+			} else {
+				loadScope := splitIgnoringLoadScope(s)
+
+				result := strings.Replace(s, loadScope, "", -1)
+				loadScope = "load:" + loadScope
+
+				sectionSplit := strings.Split(result, "|")
+				sectionSplit = append(sectionSplit, loadScope)
+
+				mainSectionSplit = append(mainSectionSplit, sectionSplit...)
+			}
+
+		}
+
+		for _, section := range mainSectionSplit {
+			f.operatorParser(section)
+
+		}
 	}
+
+}
+
+func splitIgnoringLoadScope(input string) string {
+
+	firstFindIndex := 0
+	firstFind := false
+
+	findCount := 0
+
+	for i, v := range input {
+		if v == '[' {
+
+			if !firstFind {
+				firstFindIndex = i
+				firstFind = true
+
+			}
+			findCount++
+		} else if v == ']' {
+			findCount--
+		}
+
+		if findCount == 0 {
+			return input[firstFindIndex : i+1]
+		}
+	}
+
+	return ""
 
 }
 
@@ -162,7 +220,7 @@ func (f *figo) AddFilter(opt Operation, exp clause.Expression) {
 	fx := filter{}
 	fx.Expression = append(fx.Expression, exp)
 	fx.Operation = opt
-	fx.Paretn = f.mainFilter
+	fx.Parent = f.mainFilter
 
 	switch v := exp.(type) {
 	case clause.Eq:
@@ -232,13 +290,24 @@ func (f *figo) operatorParser(str string) {
 				}),
 				Values: fieldValue,
 				Field:  field,
-				Paretn: currentParentFilter,
+				Parent: currentParentFilter,
 			}
 
 			currentParentFilter.Children = append(currentParentFilter.Children, &fx)
 
 		} else if field == string(OperationLoad) {
-			f.preloads = append(f.preloads, f.makeArrayFromString(fieldValue)...)
+
+			preloadsParts := strings.Split(fieldValue, ":")
+			preload := preloadsParts[0]
+			conditions := strings.Join(preloadsParts[1:], ":")
+
+			tempFigo := New()
+			tempFigo.AddFiltersFromString(conditions)
+			tempFigo.Build()
+
+			f.preloads[preload] = tempFigo.GetClauses()
+
+			//f.preloads = append(f.preloads, f.makeArrayFromString(fieldValue)...)
 		} else if field == string(OperationPage) {
 			v := f.makeArrayFromString(fieldValue)
 
@@ -280,7 +349,7 @@ func (f *figo) operatorParser(str string) {
 							}),
 							Values: operatorValue,
 							Field:  field,
-							Paretn: currentParentFilter,
+							Parent: currentParentFilter,
 						}
 
 						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
@@ -295,7 +364,7 @@ func (f *figo) operatorParser(str string) {
 							}),
 							Values: operatorValue,
 							Field:  field,
-							Paretn: currentParentFilter,
+							Parent: currentParentFilter,
 						}
 
 						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
@@ -310,7 +379,7 @@ func (f *figo) operatorParser(str string) {
 							}),
 							Values: operatorValue,
 							Field:  field,
-							Paretn: currentParentFilter,
+							Parent: currentParentFilter,
 						}
 
 						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
@@ -325,7 +394,7 @@ func (f *figo) operatorParser(str string) {
 							})),
 							Values: operatorValue,
 							Field:  field,
-							Paretn: currentParentFilter,
+							Parent: currentParentFilter,
 						}
 
 						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
@@ -340,7 +409,7 @@ func (f *figo) operatorParser(str string) {
 							}),
 							Values: operatorValue,
 							Field:  field,
-							Paretn: currentParentFilter,
+							Parent: currentParentFilter,
 						}
 
 						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
@@ -355,7 +424,7 @@ func (f *figo) operatorParser(str string) {
 							}),
 							Values: operatorValue,
 							Field:  field,
-							Paretn: currentParentFilter,
+							Parent: currentParentFilter,
 						}
 
 						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
@@ -370,7 +439,7 @@ func (f *figo) operatorParser(str string) {
 							}),
 							Values: operatorValue,
 							Field:  field,
-							Paretn: currentParentFilter,
+							Parent: currentParentFilter,
 						}
 
 						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
@@ -385,7 +454,7 @@ func (f *figo) operatorParser(str string) {
 							}),
 							Values: operatorValue,
 							Field:  field,
-							Paretn: currentParentFilter,
+							Parent: currentParentFilter,
 						}
 
 						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
@@ -400,7 +469,7 @@ func (f *figo) operatorParser(str string) {
 							}),
 							Values: "%" + operatorValue + "%",
 							Field:  field,
-							Paretn: currentParentFilter,
+							Parent: currentParentFilter,
 						}
 
 						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
@@ -415,7 +484,7 @@ func (f *figo) operatorParser(str string) {
 							})),
 							Values: operatorValue,
 							Field:  field,
-							Paretn: currentParentFilter,
+							Parent: currentParentFilter,
 						}
 
 						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
@@ -432,7 +501,7 @@ func (f *figo) operatorParser(str string) {
 								}),
 								Values: v[0],
 								Field:  field,
-								Paretn: currentParentFilter,
+								Parent: currentParentFilter,
 							}
 
 							fxLte := filter{
@@ -444,7 +513,7 @@ func (f *figo) operatorParser(str string) {
 								}),
 								Values: v[1],
 								Field:  field,
-								Paretn: currentParentFilter,
+								Parent: currentParentFilter,
 							}
 
 							currentParentFilter.Children = append(currentParentFilter.Children, &fxGte)
@@ -461,18 +530,18 @@ func (f *figo) operatorParser(str string) {
 					if action == string(OperationAnd) {
 
 						gg := &filter{Operation: OperationAnd}
-						gg.Paretn = currentParentFilter
+						gg.Parent = currentParentFilter
 						currentParentFilter.Children = append(currentParentFilter.Children, gg)
 						currentParentFilter = gg
 
 					} else if action == string(OperationOr) {
 						gg := &filter{Operation: OperationOr}
-						gg.Paretn = currentParentFilter
+						gg.Parent = currentParentFilter
 						currentParentFilter.Children = append(currentParentFilter.Children, gg)
 						currentParentFilter = gg
 					} else if action == string(OperationNot) {
 						gg := &filter{Operation: OperationNot}
-						gg.Paretn = currentParentFilter
+						gg.Parent = currentParentFilter
 						currentParentFilter.Children = append(currentParentFilter.Children, gg)
 						currentParentFilter = gg
 					}
@@ -488,17 +557,17 @@ func (f *figo) operatorParser(str string) {
 		if str == string(OperationOr) {
 
 			fx := &filter{Operation: OperationOr}
-			fx.Paretn = currentParentFilter
+			fx.Parent = currentParentFilter
 			currentParentFilter.Children = append(currentParentFilter.Children, fx)
 			currentParentFilter = fx
 		} else if str == string(OperationAnd) {
 			fx := &filter{Operation: OperationAnd}
-			fx.Paretn = currentParentFilter
+			fx.Parent = currentParentFilter
 			currentParentFilter.Children = append(currentParentFilter.Children, fx)
 			currentParentFilter = fx
 		} else if str == string(OperationNot) {
 			fx := &filter{Operation: OperationNot}
-			fx.Paretn = currentParentFilter
+			fx.Parent = currentParentFilter
 			currentParentFilter.Children = append(currentParentFilter.Children, fx)
 			currentParentFilter = fx
 		}
@@ -527,28 +596,28 @@ func (f *figo) recursiveItem(x *filter) {
 			f.recursiveItem(child)
 		}
 
-		if x.Paretn != nil {
+		if x.Parent != nil {
 			if _, ok := f.banFields[x.Field]; !ok {
-				x.Paretn.Expression = append(x.Paretn.Expression, x.Expression...)
+				x.Parent.Expression = append(x.Parent.Expression, x.Expression...)
 			}
 		}
 
 	} else {
-		if x.Paretn != nil {
+		if x.Parent != nil {
 
 			if _, ok := f.banFields[x.Field]; !ok {
-				if x.Paretn.Operation == OperationOr {
+				if x.Parent.Operation == OperationOr {
 
-					x.Paretn.Expression = append(x.Paretn.Expression, clause.Or(x.Expression...))
+					x.Parent.Expression = append(x.Parent.Expression, clause.Or(x.Expression...))
 
-				} else if x.Paretn.Operation == OperationAnd {
-					x.Paretn.Expression = append(x.Paretn.Expression, clause.And(x.Expression...))
+				} else if x.Parent.Operation == OperationAnd {
+					x.Parent.Expression = append(x.Parent.Expression, clause.And(x.Expression...))
 
-				} else if x.Paretn.Operation == OperationNot {
-					x.Paretn.Expression = append(x.Paretn.Expression, clause.Not(x.Expression...))
+				} else if x.Parent.Operation == OperationNot {
+					x.Parent.Expression = append(x.Parent.Expression, clause.Not(x.Expression...))
 
 				} else {
-					x.Paretn.Expression = append(x.Paretn.Expression, x.Expression...)
+					x.Parent.Expression = append(x.Parent.Expression, x.Expression...)
 				}
 			}
 

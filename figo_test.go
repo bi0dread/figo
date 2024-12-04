@@ -41,12 +41,38 @@ func TestApply(t *testing.T) {
 		t.Fatalf("failed to connect database: %v", err)
 	}
 
+	type TestInnerModel1 struct {
+		ID   int
+		Name string
+		XX   int
+	}
+
+	type TestInnerModel2 struct {
+		ID   int
+		Name string
+		XX   int
+	}
+
 	// Define a model
 	type TestModel struct {
 		ID             int
 		VendorID       int
 		BankID         int
 		ExpeditionType string
+		TestInner1     []*TestInnerModel1 `gorm:"foreignKey:XX"`
+		TestInner2     []*TestInnerModel2 `gorm:"foreignKey:XX"`
+	}
+
+	// Create the table
+	err = db.AutoMigrate(&TestInnerModel1{})
+	if err != nil {
+		t.Fatalf("failed to migrate database: %v", err)
+	}
+
+	// Create the table
+	err = db.AutoMigrate(&TestInnerModel2{})
+	if err != nil {
+		t.Fatalf("failed to migrate database: %v", err)
 	}
 
 	// Create the table
@@ -56,12 +82,13 @@ func TestApply(t *testing.T) {
 	}
 
 	// Insert some test data
-	db.Create(&TestModel{ID: 9, VendorID: 22, BankID: 12, ExpeditionType: "eq"})
-	db.Create(&TestModel{ID: 10, VendorID: 22, BankID: 13, ExpeditionType: "eq"})
+	db.Create(&TestModel{ID: 1, VendorID: 22, BankID: 12, ExpeditionType: "eq", TestInner1: []*TestInnerModel1{{XX: 1, ID: 3, Name: "test1"}}})
+	db.Create(&TestModel{ID: 2, VendorID: 22, BankID: 13, ExpeditionType: "eq", TestInner2: []*TestInnerModel2{{XX: 2, ID: 4, Name: "test2"}}})
 
 	f := New()
-	f.AddFiltersFromString("id:[eq:9,or,eq:10]|or|vendorId:[eq:22]|and|bank_id:[gt:11]|or|expedition_type:[eq:eq]")
+	f.AddFiltersFromString("id:[eq:7,or,eq:10]|or|vendorId:[eq:22]|and|bank_id:[gt:11]|or|expedition_type:[eq:eq]|load:[TestInner1:id:[eq:3,or,eq:4]|or|name:[eq:test122]]")
 	f.Build()
+	db = db.Debug()
 	db = f.Apply(db.Model(&TestModel{}))
 
 	var results []TestModel
