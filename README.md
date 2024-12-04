@@ -198,8 +198,7 @@ Complex Filters
 This project is based on original GORM package
 
 ## TODO
-* test
-* preload conditions
+* improvement
 
 ## Contributing
 
