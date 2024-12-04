@@ -74,6 +74,8 @@ type Figo interface {
 	AddFiltersFromString(input string)
 	AddFilter(opt Operation, exp clause.Expression)
 	AddBanFields(fields ...string)
+	GetBanFields() map[string]bool
+	GetMainFilter() *filter
 	GetClauses() []clause.Expression
 	GetPreloads() []any
 	GetPage() Page
@@ -126,6 +128,16 @@ func (f *figo) GetPage() Page {
 func (f *figo) GetPreloads() []any {
 
 	return f.preloads
+}
+
+func (f *figo) GetBanFields() map[string]bool {
+
+	return f.banFields
+}
+
+func (f *figo) GetMainFilter() *filter {
+
+	return f.mainFilter
 }
 
 func (f *figo) GetClauses() []clause.Expression {
