@@ -307,7 +307,6 @@ func (f *figo) operatorParser(str string) {
 
 			f.preloads[preload] = tempFigo.GetClauses()
 
-			//f.preloads = append(f.preloads, f.makeArrayFromString(fieldValue)...)
 		} else if field == string(OperationPage) {
 			v := f.makeArrayFromString(fieldValue)
 
@@ -529,21 +528,21 @@ func (f *figo) operatorParser(str string) {
 
 					if action == string(OperationAnd) {
 
-						gg := &filter{Operation: OperationAnd}
-						gg.Parent = currentParentFilter
-						currentParentFilter.Children = append(currentParentFilter.Children, gg)
-						currentParentFilter = gg
+						andOp := &filter{Operation: OperationAnd}
+						andOp.Parent = currentParentFilter
+						currentParentFilter.Children = append(currentParentFilter.Children, andOp)
+						currentParentFilter = andOp
 
 					} else if action == string(OperationOr) {
-						gg := &filter{Operation: OperationOr}
-						gg.Parent = currentParentFilter
-						currentParentFilter.Children = append(currentParentFilter.Children, gg)
-						currentParentFilter = gg
+						orOp := &filter{Operation: OperationOr}
+						orOp.Parent = currentParentFilter
+						currentParentFilter.Children = append(currentParentFilter.Children, orOp)
+						currentParentFilter = orOp
 					} else if action == string(OperationNot) {
-						gg := &filter{Operation: OperationNot}
-						gg.Parent = currentParentFilter
-						currentParentFilter.Children = append(currentParentFilter.Children, gg)
-						currentParentFilter = gg
+						notOp := &filter{Operation: OperationNot}
+						notOp.Parent = currentParentFilter
+						currentParentFilter.Children = append(currentParentFilter.Children, notOp)
+						currentParentFilter = notOp
 					}
 				}
 
