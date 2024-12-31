@@ -1,6 +1,7 @@
 package figo
 
 import (
+	"fmt"
 	"github.com/gobeam/stringy"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
@@ -11,12 +12,12 @@ import (
 type Operation string
 
 const (
-	OperationEq      Operation = "eq"
-	OperationGt      Operation = "gt"
-	OperationGte     Operation = "gte"
-	OperationLt      Operation = "lt"
-	OperationLte     Operation = "lte"
-	OperationNeq     Operation = "ne"
+	OperationEq      Operation = "="
+	OperationGt      Operation = ">"
+	OperationGte     Operation = ">="
+	OperationLt      Operation = "<"
+	OperationLte     Operation = "<="
+	OperationNeq     Operation = "!="
 	OperationNot     Operation = "not"
 	OperationLike    Operation = "like"
 	OperationNotLike Operation = "notLike"
@@ -28,13 +29,45 @@ const (
 	OperationSort    Operation = "sort"
 	OperationLoad    Operation = "load"
 	OperationPage    Operation = "page"
+	OperationChild   Operation = "----"
 )
-
-var currentParentFilter *filter
 
 type Page struct {
 	Skip int
 	Take int
+}
+
+type Figo interface {
+	AddFiltersFromString(input string)
+	AddFilter(exp clause.Expression)
+	AddIgnoreFields(fields ...string)
+	AddSelectFields(fields ...string)
+	GetIgnoreFields() map[string]bool
+	GetSelectFields() map[string]bool
+	GetClauses() []clause.Expression
+	GetPreloads() map[string][]clause.Expression
+	GetPage() Page
+	Apply(trx *gorm.DB) *gorm.DB
+	Build()
+}
+
+type figo struct {
+	clauses      []clause.Expression
+	preloads     map[string][]clause.Expression
+	page         Page
+	sort         clause.Expression
+	ignoreFields map[string]bool
+	selectFields map[string]bool
+	dsl          string
+}
+
+func New() Figo {
+	f := &figo{page: Page{
+		Skip: 0,
+		Take: 20,
+	}, preloads: make(map[string][]clause.Expression), ignoreFields: make(map[string]bool), selectFields: make(map[string]bool), clauses: make([]clause.Expression, 0)}
+
+	return f
 }
 
 func (p *Page) validate() {
@@ -48,65 +81,461 @@ func (p *Page) validate() {
 	}
 }
 
-type filter struct {
-	Type       int
-	Operation  Operation
+type Node struct {
 	Expression []clause.Expression
-	Values     any
+	Operator   Operation
+	Value      string
 	Field      string
-	Children   []*filter
-	Parent     *filter
+	Children   []*Node
+	Parent     *Node
 }
 
-func New() Figo {
-	f := &figo{filters: make([]filter, 0), page: Page{
-		Skip: 0,
-		Take: 20,
-	}, preloads: make(map[string][]clause.Expression), mainFilter: &filter{}, banFields: map[string]bool{}}
+func (f *figo) parseDSL(expr string) *Node {
+	root := &Node{Value: "root", Expression: make([]clause.Expression, 0)}
+	stack := []*Node{root}
+	current := root
 
-	currentParentFilter = &filter{Parent: nil}
-	f.mainFilter = currentParentFilter
+	for i := 0; i < len(expr); {
+		switch expr[i] {
+		case '(':
+			newNode := &Node{Operator: "----", Parent: current}
+			current.Children = append(current.Children, newNode)
+			stack = append(stack, newNode)
+			current = newNode
+			i++
+		case ')':
+			stack = stack[:len(stack)-1]
+			current = stack[len(stack)-1]
+			i++
+		case ' ':
+			i++
+		default:
+			j := i
+			for j < len(expr) && expr[j] != ' ' && expr[j] != '(' && expr[j] != ')' {
+				j++
+			}
+			token := strings.TrimSpace(expr[i:j])
+			if token != "" {
+				if strings.HasPrefix(token, string(OperationSort)) || strings.HasPrefix(token, string(OperationPage)) || strings.HasPrefix(token, string(OperationLoad)) {
+					k := j - 1
+					if strings.HasPrefix(token, string(OperationLoad)) {
+						bracketCount := 1
+						for k < len(expr) && bracketCount > 0 {
 
-	return f
+							if expr[k] == '[' {
+								bracketCount++
+							} else if expr[k] == ']' {
+								bracketCount--
+							}
+							k++
+
+						}
+						k++
+
+						loadLabel := fmt.Sprintf("%v=[", string(OperationLoad))
+
+						v := strings.TrimSpace(expr[i:k])
+						content := v[strings.Index(v, loadLabel)+len(loadLabel) : len(v)-1]
+						if content == "" {
+							i = k
+							continue
+						}
+
+						loadSplit := strings.Split(content, "|")
+						for _, l := range loadSplit {
+							table := l[:strings.Index(l, ":")]
+							loadContent := strings.TrimSpace(l[len(table)+1:])
+
+							loadRootNode := f.parseDSL(loadContent)
+							expressionParser(loadRootNode)
+							loadExpr := getFinalExpr(*loadRootNode)
+							f.preloads[table] = append(f.preloads[table], loadExpr)
+
+						}
+						i = k
+						continue
+
+					} else if strings.HasPrefix(token, string(OperationPage)) {
+
+						pageLabel := fmt.Sprintf("%v=", string(OperationPage))
+						content := token[strings.Index(token, pageLabel)+len(pageLabel):]
+
+						pageContent := strings.Split(content, ",")
+
+						for _, s := range pageContent {
+							pageSplit := strings.Split(s, ":")
+							if len(pageSplit) != 2 {
+								continue
+							}
+
+							field := pageSplit[0]
+							value := pageSplit[1]
+
+							parseInt, parsErr := strconv.ParseInt(value, 10, 64)
+							if parsErr == nil {
+
+								if field == "skip" {
+									f.page.Skip = int(parseInt)
+								} else if field == "take" {
+									f.page.Take = int(parseInt)
+								}
+
+								f.page.validate()
+							}
+
+						}
+
+					} else if strings.HasPrefix(token, string(OperationSort)) {
+
+						sortLabel := fmt.Sprintf("%v=", string(OperationSort))
+						content := token[strings.Index(token, sortLabel)+len(sortLabel):]
+
+						sortContent := strings.Split(content, ",")
+
+						var c []clause.OrderByColumn
+
+						for _, s := range sortContent {
+							sortSplit := strings.Split(s, ":")
+							if len(sortSplit) != 2 {
+								continue
+							}
+
+							field := sortSplit[0]
+							value := sortSplit[1]
+
+							c = append(c, clause.OrderByColumn{
+								Column: clause.Column{
+									Name:  parsFieldsName(field),
+									Table: clause.CurrentTable,
+								},
+								Desc:    strings.ToLower(value) == "desc",
+								Reorder: false,
+							})
+
+						}
+
+						sortExpr := clause.OrderBy{
+							Columns: c,
+						}
+						f.sort = sortExpr
+
+					} else {
+						for k < len(expr) && expr[k] != ' ' && expr[k] != '(' && expr[k] != ')' {
+							k++
+						}
+					}
+
+					i = k
+				} else {
+					operator, value, field := parseToken(token)
+
+					if operator == "" && Operation(value) != OperationAnd && Operation(value) != OperationOr && Operation(value) != OperationNot {
+						i = j
+						continue
+					}
+
+					newNode := &Node{Operator: operator, Value: value, Field: parsFieldsName(field), Parent: current, Expression: make([]clause.Expression, 0)}
+					if Operation(value) == OperationAnd || Operation(value) == OperationOr || Operation(value) == OperationNot {
+						newNode.Operator = Operation(value)
+					} else {
+
+						newNode.Expression = append(newNode.Expression, getClausesFromOperation(operator, parsFieldsName(field), value))
+					}
+					current.Children = append(current.Children, newNode)
+					i = j
+				}
+			} else {
+				i = j
+			}
+		}
+	}
+
+	return root
 }
 
-type Figo interface {
-	AddFiltersFromString(input string)
-	AddFilter(opt Operation, exp clause.Expression)
-	AddBanFields(fields ...string)
-	GetBanFields() map[string]bool
-	GetMainFilter() *filter
-	GetClauses() []clause.Expression
-	GetPreloads() map[string][]clause.Expression
-	GetPage() Page
-	Apply(trx *gorm.DB) *gorm.DB
-	Build()
+func parsFieldsName(str string) string {
+	return stringy.New(str).SnakeCase("?", "").ToLower()
 }
 
-type figo struct {
-	filters    []filter
-	clauses    []clause.Expression
-	mainFilter *filter
-	preloads   map[string][]clause.Expression
-	page       Page
-	banFields  map[string]bool
+func parseToken(token string) (Operation, string, string) {
+	operators := []Operation{OperationGte, OperationLte, OperationNeq, OperationGt, OperationLt, OperationEq}
+	for _, op := range operators {
+		if strings.Contains(token, string(op)) {
+			parts := strings.Split(token, string(op))
+			return op, parts[1], parts[0]
+		}
+	}
+	return "", token, ""
 }
 
-func (f *figo) AddBanFields(fields ...string) {
+func getClausesFromOperation(o Operation, field string, value any) clause.Expression {
+	switch o {
+	case OperationEq:
+		return clause.Eq{Column: field, Value: value}
+	case OperationGte:
+		return clause.Gte{Column: field, Value: value}
+	case OperationGt:
+		return clause.Gt{Column: field, Value: value}
+	case OperationLt:
+		return clause.Lt{Column: field, Value: value}
+	case OperationLte:
+		return clause.Lte{Column: field, Value: value}
+	case OperationNeq:
+		return clause.Neq{Column: field, Value: value}
 
-	for _, field := range fields {
-		f.banFields[field] = true
+	default:
+		return nil
 	}
 
 }
 
-func (f *figo) Build() {
+func expressionParser(node *Node) {
 
-	f.makeClauses()
+	if node.Operator == OperationChild {
+
+		if len(node.Children) == 1 {
+			node.Expression = append(node.Expression, node.Children[0].Expression...)
+		}
+
+		var latestExp clause.Expression
+
+		for i, child := range node.Children {
+			if child.Operator == OperationAnd {
+
+				if latestExp == nil {
+					if i > 0 && len(node.Children[i-1].Expression) > 0 {
+						latestExp = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
+					} else {
+						continue
+					}
+				}
+
+				var v []clause.Expression
+				v = append(v, latestExp)
+
+				if node.Children[i+1].Operator == OperationChild {
+					expressionParser(node.Children[i+1])
+				}
+
+				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
+
+				exp := clause.And(v...)
+				latestExp = exp
+
+				child.Expression = append(child.Expression, exp)
+
+				node.Expression = append(node.Expression, child.Expression...)
+
+			} else if child.Operator == OperationOr {
+				if latestExp == nil {
+					if i > 0 && len(node.Children[i-1].Expression) > 0 {
+						latestExp = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
+					} else {
+						continue
+					}
+				}
+
+				var v []clause.Expression
+				v = append(v, latestExp)
+
+				if node.Children[i+1].Operator == OperationChild {
+					expressionParser(node.Children[i+1])
+				}
+
+				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
+
+				exp := clause.Or(v...)
+				latestExp = exp
+
+				child.Expression = append(child.Expression, exp)
+
+				node.Expression = append(node.Expression, child.Expression...)
+			} else if child.Operator == OperationNot {
+				if latestExp == nil {
+					if i > 0 && len(node.Children[i-1].Expression) > 0 {
+						latestExp = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
+					} else {
+						continue
+					}
+				}
+
+				var v []clause.Expression
+				v = append(v, latestExp)
+
+				if node.Children[i+1].Operator == OperationChild {
+					expressionParser(node.Children[i+1])
+				}
+
+				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
+
+				exp := clause.Not(v...)
+				latestExp = exp
+
+				child.Expression = append(child.Expression, exp)
+
+				node.Expression = append(node.Expression, child.Expression...)
+
+			} else if child.Operator == OperationChild {
+				expressionParser(child)
+			}
+		}
+	} else {
+		var latestExp clause.Expression
+		for i, child := range node.Children {
+
+			if child.Operator == OperationAnd {
+
+				if latestExp == nil {
+					if i > 0 && len(node.Children[i-1].Expression) > 0 {
+						latestExp = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
+					} else {
+						continue
+					}
+				}
+
+				var v []clause.Expression
+				v = append(v, latestExp)
+
+				if node.Children[i+1].Operator == OperationChild {
+					expressionParser(node.Children[i+1])
+				}
+
+				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
+
+				exp := clause.And(v...)
+				latestExp = exp
+
+				child.Expression = append(child.Expression, exp)
+
+			} else if child.Operator == OperationOr {
+				if latestExp == nil {
+					if i > 0 && len(node.Children[i-1].Expression) > 0 {
+						latestExp = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
+					} else {
+						continue
+					}
+				}
+
+				var v []clause.Expression
+				v = append(v, latestExp)
+
+				if node.Children[i+1].Operator == OperationChild {
+					expressionParser(node.Children[i+1])
+				}
+
+				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
+
+				exp := clause.Or(v...)
+				latestExp = exp
+
+				child.Expression = append(child.Expression, exp)
+			} else if child.Operator == OperationNot {
+				if latestExp == nil {
+					if i > 0 && len(node.Children[i-1].Expression) > 0 {
+						latestExp = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
+					} else {
+						continue
+					}
+				}
+
+				var v []clause.Expression
+				v = append(v, latestExp)
+				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
+
+				exp := clause.Not(v...)
+				latestExp = exp
+
+				child.Expression = append(child.Expression, exp)
+			} else if child.Operator == OperationChild {
+				expressionParser(child)
+			}
+		}
+	}
+
+}
+
+func getFinalExpr(node Node) clause.Expression {
+
+	if len(node.Children) == 0 {
+		return nil
+	} else if len(node.Children) == 1 {
+
+		if len(node.Children[0].Expression) == 1 {
+			return node.Children[0].Expression[0]
+		}
+		for i := len(node.Children[0].Expression) - 1; i >= 0; i-- {
+
+			if node.Children[0].Operator == OperationAnd || node.Children[0].Operator == OperationOr || node.Children[0].Operator == OperationNot || node.Children[0].Operator == OperationChild {
+
+				return node.Children[0].Expression[i]
+
+			}
+		}
+
+	} else {
+		for i := len(node.Children) - 1; i >= 0; i-- {
+			if node.Children[i].Operator == OperationAnd || node.Children[i].Operator == OperationOr || node.Children[i].Operator == OperationNot || node.Children[i].Operator == OperationChild {
+				if node.Children[i].Operator == OperationChild {
+					continue
+				}
+				return node.Children[i].Expression[len(node.Children[i].Expression)-1]
+			}
+		}
+	}
+
+	return nil
+
+}
+
+func (f *figo) AddFiltersFromString(input string) {
+
+	f.dsl = input
+}
+
+func (f *figo) AddFilter(exp clause.Expression) {
+	f.clauses = append(f.clauses, exp)
+}
+
+func (f *figo) AddIgnoreFields(fields ...string) {
+
+	for _, field := range fields {
+		f.ignoreFields[field] = true
+	}
+}
+
+func (f *figo) AddSelectFields(fields ...string) {
+
+	for _, field := range fields {
+		f.selectFields[field] = true
+	}
+}
+
+func (f *figo) GetIgnoreFields() map[string]bool {
+
+	return f.ignoreFields
+}
+
+func (f *figo) GetClauses() []clause.Expression {
+
+	return f.clauses
+}
+
+func (f *figo) GetPreloads() map[string][]clause.Expression {
+
+	return f.preloads
+}
+
+func (f *figo) GetPage() Page {
+
+	return f.page
+}
+
+func (f *figo) GetSelectFields() map[string]bool {
+
+	return f.selectFields
 }
 
 func (f *figo) Apply(trx *gorm.DB) *gorm.DB {
-
 	trx = trx.Limit(f.GetPage().Take)
 	trx = trx.Offset(f.GetPage().Skip)
 
@@ -116,526 +545,25 @@ func (f *figo) Apply(trx *gorm.DB) *gorm.DB {
 
 	trx = trx.Clauses(f.GetClauses()...)
 
+	if f.sort != nil {
+		trx = trx.Clauses(f.sort)
+	}
+
 	return trx
 }
 
-func (f *figo) GetPage() Page {
+func (f *figo) Build() {
+	if f.dsl == "" {
+		return
+	}
+	root := f.parseDSL(f.dsl)
+	expressionParser(root)
 
-	return f.page
-}
+	finalExpr := getFinalExpr(*root)
 
-func (f *figo) GetPreloads() map[string][]clause.Expression {
+	if finalExpr != nil {
+		f.clauses = append(f.clauses, finalExpr)
 
-	return f.preloads
-}
-
-func (f *figo) GetBanFields() map[string]bool {
-
-	return f.banFields
-}
-
-func (f *figo) GetMainFilter() *filter {
-
-	return f.mainFilter
-}
-
-func (f *figo) GetClauses() []clause.Expression {
-
-	return f.clauses
-}
-
-func (f *figo) AddFiltersFromString(input string) {
-
-	xx := strings.Split(input, "load:")
-	if len(xx) == 1 {
-		sectionSplit := strings.Split(xx[0], "|")
-		for _, section := range sectionSplit {
-			f.operatorParser(section)
-
-		}
-	} else {
-
-		var mainSectionSplit []string
-
-		for i, s := range xx {
-
-			if i == 0 {
-				mainSectionSplit = append(mainSectionSplit, strings.Split(s, "|")...)
-			} else {
-				loadScope := splitIgnoringLoadScope(s)
-
-				result := strings.Replace(s, loadScope, "", -1)
-				loadScope = "load:" + loadScope
-
-				sectionSplit := strings.Split(result, "|")
-				sectionSplit = append(sectionSplit, loadScope)
-
-				mainSectionSplit = append(mainSectionSplit, sectionSplit...)
-			}
-
-		}
-
-		for _, section := range mainSectionSplit {
-			f.operatorParser(section)
-
-		}
 	}
 
-}
-
-func splitIgnoringLoadScope(input string) string {
-
-	firstFindIndex := 0
-	firstFind := false
-
-	findCount := 0
-
-	for i, v := range input {
-		if v == '[' {
-
-			if !firstFind {
-				firstFindIndex = i
-				firstFind = true
-
-			}
-			findCount++
-		} else if v == ']' {
-			findCount--
-		}
-
-		if findCount == 0 {
-			return input[firstFindIndex : i+1]
-		}
-	}
-
-	return ""
-
-}
-
-func toArray(f clause.Expression) []clause.Expression {
-	return []clause.Expression{f}
-}
-
-func (f *figo) AddFilter(opt Operation, exp clause.Expression) {
-	fx := filter{}
-	fx.Expression = append(fx.Expression, exp)
-	fx.Operation = opt
-	fx.Parent = f.mainFilter
-
-	switch v := exp.(type) {
-	case clause.Eq:
-		fx.Field = v.Column.(clause.Column).Name
-		break
-	case clause.Gt:
-		fx.Field = v.Column.(clause.Column).Name
-		break
-	case clause.Gte:
-		fx.Field = v.Column.(clause.Column).Name
-		break
-	case clause.Like:
-		fx.Field = v.Column.(clause.Column).Name
-		break
-	case clause.Lte:
-		fx.Field = v.Column.(clause.Column).Name
-		break
-	case clause.Lt:
-		fx.Field = v.Column.(clause.Column).Name
-		break
-	case clause.Neq:
-		fx.Field = v.Column.(clause.Column).Name
-		break
-	}
-
-	f.mainFilter.Children = append(f.mainFilter.Children, &fx)
-}
-
-func (f *figo) operatorParser(str string) {
-
-	if strings.Contains(str, ":") {
-		fieldSplit := strings.SplitN(str, ":", 2)
-		field := fieldSplit[0]
-		field = stringy.New(field).SnakeCase("?", "").ToLower()
-		fieldValue := fieldSplit[1]
-
-		if fieldValue[:1] == "[" {
-			fieldValue = fieldValue[1 : len(fieldValue)-1]
-		}
-
-		if field == string(OperationSort) {
-
-			v := f.makeArrayFromString(fieldValue)
-
-			var c []clause.OrderByColumn
-
-			for _, a := range v {
-
-				split := strings.Split(a.(string), "=")
-
-				c = append(c, clause.OrderByColumn{
-					Column: clause.Column{
-						Name:  stringy.New(split[0]).SnakeCase("?", "").ToLower(),
-						Table: clause.CurrentTable,
-					},
-					Desc:    strings.ToLower(split[1]) == "desc",
-					Reorder: false,
-				})
-
-			}
-
-			fx := filter{
-				Type:      0,
-				Operation: OperationSort,
-				Expression: toArray(clause.OrderBy{
-					Columns: c,
-				}),
-				Values: fieldValue,
-				Field:  field,
-				Parent: currentParentFilter,
-			}
-
-			currentParentFilter.Children = append(currentParentFilter.Children, &fx)
-
-		} else if field == string(OperationLoad) {
-
-			preloadsParts := strings.Split(fieldValue, ":")
-			preload := preloadsParts[0]
-			conditions := strings.Join(preloadsParts[1:], ":")
-
-			tempFigo := New()
-			tempFigo.AddFiltersFromString(conditions)
-			tempFigo.Build()
-
-			f.preloads[preload] = tempFigo.GetClauses()
-
-		} else if field == string(OperationPage) {
-			v := f.makeArrayFromString(fieldValue)
-
-			for _, a := range v {
-				split := strings.Split(a.(string), "=")
-
-				item := split[0]
-				value := split[1]
-
-				parseInt, parsErr := strconv.ParseInt(value, 10, 64)
-				if parsErr == nil {
-
-					if item == "skip" {
-						f.page.Skip = int(parseInt)
-					} else if item == "take" {
-						f.page.Take = int(parseInt)
-					}
-
-					f.page.validate()
-				}
-
-			}
-
-		} else {
-			actionSplit := strings.Split(fieldValue, ",")
-			for _, action := range actionSplit {
-				if strings.Contains(action, ":") {
-					operatorSplit := strings.Split(action, ":")
-					operator := operatorSplit[0]
-					operatorValue := operatorSplit[1]
-
-					if operator == string(OperationGt) {
-						fx := filter{
-							Type:      0,
-							Operation: OperationGt,
-							Expression: toArray(clause.Gt{
-								Column: field,
-								Value:  operatorValue,
-							}),
-							Values: operatorValue,
-							Field:  field,
-							Parent: currentParentFilter,
-						}
-
-						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
-
-					} else if operator == string(OperationLt) {
-						fx := filter{
-							Type:      0,
-							Operation: OperationLt,
-							Expression: toArray(clause.Lt{
-								Column: field,
-								Value:  operatorValue,
-							}),
-							Values: operatorValue,
-							Field:  field,
-							Parent: currentParentFilter,
-						}
-
-						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
-
-					} else if operator == string(OperationIn) {
-						fx := filter{
-							Type:      0,
-							Operation: OperationIn,
-							Expression: toArray(clause.IN{
-								Column: field,
-								Values: f.makeArrayFromString(operatorValue),
-							}),
-							Values: operatorValue,
-							Field:  field,
-							Parent: currentParentFilter,
-						}
-
-						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
-
-					} else if operator == string(OperationNotIn) {
-						fx := filter{
-							Type:      0,
-							Operation: OperationNotIn,
-							Expression: toArray(clause.Not(clause.IN{
-								Column: field,
-								Values: f.makeArrayFromString(operatorValue),
-							})),
-							Values: operatorValue,
-							Field:  field,
-							Parent: currentParentFilter,
-						}
-
-						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
-
-					} else if operator == string(OperationEq) {
-						fx := filter{
-							Type:      0,
-							Operation: OperationEq,
-							Expression: toArray(clause.Eq{
-								Column: field,
-								Value:  operatorValue,
-							}),
-							Values: operatorValue,
-							Field:  field,
-							Parent: currentParentFilter,
-						}
-
-						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
-
-					} else if operator == string(OperationGte) {
-						fx := filter{
-							Type:      0,
-							Operation: OperationGte,
-							Expression: toArray(clause.Gte{
-								Column: field,
-								Value:  operatorValue,
-							}),
-							Values: operatorValue,
-							Field:  field,
-							Parent: currentParentFilter,
-						}
-
-						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
-
-					} else if operator == string(OperationLte) {
-						fx := filter{
-							Type:      0,
-							Operation: OperationLte,
-							Expression: toArray(clause.Lte{
-								Column: field,
-								Value:  operatorValue,
-							}),
-							Values: operatorValue,
-							Field:  field,
-							Parent: currentParentFilter,
-						}
-
-						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
-
-					} else if operator == string(OperationNeq) {
-						fx := filter{
-							Type:      0,
-							Operation: OperationNeq,
-							Expression: toArray(clause.Neq{
-								Column: field,
-								Value:  operatorValue,
-							}),
-							Values: operatorValue,
-							Field:  field,
-							Parent: currentParentFilter,
-						}
-
-						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
-
-					} else if operator == string(OperationLike) {
-						fx := filter{
-							Type:      0,
-							Operation: OperationLike,
-							Expression: toArray(clause.Like{
-								Column: field,
-								Value:  operatorValue,
-							}),
-							Values: "%" + operatorValue + "%",
-							Field:  field,
-							Parent: currentParentFilter,
-						}
-
-						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
-
-					} else if operator == string(OperationNotLike) {
-						fx := filter{
-							Type:      0,
-							Operation: OperationNotLike,
-							Expression: toArray(clause.Not(clause.Like{
-								Column: field,
-								Value:  "%" + operatorValue + "%",
-							})),
-							Values: operatorValue,
-							Field:  field,
-							Parent: currentParentFilter,
-						}
-
-						currentParentFilter.Children = append(currentParentFilter.Children, &fx)
-
-					} else if operator == string(OperationBetween) {
-						v := f.makeArrayFromString(operatorValue)
-						if len(v) >= 2 {
-							fxGte := filter{
-								Type:      0,
-								Operation: OperationGte,
-								Expression: toArray(clause.Gte{
-									Column: field,
-									Value:  v[0],
-								}),
-								Values: v[0],
-								Field:  field,
-								Parent: currentParentFilter,
-							}
-
-							fxLte := filter{
-								Type:      0,
-								Operation: OperationLte,
-								Expression: toArray(clause.Lte{
-									Column: field,
-									Value:  v[1],
-								}),
-								Values: v[1],
-								Field:  field,
-								Parent: currentParentFilter,
-							}
-
-							currentParentFilter.Children = append(currentParentFilter.Children, &fxGte)
-							currentParentFilter.Children = append(currentParentFilter.Children, &fxLte)
-						}
-
-					}
-				} else {
-
-					if currentParentFilter.Operation == OperationOr || currentParentFilter.Operation == OperationAnd || currentParentFilter.Operation == OperationNot {
-						currentParentFilter = f.mainFilter
-					}
-
-					if action == string(OperationAnd) {
-
-						andOp := &filter{Operation: OperationAnd}
-						andOp.Parent = currentParentFilter
-						currentParentFilter.Children = append(currentParentFilter.Children, andOp)
-						currentParentFilter = andOp
-
-					} else if action == string(OperationOr) {
-						orOp := &filter{Operation: OperationOr}
-						orOp.Parent = currentParentFilter
-						currentParentFilter.Children = append(currentParentFilter.Children, orOp)
-						currentParentFilter = orOp
-					} else if action == string(OperationNot) {
-						notOp := &filter{Operation: OperationNot}
-						notOp.Parent = currentParentFilter
-						currentParentFilter.Children = append(currentParentFilter.Children, notOp)
-						currentParentFilter = notOp
-					}
-				}
-
-			}
-
-		}
-
-	} else {
-		currentParentFilter = f.mainFilter
-
-		if str == string(OperationOr) {
-
-			fx := &filter{Operation: OperationOr}
-			fx.Parent = currentParentFilter
-			currentParentFilter.Children = append(currentParentFilter.Children, fx)
-			currentParentFilter = fx
-		} else if str == string(OperationAnd) {
-			fx := &filter{Operation: OperationAnd}
-			fx.Parent = currentParentFilter
-			currentParentFilter.Children = append(currentParentFilter.Children, fx)
-			currentParentFilter = fx
-		} else if str == string(OperationNot) {
-			fx := &filter{Operation: OperationNot}
-			fx.Parent = currentParentFilter
-			currentParentFilter.Children = append(currentParentFilter.Children, fx)
-			currentParentFilter = fx
-		}
-
-	}
-}
-
-func (f *figo) makeClauses() {
-
-	f.recursiveItem(f.mainFilter)
-
-	f.clauses = append(f.clauses, f.mainFilter.Expression...)
-
-}
-
-func (f *figo) recursiveItem(x *filter) {
-
-	if len(x.Children) != 0 {
-
-		for _, child := range x.Children {
-
-			if _, ok := f.banFields[child.Field]; ok {
-				continue
-			}
-
-			f.recursiveItem(child)
-		}
-
-		if x.Parent != nil {
-			if _, ok := f.banFields[x.Field]; !ok {
-				x.Parent.Expression = append(x.Parent.Expression, x.Expression...)
-			}
-		}
-
-	} else {
-		if x.Parent != nil {
-
-			if _, ok := f.banFields[x.Field]; !ok {
-				if x.Parent.Operation == OperationOr {
-
-					x.Parent.Expression = append(x.Parent.Expression, clause.Or(x.Expression...))
-
-				} else if x.Parent.Operation == OperationAnd {
-					x.Parent.Expression = append(x.Parent.Expression, clause.And(x.Expression...))
-
-				} else if x.Parent.Operation == OperationNot {
-					x.Parent.Expression = append(x.Parent.Expression, clause.Not(x.Expression...))
-
-				} else {
-					x.Parent.Expression = append(x.Parent.Expression, x.Expression...)
-				}
-			}
-
-		}
-	}
-
-}
-
-func (f *figo) makeArrayFromString(str string) []any {
-
-	var result []any
-
-	trimmedInput := strings.Trim(str, "[]")
-	elements := strings.Split(trimmedInput, "&")
-
-	for _, element := range elements {
-		element = strings.TrimSpace(element)
-		result = append(result, element)
-	}
-
-	return result
 }

@@ -1,4 +1,4 @@
-# Go Gorm plugin Library (figo)
+# Go Gorm plugin Library (figo) v2
 
 The figo package provides a robust mechanism for building dynamic filters for SQL queries in applications that use the GORM ORM library. It simplifies the process of defining filters through a domain-specific language (DSL) and converting them into GORM clauses, offering a powerful tool for creating flexible and complex queries.
 ## Differences from gorm package
@@ -19,11 +19,11 @@ go get github.com/bi0dread/figo
 * DSL-Based Filter Parsing \
 Easily construct complex filters using a concise DSL format like:
 ```go
-"id:[eq:9,or,eq:10]|or|vendorId:[eq:22]|and|bank_id:[gt:11]|or|expedition_type:[eq:eq]"
+"(id=1 and vendorId=22) and bank_id>11 or expedition_type=eq load=[TestInner1:id=3 or name=test1 | TestInner2:id=4] sort=id:desc page=skip:0,take:10"
 
 ```
 * Supported Operations
-* eq, gt, gte, lt, lte, ne, like, notLike, between, in, notIn
+* ">, <, >=, <=, =, !=
 * Logical operations: and, or, not
 * Additional features: sort, load, page
 
@@ -43,13 +43,13 @@ f := figo.New()
 ```
 * Adding Filters
 ```go
-f.AddFiltersFromString("id:[eq:9,or,eq:10]|or|vendorId:[eq:22]|and|bank_id:[gt:11]|or|expedition_type:[eq:eq]")
+f.AddFiltersFromString("(id=1 and vendorId=22) and bank_id>11 or expedition_type=eq load=[TestInner1:id=3 or name=test1 | TestInner2:id=4] sort=id:desc page=skip:0,take:10")
 
 ```
 Manually 
 
 ```go
-f.AddFilter(figo.OperationEq, clause.Eq{
+f.AddFilter(clause.Eq{
     Column: clause.Column{Name: "id"},
     Value:  9,
 })
@@ -59,7 +59,7 @@ f.AddFilter(figo.OperationEq, clause.Eq{
 * Restricting Fields\
   Prevent certain fields from being queried:
 ```go
-f.AddBanFields("sensitive_field", "internal_use_only")
+f.AddIgnoreFields("sensitive_field", "internal_use_only")
 
 ```
 
@@ -76,7 +76,7 @@ db := f.Apply(db)
 * Pagination\
   Control the result set's skip and take values via the DSL:
 ```go
-f.AddFiltersFromString("page:[skip=10&take=20]")
+f.AddFiltersFromString("page=skip:0,take:10")
 ```
  Or programmatically:
 ```go
@@ -111,11 +111,14 @@ func main() {
 	f := figo.New()
 
 	// Add filters from DSL
-	f.AddFiltersFromString("id:[eq:9,or,eq:10]|and|status:[eq:active]|page:[skip=0&take=5]")
+	f.AddFiltersFromString("(id=1 and vendorId=22) and bank_id>11 or expedition_type=eq load=[TestInner1:id=3 or name=test1 | TestInner2:id=4] sort=id:desc page=skip:0,take:10")
 
 	// Add banned fields
-	f.AddBanFields("restricted_field")
+	f.AddIgnoreFields("restricted_field")
 
+	// Add hide fields in results
+        f.AddSelectFields("restricted_field")
+  
 	// Build the filters
 	f.Build()
 
@@ -132,63 +135,63 @@ func main() {
 # Domain-Specific Language (DSL) Syntax
 * Syntax Format
 ```text
-field:[operation:value,operation:value]|operator|field:[operation:value]|...
+field operation value (field operation value field operation value(field operation value))...
 ```
 ## DSL Syntax
 
 The DSL syntax allows you to define query filters dynamically:
 
-- **Field Filters**: `field:[operation:value]`
+- **Field Filters**: `field operation value` (id=3)
 - **Logical Operations**: Combine filters using `and`, `or`, and `not`.
-- **Sorting**: `sort:[field=desc&field2=asc]`
-- **Pagination**: `page:[skip=0&take=10]`
-- **Preloading Relations**: `load:[relation1&relation2]`
+- **Sorting**: `sort=id:desc`
+- **Pagination**: `page=skip:0,take:10`
+- **Preloading Relations**: `load=[TestInner1:id=3 or name=test1 | TestInner2:id=4]`
 
 * Examples
 ```text
 
 Basic Filters
 
-    id:[eq:10]
+    id=10
     (Where id = 10)
     
 Logical Operators
 
-    id:[eq:10]|or|status:[eq:active]
+    id=10 or status=active
     (Where id = 10 OR status = 'active')
     
 Sorting
 
-    sort:[name=asc,created_at=desc]
+    sort=name:asc,created_at=desc
     (Order by name ASC, created_at DESC)
     
 Pagination
 
-    page:[skip=10&take=5]
+    page=skip:10,take:5
     (Skip 10 records and take 5)
     
 Complex Filters
 
-    id:[eq:9,or,eq:10]|or|status:[eq:active]|and|price:[gte:100]|or|category:[in:electronics&home_appliances]
+    (id=1 and vendorId=22) and bank_id>11 or expedition_type=eq load=[TestInner1:id=3 or name=test1 | TestInner2:id=4] sort=id:desc page=skip:0,take:10
 ```
 ## Supported Operations
 
-| Operation     | DSL Example                | Description             |
-|---------------|----------------------------|-------------------------|
-| `eq`          | `field:[eq:value]`         | Equals                  |
-| `gt`          | `field:[gt:value]`         | Greater Than            |
-| `gte`         | `field:[gte:value]`        | Greater Than or Equal   |
-| `lt`          | `field:[lt:value]`         | Less Than               |
-| `lte`         | `field:[lte:value]`        | Less Than or Equal      |
-| `neq`         | `field:[neq:value]`        | Not Equal               |
-| `in`          | `field:[in:value1&value2]` | Value in List           |
-| `notIn`       | `field:[notIn:value1&value2]` | Value not in List   |
-| `like`        | `field:[like:value]`       | Like (Partial Match)    |
-| `notLike`     | `field:[notLike:value]`    | Not Like                |
-| `between`     | `field:[between:val1&val2]`| Between Range           |
-| `and`         | `and`                      | Logical AND             |
-| `or`          | `or`                       | Logical OR              |
-| `not`         | `not`                      | Logical NOT             |
+| Operation | DSL Example                   | Description             |
+|-----------|-------------------------------|-------------------------|
+| `=`       | `field=value`                 | Equals                  |
+| `>`       | `field>value`                 | Greater Than            |
+| `>=`      | `field>=value`                | Greater Than or Equal   |
+| `<`       | `field<value`                 | Less Than               |
+| `<=`      | `field<=value`                | Less Than or Equal      |
+| `!=`      | `field!=value`                | Not Equal               |
+| `in`      | `not impl`    | Value in List           |
+| `notIn`   | `not impl` | Value not in List   |
+| `like`    | `not impl`          | Like (Partial Match)    |
+| `notLike` | `not impl`       | Not Like                |
+| `between` | `not impl`                    | Between Range           |
+| `and`     | `and`                         | Logical AND             |
+| `or`      | `or`                          | Logical OR              |
+| `not`     | `not`                         | Logical NOT             |
 
 # Extensibility
 * You can extend the package to support custom operations or additional parsing logic. Modify the operatorParser method for parsing custom DSL extensions.
@@ -199,6 +202,7 @@ This project is based on original GORM package
 
 ## TODO
 * improvement
+* more operators
 
 ## Contributing
 

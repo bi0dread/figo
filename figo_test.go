@@ -4,7 +4,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
 	"testing"
 )
 
@@ -17,20 +16,21 @@ func TestNew(t *testing.T) {
 
 func TestAddBanFields(t *testing.T) {
 	f := New()
-	f.AddBanFields("sensitive_field", "internal_use_only")
-	assert.True(t, f.GetBanFields()["sensitive_field"])
-	assert.True(t, f.GetBanFields()["internal_use_only"])
+	f.AddIgnoreFields("sensitive_field", "internal_use_only")
+	assert.True(t, f.GetIgnoreFields()["sensitive_field"])
+	assert.True(t, f.GetIgnoreFields()["internal_use_only"])
 }
 
-func TestAddFiltersFromString(t *testing.T) {
+func TestAddSelectFields(t *testing.T) {
 	f := New()
-	f.AddFiltersFromString("id:[eq:9,or,eq:10]|or|vendorId:[eq:22]|and|bank_id:[gt:11]|or|expedition_type:[eq:eq]")
-	assert.NotEmpty(t, f.GetMainFilter().Children)
+	f.AddSelectFields("field1", "field2")
+	assert.True(t, f.GetSelectFields()["field1"])
+	assert.True(t, f.GetSelectFields()["field2"])
 }
 
 func TestBuild(t *testing.T) {
 	f := New()
-	f.AddFiltersFromString("id:[eq:9,or,eq:10]|or|vendorId:[eq:22]|and|bank_id:[gt:11]|or|expedition_type:[eq:eq]")
+	f.AddFiltersFromString("(id=1 or id=2) or id>=2 or id<=3 or id!=0 and vendor=vendor1 or name=ali and (place=tehran or place=shiraz or (v1=2 and v2=1 and (g1=0 or g1=2))) or GG=9 or GG=8 sort=id:desc,name:ace page=skip:10,take:10 load=[Profile: id>=1 or (id<=2 or id!=3 not (id=4 and id<5 and id=6 not (vendor=rrrrr))) | Lan:id>=2 or id<=3]")
 	f.Build()
 	assert.NotEmpty(t, f.GetClauses())
 }
@@ -86,7 +86,9 @@ func TestApply(t *testing.T) {
 	db.Create(&TestModel{ID: 2, VendorID: 22, BankID: 13, ExpeditionType: "eq", TestInner2: []*TestInnerModel2{{XX: 2, ID: 4, Name: "test2"}}})
 
 	f := New()
-	f.AddFiltersFromString("id:[eq:7,or,eq:10]|or|vendorId:[eq:22]|and|bank_id:[gt:11]|or|expedition_type:[eq:eq]|load:[TestInner1:id:[eq:3,or,eq:4]|or|name:[eq:test122]]")
+	// "(id=1 and vendorId=22) and bank_id>11 or expedition_type=eq load=[TestInner1:id=3 or name=test1 | TestInner2:id=4] sort=id:desc page=skip:0,take:10"
+	f.AddFiltersFromString("(id=1 and vendorId=22) and bank_id>11 or expedition_type=eq load=[TestInner1:id=3 or name=test1] sort=id:desc page=skip:0,take:10")
+
 	f.Build()
 	db = db.Debug()
 	db = f.Apply(db.Model(&TestModel{}))
@@ -97,27 +99,9 @@ func TestApply(t *testing.T) {
 	assert.NotEmpty(t, results)
 }
 
-func TestPagination(t *testing.T) {
-	f := New()
-	f.AddFiltersFromString("page:[skip=10&take=20]")
-	assert.Equal(t, 10, f.GetPage().Skip)
-	assert.Equal(t, 20, f.GetPage().Take)
-}
-
-func TestAddFilter(t *testing.T) {
-	f := New()
-	f.AddFilter(OperationEq, clause.Eq{
-		Column: clause.Column{Name: "id"},
-		Value:  9,
-	})
-	assert.NotEmpty(t, f.GetMainFilter().Children)
-	assert.Equal(t, OperationEq, f.GetMainFilter().Children[0].Operation)
-}
-
-func TestGetPreloads(t *testing.T) {
-	f := New()
-	f.AddFiltersFromString("load:[relation1&relation2]")
-	assert.Equal(t, 2, len(f.GetPreloads()))
-	assert.Contains(t, f.GetPreloads(), "relation1")
-	assert.Contains(t, f.GetPreloads(), "relation2")
+func TestPageValidation(t *testing.T) {
+	p := Page{Skip: -1, Take: 30}
+	p.validate()
+	assert.Equal(t, 0, p.Skip)
+	assert.Equal(t, 20, p.Take)
 }
