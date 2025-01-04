@@ -9,6 +9,11 @@ import (
 	"strings"
 )
 
+type NamingStrategy string
+
+const NAMING_STRATEGY_NO_CHANGE = "no_change"
+const NAMING_STRATEGY_SNAKE_CASE = "snake_case"
+
 type Operation string
 
 const (
@@ -42,6 +47,8 @@ type Figo interface {
 	AddFilter(exp clause.Expression)
 	AddIgnoreFields(fields ...string)
 	AddSelectFields(fields ...string)
+	SetNamingStrategy(strategy NamingStrategy)
+	GetNamingStrategy() NamingStrategy
 	GetIgnoreFields() map[string]bool
 	GetSelectFields() map[string]bool
 	GetClauses() []clause.Expression
@@ -52,20 +59,21 @@ type Figo interface {
 }
 
 type figo struct {
-	clauses      []clause.Expression
-	preloads     map[string][]clause.Expression
-	page         Page
-	sort         clause.Expression
-	ignoreFields map[string]bool
-	selectFields map[string]bool
-	dsl          string
+	clauses        []clause.Expression
+	preloads       map[string][]clause.Expression
+	page           Page
+	sort           clause.Expression
+	ignoreFields   map[string]bool
+	selectFields   map[string]bool
+	dsl            string
+	namingStrategy NamingStrategy
 }
 
 func New() Figo {
 	f := &figo{page: Page{
 		Skip: 0,
 		Take: 20,
-	}, preloads: make(map[string][]clause.Expression), ignoreFields: make(map[string]bool), selectFields: make(map[string]bool), clauses: make([]clause.Expression, 0)}
+	}, preloads: make(map[string][]clause.Expression), ignoreFields: make(map[string]bool), selectFields: make(map[string]bool), clauses: make([]clause.Expression, 0), namingStrategy: NAMING_STRATEGY_SNAKE_CASE}
 
 	return f
 }
@@ -205,7 +213,7 @@ func (f *figo) parseDSL(expr string) *Node {
 
 							c = append(c, clause.OrderByColumn{
 								Column: clause.Column{
-									Name:  parsFieldsName(field),
+									Name:  f.parsFieldsName(field),
 									Table: clause.CurrentTable,
 								},
 								Desc:    strings.ToLower(value) == "desc",
@@ -234,12 +242,12 @@ func (f *figo) parseDSL(expr string) *Node {
 						continue
 					}
 
-					newNode := &Node{Operator: operator, Value: value, Field: parsFieldsName(field), Parent: current, Expression: make([]clause.Expression, 0)}
+					newNode := &Node{Operator: operator, Value: value, Field: f.parsFieldsName(field), Parent: current, Expression: make([]clause.Expression, 0)}
 					if Operation(value) == OperationAnd || Operation(value) == OperationOr || Operation(value) == OperationNot {
 						newNode.Operator = Operation(value)
 					} else {
 
-						newNode.Expression = append(newNode.Expression, getClausesFromOperation(operator, parsFieldsName(field), value))
+						newNode.Expression = append(newNode.Expression, getClausesFromOperation(operator, f.parsFieldsName(field), value))
 					}
 					current.Children = append(current.Children, newNode)
 					i = j
@@ -253,8 +261,14 @@ func (f *figo) parseDSL(expr string) *Node {
 	return root
 }
 
-func parsFieldsName(str string) string {
-	return stringy.New(str).SnakeCase("?", "").ToLower()
+func (f *figo) parsFieldsName(str string) string {
+	if f.namingStrategy == NAMING_STRATEGY_NO_CHANGE {
+		return str
+	} else if f.namingStrategy == NAMING_STRATEGY_SNAKE_CASE {
+		return stringy.New(str).SnakeCase("?", "").ToLower()
+
+	}
+	return ""
 }
 
 func parseToken(token string) (Operation, string, string) {
@@ -533,6 +547,15 @@ func (f *figo) GetPage() Page {
 func (f *figo) GetSelectFields() map[string]bool {
 
 	return f.selectFields
+}
+
+func (f *figo) SetNamingStrategy(strategy NamingStrategy) {
+	f.namingStrategy = strategy
+}
+
+func (f *figo) GetNamingStrategy() NamingStrategy {
+
+	return f.namingStrategy
 }
 
 func (f *figo) Apply(trx *gorm.DB) *gorm.DB {
