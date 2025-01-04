@@ -236,6 +236,7 @@ func (f *figo) parseDSL(expr string) *Node {
 					i = k
 				} else {
 					operator, value, field := parseToken(token)
+					value = f.parsFieldsValue(value)
 
 					if operator == "" && Operation(value) != OperationAnd && Operation(value) != OperationOr && Operation(value) != OperationNot {
 						i = j
@@ -269,6 +270,10 @@ func (f *figo) parsFieldsName(str string) string {
 
 	}
 	return ""
+}
+
+func (f *figo) parsFieldsValue(str string) string {
+	return strings.Replace(str, "_", " ", -1)
 }
 
 func parseToken(token string) (Operation, string, string) {
