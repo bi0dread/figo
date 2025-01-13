@@ -30,7 +30,8 @@ func TestAddSelectFields(t *testing.T) {
 
 func TestBuild(t *testing.T) {
 	f := New()
-	f.AddFiltersFromString("(id=1 or id=2) or id>=2 or id<=3 or id!=0 and vendor=vendor1 or name=ali and (place=tehran or place=shiraz or (v1=2 and v2=1 and (g1=0 or g1=2))) or GG=9 or GG=8 sort=id:desc,name:ace page=skip:10,take:10 load=[Profile: id>=1 or (id<=2 or id!=3 not (id=4 and id<5 and id=6 not (vendor=rrrrr))) | Lan:id>=2 or id<=3]")
+
+	f.AddFiltersFromString(`(id=1 or id=2) or id>=2 or id<=3 or id!=0 and vendor=vendor1 or name=ali and (place=tehran or place=shiraz or (v1=2 and v2=1 and (g1=0 or g1=2))) or GG=9 or GG=8 sort=id:desc,name:ace page=skip:10,take:10 load=[inner1:id=1 or name=ali | inner2:id=2 or name=ali]`)
 	f.Build()
 	assert.NotEmpty(t, f.GetClauses())
 }
@@ -87,7 +88,7 @@ func TestApply(t *testing.T) {
 
 	f := New()
 	// "(id=1 and vendorId=22) and bank_id>11 or expedition_type=eq load=[TestInner1:id=3 or name=test1 | TestInner2:id=4] sort=id:desc page=skip:0,take:10"
-	f.AddFiltersFromString("(id=1 and vendorId=22) and bank_id>11 or expedition_type=eq load=[TestInner1:id=3 or name=test1] sort=id:desc page=skip:0,take:10")
+	f.AddFiltersFromString(`(id=1 and vendorId="22") and bank_id>11 or expedition_type="eq" load=[TestInner1:id="3" or name="test1"] sort=id:desc page=skip:0,take:10 `)
 
 	f.Build()
 	db = db.Debug()

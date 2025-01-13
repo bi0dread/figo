@@ -19,7 +19,7 @@ go get github.com/bi0dread/figo
 * DSL-Based Filter Parsing \
 Easily construct complex filters using a concise DSL format like:
 ```go
-"(id=1 and vendorId=22) and bank_id>11 or expedition_type=eq load=[TestInner1:id=3 or name=test1 | TestInner2:id=4] sort=id:desc page=skip:0,take:10"
+"(id=1 and vendorId=22) and bank_id>11 or expedition_type="eq" load=[TestInner1:id=3 or name=test1 | TestInner2:id=4] sort=id:desc page=skip:0,take:10"
 
 ```
 * Supported Operations
@@ -43,9 +43,11 @@ f := figo.New()
 ```
 * Adding Filters
 ```go
-f.AddFiltersFromString("(id=1 and vendorId=22) and bank_id>11 or expedition_type=eq load=[TestInner1:id=3 or name=test1 | TestInner2:id=4] sort=id:desc page=skip:0,take:10")
-
+f.AddFiltersFromString("(id=1 and vendorId=22) and bank_id>11 or expedition_type="eq gg" load=[TestInner1:id=3 or name=test1 | TestInner2:id=4] sort=id:desc page=skip:0,take:10")
 ```
+if you want to set value with space char " " just put it in quotes  e.g expedition_type="eq gg"
+```go
+
 Manually 
 
 ```go

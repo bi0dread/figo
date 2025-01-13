@@ -119,7 +119,28 @@ func (f *figo) parseDSL(expr string) *Node {
 			i++
 		default:
 			j := i
-			for j < len(expr) && expr[j] != ' ' && expr[j] != '(' && expr[j] != ')' {
+			ff := -1
+			for j < len(expr) && expr[j] != '(' && expr[j] != ')' {
+
+				if expr[j] == '"' && ff == -1 {
+					ff = 1
+					j++
+					continue
+				}
+
+				if expr[j] == '"' && ff == 1 {
+					ff = 0
+
+				}
+
+				if expr[j] == ' ' && ff == -1 {
+					break
+				}
+
+				if expr[j] == ' ' && ff == 0 {
+					break
+				}
+
 				j++
 			}
 			token := strings.TrimSpace(expr[i:j])
@@ -138,7 +159,7 @@ func (f *figo) parseDSL(expr string) *Node {
 							k++
 
 						}
-						k++
+						//k++
 
 						loadLabel := fmt.Sprintf("%v=[", string(OperationLoad))
 
@@ -273,7 +294,7 @@ func (f *figo) parsFieldsName(str string) string {
 }
 
 func (f *figo) parsFieldsValue(str string) string {
-	return strings.Replace(str, "_", " ", -1)
+	return strings.Replace(str, "\"", "", -1)
 }
 
 func parseToken(token string) (Operation, string, string) {
