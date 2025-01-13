@@ -12,7 +12,7 @@ figo
 
 ### Installation
 ``` bash
-go get github.com/bi0dread/figo
+go get github.com/bi0dread/figo/v2
 ```
 
 # Features
