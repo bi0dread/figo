@@ -1,4 +1,4 @@
-module github.com/bi0dread/figo
+module github.com/bi0dread/figo/2
 
 go 1.21.0
 
