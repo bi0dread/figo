@@ -94,10 +94,14 @@ func TestApply(t *testing.T) {
 	db = db.Debug()
 	db = f.Apply(db.Model(&TestModel{}))
 
+	fullSql := f.GetSqlString(db, "SELECT", "FROM", "WHERE", "JOIN", "ORDER BY", "GROUP BY", "LIMIT", "OFFSET")
+
 	var results []TestModel
 	result := db.Find(&results)
 	assert.Nil(t, result.Error)
 	assert.NotEmpty(t, results)
+	expectedQuery := "SELECT * FROM `test_models` WHERE (((`id` = \"1\" AND `vendor_id` = \"22\") AND `bank_id` > \"11\") OR `expedition_type` = \"eq\") ORDER BY `test_models`.`id` DESC LIMIT 10"
+	assert.Equal(t, fullSql, expectedQuery)
 }
 
 func TestPageValidation(t *testing.T) {

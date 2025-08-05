@@ -5,6 +5,7 @@ import (
 	"github.com/gobeam/stringy"
 	"gorm.io/gorm"
 	"gorm.io/gorm/clause"
+	"gorm.io/gorm/logger"
 	"strconv"
 	"strings"
 )
@@ -55,6 +56,7 @@ type Figo interface {
 	GetPreloads() map[string][]clause.Expression
 	GetPage() Page
 	Apply(trx *gorm.DB) *gorm.DB
+	GetSqlString(trx *gorm.DB, conditionType ...string) string
 	Build()
 }
 
@@ -584,7 +586,28 @@ func (f *figo) GetNamingStrategy() NamingStrategy {
 	return f.namingStrategy
 }
 
+func (f *figo) GetSqlString(trx *gorm.DB, conditionType ...string) string {
+
+	tr := trx.Begin()
+	tr = tr.Session(&gorm.Session{DryRun: true, NewDB: true})
+	tr.Logger = logger.Default.LogMode(logger.Silent)
+
+	stmt := tr.Statement
+
+	tr.Callback().Query().Execute(tr)
+	stmt.Build(conditionType...)
+	sqlWithPlaceholders := stmt.SQL.String()
+	params := stmt.Vars
+
+	fullSQL := tr.Dialector.Explain(sqlWithPlaceholders, params...)
+
+	tr.Rollback()
+
+	return fullSQL
+}
+
 func (f *figo) Apply(trx *gorm.DB) *gorm.DB {
+
 	trx = trx.Limit(f.GetPage().Take)
 	trx = trx.Offset(f.GetPage().Skip)
 

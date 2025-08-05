@@ -75,6 +75,13 @@ f.Build()
 ```go
 db := f.Apply(db)
 ```
+* Get query string\
+  Use the GetSqlString method to get sql query:
+```go
+// pass the condition types
+sqlQuery := f.GetSqlString(db, "SELECT", "FROM", "WHERE", "JOIN", "ORDER BY", "GROUP BY", "LIMIT", "OFFSET")
+```
+
 * Pagination\
   Control the result set's skip and take values via the DSL:
 ```go
