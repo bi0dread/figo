@@ -87,7 +87,7 @@ func (p *Page) validate() {
 	if p.Take < 0 {
 		p.Take = 0
 	} else if p.Take > 20 {
-		p.Take = 20
+		//p.Take = 20
 	}
 }
 
