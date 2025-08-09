@@ -88,8 +88,8 @@ func TestApply(t *testing.T) {
 
 	f := New()
 	// "(id=1 and vendorId=22) and bank_id>11 or expedition_type=eq load=[TestInner1:id=3 or name=test1 | TestInner2:id=4] sort=id:desc page=skip:0,take:10"
-	f.AddFiltersFromString(`(id=1 and vendorId="22") and bank_id>11 or expedition_type="eq" load=[TestInner1:id="3" or name="test1"] sort=id:desc page=skip:0,take:10 `)
-
+	f.AddFiltersFromString(`(id=1 and vendorId="22") and bank_id=11 or expedition_type="eq" load=[TestInner1:id="3" or name="test1"] sort=id:desc page=skip:0,take:10 `)
+	f.AddIgnoreFields("bank_id")
 	f.Build()
 	db = db.Debug()
 	db = f.Apply(db.Model(&TestModel{}))

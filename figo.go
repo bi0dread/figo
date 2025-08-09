@@ -104,7 +104,7 @@ func (f *figo) parseDSL(expr string) *Node {
 	root := &Node{Value: "root", Expression: make([]clause.Expression, 0)}
 	stack := []*Node{root}
 	current := root
-
+outerLoop:
 	for i := 0; i < len(expr); {
 		switch expr[i] {
 		case '(':
@@ -264,6 +264,15 @@ func (f *figo) parseDSL(expr string) *Node {
 					if operator == "" && Operation(value) != OperationAnd && Operation(value) != OperationOr && Operation(value) != OperationNot {
 						i = j
 						continue
+					} else {
+
+						for ignoreField, _ := range f.ignoreFields {
+							if field == ignoreField {
+								i = j
+								continue outerLoop
+							}
+						}
+
 					}
 
 					newNode := &Node{Operator: operator, Value: value, Field: f.parsFieldsName(field), Parent: current, Expression: make([]clause.Expression, 0)}
@@ -442,6 +451,9 @@ func expressionParser(node *Node) {
 					expressionParser(node.Children[i+1])
 				}
 
+				if len(node.Children[i+1].Expression) == 0 {
+					continue
+				}
 				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
 
 				exp := clause.And(v...)
@@ -518,6 +530,9 @@ func getFinalExpr(node Node) clause.Expression {
 		for i := len(node.Children) - 1; i >= 0; i-- {
 			if node.Children[i].Operator == OperationAnd || node.Children[i].Operator == OperationOr || node.Children[i].Operator == OperationNot || node.Children[i].Operator == OperationChild {
 				if node.Children[i].Operator == OperationChild {
+					continue
+				}
+				if len(node.Children[i].Expression) == 0 {
 					continue
 				}
 				return node.Children[i].Expression[len(node.Children[i].Expression)-1]
