@@ -122,17 +122,23 @@ outerLoop:
 		default:
 			j := i
 			ff := -1
-			for j < len(expr) && expr[j] != '(' && expr[j] != ')' {
+			for j < len(expr) {
 
 				if expr[j] == '"' && ff == -1 {
 					ff = 1
 					j++
 					continue
 				}
-
 				if expr[j] == '"' && ff == 1 {
 					ff = 0
+					j++
+					break
 
+				}
+
+				if expr[j] != '"' && ff == 1 {
+					j++
+					continue
 				}
 
 				if expr[j] == ' ' && ff == -1 {
@@ -368,6 +374,9 @@ func expressionParser(node *Node) {
 					expressionParser(node.Children[i+1])
 				}
 
+				if len(node.Children[i+1].Expression) == 0 {
+					continue
+				}
 				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
 
 				exp := clause.And(v...)
