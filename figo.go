@@ -25,8 +25,8 @@ const (
 	OperationLte     Operation = "<="
 	OperationNeq     Operation = "!="
 	OperationNot     Operation = "not"
-	OperationLike    Operation = "like"
-	OperationNotLike Operation = "notLike"
+	OperationLike    Operation = "=^"
+	OperationNotLike Operation = "!=^"
 	OperationAnd     Operation = "and"
 	OperationOr      Operation = "or"
 	OperationBetween Operation = "between"
@@ -315,7 +315,8 @@ func (f *figo) parsFieldsValue(str string) string {
 }
 
 func parseToken(token string) (Operation, string, string) {
-	operators := []Operation{OperationGte, OperationLte, OperationNeq, OperationGt, OperationLt, OperationEq}
+	// set operators as length of chars because if there is a longer operator it will be checked first
+	operators := []Operation{OperationNotLike, OperationLike, OperationGte, OperationLte, OperationNeq, OperationGt, OperationLt, OperationEq}
 	for _, op := range operators {
 		if strings.Contains(token, string(op)) {
 			parts := strings.Split(token, string(op))
@@ -339,6 +340,10 @@ func getClausesFromOperation(o Operation, field string, value any) clause.Expres
 		return clause.Lte{Column: field, Value: value}
 	case OperationNeq:
 		return clause.Neq{Column: field, Value: value}
+	case OperationLike:
+		return clause.Like{Column: field, Value: value}
+	case OperationNotLike:
+		return clause.Not(clause.Like{Column: field, Value: value})
 
 	default:
 		return nil

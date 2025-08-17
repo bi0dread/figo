@@ -88,7 +88,7 @@ func TestApply(t *testing.T) {
 
 	f := New()
 	// "(id=1 and vendorId=22) and bank_id>11 or expedition_type=eq load=[TestInner1:id=3 or name=test1 | TestInner2:id=4] sort=id:desc page=skip:0,take:10"
-	f.AddFiltersFromString(`(id=1 and vendorId="22") and bank_id=11 or expedition_type="eq" load=[TestInner1:id="3" or name="test1"] sort=id:desc page=skip:0,take:10 `)
+	f.AddFiltersFromString(`(id=1 and vendorId="22") and bank_id=11 or expedition_type=^"%e%" load=[TestInner1:id="3" or name="test1"] sort=id:desc page=skip:0,take:10 `)
 	f.AddIgnoreFields("bank_id")
 	f.Build()
 	db = db.Debug()
@@ -100,7 +100,7 @@ func TestApply(t *testing.T) {
 	result := db.Find(&results)
 	assert.Nil(t, result.Error)
 	assert.NotEmpty(t, results)
-	expectedQuery := "SELECT * FROM `test_models` WHERE (((`id` = \"1\" AND `vendor_id` = \"22\") AND `bank_id` > \"11\") OR `expedition_type` = \"eq\") ORDER BY `test_models`.`id` DESC LIMIT 10"
+	expectedQuery := "SELECT * FROM `test_models` WHERE ((`id` = \"1\" AND `vendor_id` = \"22\") OR `expedition_type` LIKE \"%e%\") ORDER BY `test_models`.`id` DESC LIMIT 10"
 	assert.Equal(t, fullSql, expectedQuery)
 }
 
