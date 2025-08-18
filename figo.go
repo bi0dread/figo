@@ -49,6 +49,7 @@ type Figo interface {
 	AddIgnoreFields(fields ...string)
 	AddSelectFields(fields ...string)
 	SetNamingStrategy(strategy NamingStrategy)
+	SetPage(skip, take int)
 	GetNamingStrategy() NamingStrategy
 	GetIgnoreFields() map[string]bool
 	GetSelectFields() map[string]bool
@@ -599,6 +600,12 @@ func (f *figo) GetPreloads() map[string][]clause.Expression {
 func (f *figo) GetPage() Page {
 
 	return f.page
+}
+
+func (f *figo) SetPage(skip, take int) {
+
+	f.page.Skip = skip
+	f.page.Take = take
 }
 
 func (f *figo) GetSelectFields() map[string]bool {
