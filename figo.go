@@ -50,6 +50,7 @@ type Figo interface {
 	AddSelectFields(fields ...string)
 	SetNamingStrategy(strategy NamingStrategy)
 	SetPage(skip, take int)
+	SetPageString(v string)
 	GetNamingStrategy() NamingStrategy
 	GetIgnoreFields() map[string]bool
 	GetSelectFields() map[string]bool
@@ -606,6 +607,33 @@ func (f *figo) SetPage(skip, take int) {
 
 	f.page.Skip = skip
 	f.page.Take = take
+}
+
+func (f *figo) SetPageString(v string) {
+	pageContent := strings.Split(v, ",")
+
+	for _, s := range pageContent {
+		pageSplit := strings.Split(s, ":")
+		if len(pageSplit) != 2 {
+			continue
+		}
+
+		field := pageSplit[0]
+		value := pageSplit[1]
+
+		parseInt, parsErr := strconv.ParseInt(value, 10, 64)
+		if parsErr == nil {
+
+			if field == "skip" {
+				f.page.Skip = int(parseInt)
+			} else if field == "take" {
+				f.page.Take = int(parseInt)
+			}
+
+			f.page.validate()
+		}
+
+	}
 }
 
 func (f *figo) GetSelectFields() map[string]bool {
