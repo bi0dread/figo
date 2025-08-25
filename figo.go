@@ -2,13 +2,30 @@ package figo
 
 import (
 	"fmt"
-	"github.com/gobeam/stringy"
-	"gorm.io/gorm"
-	"gorm.io/gorm/clause"
-	"gorm.io/gorm/logger"
 	"strconv"
 	"strings"
+
+	"github.com/gobeam/stringy"
 )
+
+// Global configuration
+var (
+	// regexSQLOperator controls the SQL operator used for RegexExpr in SQL adapters.
+	// Defaults to MySQL-compatible REGEXP. For Postgres, set to "~" or "~*".
+	regexSQLOperator = "REGEXP"
+)
+
+// SetRegexSQLOperator sets the SQL operator used to render regex in SQL adapters (Raw/GORM)
+func SetRegexSQLOperator(op string) {
+	op = strings.TrimSpace(op)
+	if op == "" {
+		return
+	}
+	regexSQLOperator = op
+}
+
+// GetRegexSQLOperator returns the configured SQL regex operator
+func GetRegexSQLOperator() string { return regexSQLOperator }
 
 type NamingStrategy string
 
@@ -18,67 +35,195 @@ const NAMING_STRATEGY_SNAKE_CASE = "snake_case"
 type Operation string
 
 const (
-	OperationEq      Operation = "="
-	OperationGt      Operation = ">"
-	OperationGte     Operation = ">="
-	OperationLt      Operation = "<"
-	OperationLte     Operation = "<="
-	OperationNeq     Operation = "!="
-	OperationNot     Operation = "not"
-	OperationLike    Operation = "=^"
-	OperationNotLike Operation = "!=^"
-	OperationAnd     Operation = "and"
-	OperationOr      Operation = "or"
-	OperationBetween Operation = "between"
-	OperationIn      Operation = "in"
-	OperationNotIn   Operation = "notIn"
-	OperationSort    Operation = "sort"
-	OperationLoad    Operation = "load"
-	OperationPage    Operation = "page"
-	OperationChild   Operation = "----"
+	OperationEq       Operation = "="
+	OperationGt       Operation = ">"
+	OperationGte      Operation = ">="
+	OperationLt       Operation = "<"
+	OperationLte      Operation = "<="
+	OperationNeq      Operation = "!="
+	OperationNot      Operation = "not"
+	OperationLike     Operation = "=^"
+	OperationNotLike  Operation = "!=^"
+	OperationRegex    Operation = "=~"
+	OperationNotRegex Operation = "!=~"
+	OperationAnd      Operation = "and"
+	OperationOr       Operation = "or"
+	OperationBetween  Operation = "<bet>"
+	OperationIn       Operation = "<in>"
+	OperationNotIn    Operation = "<nin>"
+	OperationSort     Operation = "sort"
+	OperationLoad     Operation = "load"
+	OperationPage     Operation = "page"
+	OperationChild    Operation = "----"
+	OperationILike    Operation = ".=^"
+	OperationIsNull   Operation = "<null>"
+	OperationNotNull  Operation = "<notnull>"
 )
+
+// AdapterType removed: adapters are selected via Adapter objects
 
 type Page struct {
 	Skip int
 	Take int
 }
 
+// Expr represents an ORM-agnostic expression node
+type Expr interface{ isExpr() }
+
+// Comparison expressions
+type EqExpr struct {
+	Field string
+	Value any
+}
+type GteExpr struct {
+	Field string
+	Value any
+}
+type GtExpr struct {
+	Field string
+	Value any
+}
+type LtExpr struct {
+	Field string
+	Value any
+}
+type LteExpr struct {
+	Field string
+	Value any
+}
+type NeqExpr struct {
+	Field string
+	Value any
+}
+type LikeExpr struct {
+	Field string
+	Value any
+}
+
+// Regex expression
+type RegexExpr struct {
+	Field string
+	Value any
+}
+
+// Logical expressions
+type AndExpr struct{ Operands []Expr }
+type OrExpr struct{ Operands []Expr }
+type NotExpr struct{ Operands []Expr }
+
+// Sorting expressions
+type OrderByColumn struct {
+	Name string
+	Desc bool
+}
+
+type OrderBy struct{ Columns []OrderByColumn }
+
+// Query is a marker interface for adapter-agnostic rendered queries
+// Concrete types are provided per adapter (e.g., SQLQuery, MongoFindQuery)
+type Query interface{ isQuery() }
+
+// SQLQuery represents a parametrized SQL statement
+type SQLQuery struct {
+	SQL  string
+	Args []any
+}
+
+func (SQLQuery) isQuery() {}
+
+func (EqExpr) isExpr()    {}
+func (GteExpr) isExpr()   {}
+func (GtExpr) isExpr()    {}
+func (LtExpr) isExpr()    {}
+func (LteExpr) isExpr()   {}
+func (NeqExpr) isExpr()   {}
+func (LikeExpr) isExpr()  {}
+func (RegexExpr) isExpr() {}
+func (AndExpr) isExpr()   {}
+func (OrExpr) isExpr()    {}
+func (NotExpr) isExpr()   {}
+func (OrderBy) isExpr()   {}
+
+type InExpr struct {
+	Field  string
+	Values []any
+}
+
+type NotInExpr struct {
+	Field  string
+	Values []any
+}
+
+type BetweenExpr struct {
+	Field string
+	Low   any
+	High  any
+}
+
+type IsNullExpr struct{ Field string }
+
+type NotNullExpr struct{ Field string }
+
+type ILikeExpr struct {
+	Field string
+	Value any
+}
+
+func (InExpr) isExpr()      {}
+func (NotInExpr) isExpr()   {}
+func (BetweenExpr) isExpr() {}
+func (IsNullExpr) isExpr()  {}
+func (NotNullExpr) isExpr() {}
+func (ILikeExpr) isExpr()   {}
+
 type Figo interface {
 	AddFiltersFromString(input string)
-	AddFilter(exp clause.Expression)
+	AddFilter(exp Expr)
 	AddIgnoreFields(fields ...string)
 	AddSelectFields(fields ...string)
 	SetNamingStrategy(strategy NamingStrategy)
 	SetPage(skip, take int)
 	SetPageString(v string)
+	SetAdapterObject(adapter Adapter)
 	GetNamingStrategy() NamingStrategy
 	GetIgnoreFields() map[string]bool
 	GetSelectFields() map[string]bool
-	GetClauses() []clause.Expression
-	GetPreloads() map[string][]clause.Expression
+	GetClauses() []Expr
+	GetPreloads() map[string][]Expr
 	GetPage() Page
-	Apply(trx *gorm.DB) *gorm.DB
-	GetSqlString(trx *gorm.DB, conditionType ...string) string
+	GetAdapterObject() Adapter
+	GetSqlString(ctx any, conditionType ...string) string
+	GetExplainedSqlString(ctx any, conditionType ...string) string
+	GetQuery(ctx any, conditionType ...string) Query
 	Build()
 }
 
+type Adapter interface {
+	GetSqlString(f Figo, ctx any, conditionType ...string) (string, bool)
+	GetQuery(f Figo, ctx any, conditionType ...string) (Query, bool)
+}
+
 type figo struct {
-	clauses        []clause.Expression
-	preloads       map[string][]clause.Expression
+	clauses        []Expr
+	preloads       map[string][]Expr
 	page           Page
-	sort           clause.Expression
+	sort           *OrderBy
 	ignoreFields   map[string]bool
 	selectFields   map[string]bool
 	dsl            string
 	namingStrategy NamingStrategy
+	adapterObj     Adapter
 }
 
-func New() Figo {
+// Constructor: use New(adapter) with an Adapter object (or nil)
+
+// New constructs a new instance with the specified adapter object. Pass nil for no adapter.
+func New(adapter Adapter) Figo {
 	f := &figo{page: Page{
 		Skip: 0,
 		Take: 20,
-	}, preloads: make(map[string][]clause.Expression), ignoreFields: make(map[string]bool), selectFields: make(map[string]bool), clauses: make([]clause.Expression, 0), namingStrategy: NAMING_STRATEGY_SNAKE_CASE}
-
+	}, preloads: make(map[string][]Expr), ignoreFields: make(map[string]bool), selectFields: make(map[string]bool), clauses: make([]Expr, 0), namingStrategy: NAMING_STRATEGY_SNAKE_CASE}
+	f.adapterObj = adapter
 	return f
 }
 
@@ -88,13 +233,11 @@ func (p *Page) validate() {
 	}
 	if p.Take < 0 {
 		p.Take = 0
-	} else if p.Take > 20 {
-		//p.Take = 20
 	}
 }
 
 type Node struct {
-	Expression []clause.Expression
+	Expression []Expr
 	Operator   Operation
 	Value      string
 	Field      string
@@ -103,7 +246,7 @@ type Node struct {
 }
 
 func (f *figo) parseDSL(expr string) *Node {
-	root := &Node{Value: "root", Expression: make([]clause.Expression, 0)}
+	root := &Node{Value: "root", Expression: make([]Expr, 0)}
 	stack := []*Node{root}
 	current := root
 outerLoop:
@@ -161,9 +304,10 @@ outerLoop:
 						bracketCount := 1
 						for k < len(expr) && bracketCount > 0 {
 
-							if expr[k] == '[' {
+							switch expr[k] {
+							case '[':
 								bracketCount++
-							} else if expr[k] == ']' {
+							case ']':
 								bracketCount--
 							}
 							k++
@@ -182,13 +326,16 @@ outerLoop:
 
 						loadSplit := strings.Split(content, "|")
 						for _, l := range loadSplit {
-							table := l[:strings.Index(l, ":")]
-							loadContent := strings.TrimSpace(l[len(table)+1:])
+							rawTable := l[:strings.Index(l, ":")]
+							table := strings.TrimSpace(rawTable)
+							loadContent := strings.TrimSpace(l[len(rawTable)+1:])
 
 							loadRootNode := f.parseDSL(loadContent)
 							expressionParser(loadRootNode)
 							loadExpr := getFinalExpr(*loadRootNode)
-							f.preloads[table] = append(f.preloads[table], loadExpr)
+							if loadExpr != nil {
+								f.preloads[table] = append(f.preloads[table], loadExpr)
+							}
 
 						}
 						i = k
@@ -213,9 +360,10 @@ outerLoop:
 							parseInt, parsErr := strconv.ParseInt(value, 10, 64)
 							if parsErr == nil {
 
-								if field == "skip" {
+								switch field {
+								case "skip":
 									f.page.Skip = int(parseInt)
-								} else if field == "take" {
+								case "take":
 									f.page.Take = int(parseInt)
 								}
 
@@ -231,7 +379,7 @@ outerLoop:
 
 						sortContent := strings.Split(content, ",")
 
-						var c []clause.OrderByColumn
+						var c []OrderByColumn
 
 						for _, s := range sortContent {
 							sortSplit := strings.Split(s, ":")
@@ -242,21 +390,17 @@ outerLoop:
 							field := sortSplit[0]
 							value := sortSplit[1]
 
-							c = append(c, clause.OrderByColumn{
-								Column: clause.Column{
-									Name:  f.parsFieldsName(field),
-									Table: clause.CurrentTable,
-								},
-								Desc:    strings.ToLower(value) == "desc",
-								Reorder: false,
+							c = append(c, OrderByColumn{
+								Name: f.parsFieldsName(field),
+								Desc: strings.ToLower(value) == "desc",
 							})
 
 						}
 
-						sortExpr := clause.OrderBy{
+						sortExpr := OrderBy{
 							Columns: c,
 						}
-						f.sort = sortExpr
+						f.sort = &sortExpr
 
 					} else {
 						for k < len(expr) && expr[k] != ' ' && expr[k] != '(' && expr[k] != ')' {
@@ -274,7 +418,7 @@ outerLoop:
 						continue
 					} else {
 
-						for ignoreField, _ := range f.ignoreFields {
+						for ignoreField := range f.ignoreFields {
 							if field == ignoreField {
 								i = j
 								continue outerLoop
@@ -283,7 +427,7 @@ outerLoop:
 
 					}
 
-					newNode := &Node{Operator: operator, Value: value, Field: f.parsFieldsName(field), Parent: current, Expression: make([]clause.Expression, 0)}
+					newNode := &Node{Operator: operator, Value: value, Field: f.parsFieldsName(field), Parent: current, Expression: make([]Expr, 0)}
 					if Operation(value) == OperationAnd || Operation(value) == OperationOr || Operation(value) == OperationNot {
 						newNode.Operator = Operation(value)
 					} else {
@@ -303,54 +447,141 @@ outerLoop:
 }
 
 func (f *figo) parsFieldsName(str string) string {
-	if f.namingStrategy == NAMING_STRATEGY_NO_CHANGE {
+	switch f.namingStrategy {
+	case NAMING_STRATEGY_NO_CHANGE:
 		return str
-	} else if f.namingStrategy == NAMING_STRATEGY_SNAKE_CASE {
+	case NAMING_STRATEGY_SNAKE_CASE:
 		return stringy.New(str).SnakeCase("?", "").ToLower()
-
+	default:
+		return ""
 	}
-	return ""
 }
 
 func (f *figo) parsFieldsValue(str string) string {
-	return strings.Replace(str, "\"", "", -1)
+	return strings.TrimSpace(str)
 }
 
 func parseToken(token string) (Operation, string, string) {
-	// set operators as length of chars because if there is a longer operator it will be checked first
-	operators := []Operation{OperationNotLike, OperationLike, OperationGte, OperationLte, OperationNeq, OperationGt, OperationLt, OperationEq}
+	// Order matters: place custom multi-char markers first
+	operators := []Operation{
+		OperationNotRegex,
+		OperationRegex,
+		OperationNotLike,
+		OperationILike,
+		OperationNotIn,
+		OperationIn,
+		OperationBetween,
+		OperationNotNull,
+		OperationIsNull,
+		OperationLike,
+		OperationGte, OperationLte,
+		OperationNeq, OperationGt, OperationLt, OperationEq,
+	}
 	for _, op := range operators {
 		if strings.Contains(token, string(op)) {
 			parts := strings.Split(token, string(op))
-			return op, parts[1], parts[0]
+			var right string
+			if len(parts) > 1 {
+				right = parts[1]
+			}
+			return op, right, strings.TrimSpace(parts[0])
 		}
 	}
 	return "", token, ""
 }
 
-func getClausesFromOperation(o Operation, field string, value any) clause.Expression {
+func getClausesFromOperation(o Operation, field string, value any) Expr {
+	// helper to parse a single scalar literal: preserve quoted strings, parse unquoted numerics
+	parseScalarValue := func(raw string) any {
+		s := strings.TrimSpace(raw)
+		if len(s) >= 2 && strings.HasPrefix(s, "\"") && strings.HasSuffix(s, "\"") {
+			return strings.Trim(s, "\"")
+		}
+		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return i
+		}
+		if f64, err := strconv.ParseFloat(s, 64); err == nil {
+			return f64
+		}
+		return s
+	}
+
+	// helper to parse a list literal like [1,2,"x"]
+	parseListValue := func(raw string) []any {
+		s := strings.TrimSpace(raw)
+		if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+			s = strings.TrimPrefix(s, "[")
+			s = strings.TrimSuffix(s, "]")
+		}
+		if s == "" {
+			return nil
+		}
+		parts := strings.Split(s, ",")
+		vals := make([]any, 0, len(parts))
+		for _, p := range parts {
+			vals = append(vals, parseScalarValue(p))
+		}
+		return vals
+	}
+
+	// helper to parse a string literal for LIKE operations (always string)
+	parseLikeValue := func(raw string) string {
+		s := strings.TrimSpace(raw)
+		if len(s) >= 2 && strings.HasPrefix(s, "\"") && strings.HasSuffix(s, "\"") {
+			return strings.Trim(s, "\"")
+		}
+		return s
+	}
+
 	switch o {
 	case OperationEq:
-		return clause.Eq{Column: field, Value: value}
+		return EqExpr{Field: field, Value: parseScalarValue(fmt.Sprintf("%v", value))}
 	case OperationGte:
-		return clause.Gte{Column: field, Value: value}
+		return GteExpr{Field: field, Value: parseScalarValue(fmt.Sprintf("%v", value))}
 	case OperationGt:
-		return clause.Gt{Column: field, Value: value}
+		return GtExpr{Field: field, Value: parseScalarValue(fmt.Sprintf("%v", value))}
 	case OperationLt:
-		return clause.Lt{Column: field, Value: value}
+		return LtExpr{Field: field, Value: parseScalarValue(fmt.Sprintf("%v", value))}
 	case OperationLte:
-		return clause.Lte{Column: field, Value: value}
+		return LteExpr{Field: field, Value: parseScalarValue(fmt.Sprintf("%v", value))}
 	case OperationNeq:
-		return clause.Neq{Column: field, Value: value}
+		return NeqExpr{Field: field, Value: parseScalarValue(fmt.Sprintf("%v", value))}
 	case OperationLike:
-		return clause.Like{Column: field, Value: value}
+		return LikeExpr{Field: field, Value: parseLikeValue(fmt.Sprintf("%v", value))}
 	case OperationNotLike:
-		return clause.Not(clause.Like{Column: field, Value: value})
-
+		return NotExpr{Operands: []Expr{LikeExpr{Field: field, Value: parseLikeValue(fmt.Sprintf("%v", value))}}}
+	case OperationRegex:
+		return RegexExpr{Field: field, Value: parseLikeValue(fmt.Sprintf("%v", value))}
+	case OperationNotRegex:
+		return NotExpr{Operands: []Expr{RegexExpr{Field: field, Value: parseLikeValue(fmt.Sprintf("%v", value))}}}
+	case OperationIn:
+		vals := parseListValue(fmt.Sprintf("%v", value))
+		return InExpr{Field: field, Values: vals}
+	case OperationNotIn:
+		vals := parseListValue(fmt.Sprintf("%v", value))
+		return NotInExpr{Field: field, Values: vals}
+	case OperationBetween:
+		s := strings.TrimSpace(fmt.Sprintf("%v", value))
+		// strip optional parentheses
+		if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
+			s = strings.TrimPrefix(s, "(")
+			s = strings.TrimSuffix(s, ")")
+		}
+		if idx := strings.Index(s, ".."); idx > 0 {
+			low := strings.TrimSpace(s[:idx])
+			high := strings.TrimSpace(s[idx+2:])
+			return BetweenExpr{Field: field, Low: parseScalarValue(low), High: parseScalarValue(high)}
+		}
+		return nil
+	case OperationILike:
+		return ILikeExpr{Field: field, Value: parseLikeValue(fmt.Sprintf("%v", value))}
+	case OperationIsNull:
+		return IsNullExpr{Field: field}
+	case OperationNotNull:
+		return NotNullExpr{Field: field}
 	default:
 		return nil
 	}
-
 }
 
 func expressionParser(node *Node) {
@@ -361,21 +592,21 @@ func expressionParser(node *Node) {
 			node.Expression = append(node.Expression, node.Children[0].Expression...)
 		}
 
-		var latestExp clause.Expression
+		var latestExpr Expr
 
 		for i, child := range node.Children {
 			if child.Operator == OperationAnd {
 
-				if latestExp == nil {
+				if latestExpr == nil {
 					if i > 0 && len(node.Children[i-1].Expression) > 0 {
-						latestExp = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
+						latestExpr = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
 					} else {
 						continue
 					}
 				}
 
-				var v []clause.Expression
-				v = append(v, latestExp)
+				var v []Expr
+				v = append(v, latestExpr)
 
 				if node.Children[i+1].Operator == OperationChild {
 					expressionParser(node.Children[i+1])
@@ -386,24 +617,24 @@ func expressionParser(node *Node) {
 				}
 				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
 
-				exp := clause.And(v...)
-				latestExp = exp
+				exp := AndExpr{Operands: v}
+				latestExpr = exp
 
 				child.Expression = append(child.Expression, exp)
 
 				node.Expression = append(node.Expression, child.Expression...)
 
 			} else if child.Operator == OperationOr {
-				if latestExp == nil {
+				if latestExpr == nil {
 					if i > 0 && len(node.Children[i-1].Expression) > 0 {
-						latestExp = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
+						latestExpr = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
 					} else {
 						continue
 					}
 				}
 
-				var v []clause.Expression
-				v = append(v, latestExp)
+				var v []Expr
+				v = append(v, latestExpr)
 
 				if node.Children[i+1].Operator == OperationChild {
 					expressionParser(node.Children[i+1])
@@ -411,23 +642,23 @@ func expressionParser(node *Node) {
 
 				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
 
-				exp := clause.Or(v...)
-				latestExp = exp
+				exp := OrExpr{Operands: v}
+				latestExpr = exp
 
 				child.Expression = append(child.Expression, exp)
 
 				node.Expression = append(node.Expression, child.Expression...)
 			} else if child.Operator == OperationNot {
-				if latestExp == nil {
+				if latestExpr == nil {
 					if i > 0 && len(node.Children[i-1].Expression) > 0 {
-						latestExp = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
+						latestExpr = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
 					} else {
 						continue
 					}
 				}
 
-				var v []clause.Expression
-				v = append(v, latestExp)
+				var v []Expr
+				v = append(v, latestExpr)
 
 				if node.Children[i+1].Operator == OperationChild {
 					expressionParser(node.Children[i+1])
@@ -435,8 +666,8 @@ func expressionParser(node *Node) {
 
 				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
 
-				exp := clause.Not(v...)
-				latestExp = exp
+				exp := NotExpr{Operands: v}
+				latestExpr = exp
 
 				child.Expression = append(child.Expression, exp)
 
@@ -447,21 +678,21 @@ func expressionParser(node *Node) {
 			}
 		}
 	} else {
-		var latestExp clause.Expression
+		var latestExpr Expr
 		for i, child := range node.Children {
 
 			if child.Operator == OperationAnd {
 
-				if latestExp == nil {
+				if latestExpr == nil {
 					if i > 0 && len(node.Children[i-1].Expression) > 0 {
-						latestExp = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
+						latestExpr = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
 					} else {
 						continue
 					}
 				}
 
-				var v []clause.Expression
-				v = append(v, latestExp)
+				var v []Expr
+				v = append(v, latestExpr)
 
 				if node.Children[i+1].Operator == OperationChild {
 					expressionParser(node.Children[i+1])
@@ -472,22 +703,22 @@ func expressionParser(node *Node) {
 				}
 				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
 
-				exp := clause.And(v...)
-				latestExp = exp
+				exp := AndExpr{Operands: v}
+				latestExpr = exp
 
 				child.Expression = append(child.Expression, exp)
 
 			} else if child.Operator == OperationOr {
-				if latestExp == nil {
+				if latestExpr == nil {
 					if i > 0 && len(node.Children[i-1].Expression) > 0 {
-						latestExp = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
+						latestExpr = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
 					} else {
 						continue
 					}
 				}
 
-				var v []clause.Expression
-				v = append(v, latestExp)
+				var v []Expr
+				v = append(v, latestExpr)
 
 				if node.Children[i+1].Operator == OperationChild {
 					expressionParser(node.Children[i+1])
@@ -495,25 +726,25 @@ func expressionParser(node *Node) {
 
 				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
 
-				exp := clause.Or(v...)
-				latestExp = exp
+				exp := OrExpr{Operands: v}
+				latestExpr = exp
 
 				child.Expression = append(child.Expression, exp)
 			} else if child.Operator == OperationNot {
-				if latestExp == nil {
+				if latestExpr == nil {
 					if i > 0 && len(node.Children[i-1].Expression) > 0 {
-						latestExp = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
+						latestExpr = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
 					} else {
 						continue
 					}
 				}
 
-				var v []clause.Expression
-				v = append(v, latestExp)
+				var v []Expr
+				v = append(v, latestExpr)
 				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
 
-				exp := clause.Not(v...)
-				latestExp = exp
+				exp := NotExpr{Operands: v}
+				latestExpr = exp
 
 				child.Expression = append(child.Expression, exp)
 			} else if child.Operator == OperationChild {
@@ -524,7 +755,7 @@ func expressionParser(node *Node) {
 
 }
 
-func getFinalExpr(node Node) clause.Expression {
+func getFinalExpr(node Node) Expr {
 
 	if len(node.Children) == 0 {
 		return nil
@@ -565,7 +796,7 @@ func (f *figo) AddFiltersFromString(input string) {
 	f.dsl = input
 }
 
-func (f *figo) AddFilter(exp clause.Expression) {
+func (f *figo) AddFilter(exp Expr) {
 	f.clauses = append(f.clauses, exp)
 }
 
@@ -588,12 +819,12 @@ func (f *figo) GetIgnoreFields() map[string]bool {
 	return f.ignoreFields
 }
 
-func (f *figo) GetClauses() []clause.Expression {
+func (f *figo) GetClauses() []Expr {
 
 	return f.clauses
 }
 
-func (f *figo) GetPreloads() map[string][]clause.Expression {
+func (f *figo) GetPreloads() map[string][]Expr {
 
 	return f.preloads
 }
@@ -607,6 +838,7 @@ func (f *figo) SetPage(skip, take int) {
 
 	f.page.Skip = skip
 	f.page.Take = take
+	f.page.validate()
 }
 
 func (f *figo) SetPageString(v string) {
@@ -623,10 +855,10 @@ func (f *figo) SetPageString(v string) {
 
 		parseInt, parsErr := strconv.ParseInt(value, 10, 64)
 		if parsErr == nil {
-
-			if field == "skip" {
+			switch field {
+			case "skip":
 				f.page.Skip = int(parseInt)
-			} else if field == "take" {
+			case "take":
 				f.page.Take = int(parseInt)
 			}
 
@@ -650,42 +882,47 @@ func (f *figo) GetNamingStrategy() NamingStrategy {
 	return f.namingStrategy
 }
 
-func (f *figo) GetSqlString(trx *gorm.DB, conditionType ...string) string {
-
-	tr := trx.Begin()
-	tr = tr.Session(&gorm.Session{DryRun: true, NewDB: true})
-	tr.Logger = logger.Default.LogMode(logger.Silent)
-
-	stmt := tr.Statement
-
-	tr.Callback().Query().Execute(tr)
-	stmt.Build(conditionType...)
-	sqlWithPlaceholders := stmt.SQL.String()
-	params := stmt.Vars
-
-	fullSQL := tr.Dialector.Explain(sqlWithPlaceholders, params...)
-
-	tr.Rollback()
-
-	return fullSQL
+func (f *figo) SetAdapterObject(adapter Adapter) {
+	f.adapterObj = adapter
 }
 
-func (f *figo) Apply(trx *gorm.DB) *gorm.DB {
+func (f *figo) GetAdapterObject() Adapter {
+	return f.adapterObj
+}
 
-	trx = trx.Limit(f.GetPage().Take)
-	trx = trx.Offset(f.GetPage().Skip)
-
-	for k, v := range f.preloads {
-		trx = trx.Preload(k, v)
+// GetSqlString returns a SQL string based on the selected adapter.
+// For AdapterGorm, ctx should be a *gorm.DB configured with Model(...).
+// For AdapterRaw, ctx can be a table name (string) or RawContext.
+func (f *figo) GetSqlString(ctx any, conditionType ...string) string {
+	if f.adapterObj != nil {
+		if sql, ok := f.adapterObj.GetSqlString(f, ctx, conditionType...); ok {
+			return sql
+		}
+		return ""
 	}
+	return ""
+}
 
-	trx = trx.Clauses(f.GetClauses()...)
-
-	if f.sort != nil {
-		trx = trx.Clauses(f.sort)
+// GetExplainedSqlString returns a SQL string with placeholders expanded for easier debugging
+func (f *figo) GetExplainedSqlString(ctx any, conditionType ...string) string {
+	if f.adapterObj != nil {
+		if sql, ok := f.adapterObj.GetSqlString(f, ctx, conditionType...); ok {
+			return sql
+		}
+		return ""
 	}
+	return ""
+}
 
-	return trx
+// GetQuery delegates to the configured adapter to obtain a typed query object
+func (f *figo) GetQuery(ctx any, conditionType ...string) Query {
+	if f.adapterObj != nil {
+		if q, ok := f.adapterObj.GetQuery(f, ctx, conditionType...); ok {
+			return q
+		}
+		return nil
+	}
+	return nil
 }
 
 func (f *figo) Build() {
