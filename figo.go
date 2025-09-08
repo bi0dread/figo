@@ -410,10 +410,150 @@ outerLoop:
 
 					i = k
 				} else {
-					operator, value, field := parseToken(token)
-					value = f.parsFieldsValue(value)
+					// Try to combine tokens for expressions like "field > value" or "field =^ value"
+					// Only do this for very specific cases to avoid interfering with complex operators
+					combinedToken := token
+					// Only combine if the token looks like a simple field name (alphanumeric + underscores)
+					// and doesn't contain any operators or special characters
+					if isSimpleFieldName(token) {
+						// This looks like a field name with underscores, try to combine with next tokens
+						nextStart := j
+						for nextStart < len(expr) && expr[nextStart] == ' ' {
+							nextStart++
+						}
+						if nextStart < len(expr) {
+							nextEnd := nextStart
+							nextFF := -1
+							for nextEnd < len(expr) {
+								if expr[nextEnd] == '"' && nextFF == -1 {
+									nextFF = 1
+									nextEnd++
+									continue
+								}
+								if expr[nextEnd] == '"' && nextFF == 1 {
+									nextFF = 0
+									nextEnd++
+									break
+								}
+								if expr[nextEnd] != '"' && nextFF == 1 {
+									nextEnd++
+									continue
+								}
+								if expr[nextEnd] == ' ' && nextFF == -1 {
+									break
+								}
+								if expr[nextEnd] == ' ' && nextFF == 0 {
+									break
+								}
+								nextEnd++
+							}
+							nextToken := strings.TrimSpace(expr[nextStart:nextEnd])
+							// Combine with both simple and complex operators
+							if nextToken == ">" || nextToken == "<" || nextToken == "=" || nextToken == "!=" || nextToken == ">=" || nextToken == "<=" || nextToken == "=^" || nextToken == "!=^" || nextToken == ".=^" || nextToken == "=~" || nextToken == "!=~" || nextToken == "<in>" || nextToken == "<nin>" || nextToken == "<bet>" || nextToken == "<null>" || nextToken == "<notnull>" {
+								combinedToken = token + " " + nextToken
+								j = nextEnd
 
-					if operator == "" && Operation(value) != OperationAnd && Operation(value) != OperationOr && Operation(value) != OperationNot {
+								// Try to get the value token as well
+								if nextToken == "<bet>" || nextToken == "<in>" || nextToken == "<nin>" {
+									valueStart := j
+									for valueStart < len(expr) && expr[valueStart] == ' ' {
+										valueStart++
+									}
+									if valueStart < len(expr) {
+										valueEnd := valueStart
+										valueFF := -1
+										parenCount := 0
+										for valueEnd < len(expr) {
+											if expr[valueEnd] == '"' && valueFF == -1 {
+												valueFF = 1
+												valueEnd++
+												continue
+											}
+											if expr[valueEnd] == '"' && valueFF == 1 {
+												valueFF = 0
+												valueEnd++
+												break
+											}
+											if expr[valueEnd] != '"' && valueFF == 1 {
+												valueEnd++
+												continue
+											}
+											// Handle parentheses for BETWEEN operations
+											if expr[valueEnd] == '(' && valueFF == -1 {
+												parenCount++
+											}
+											if expr[valueEnd] == ')' && valueFF == -1 {
+												parenCount--
+												if parenCount == 0 {
+													valueEnd++
+													break
+												}
+											}
+											// Stop at spaces, parentheses, or logical operators (but not inside parentheses)
+											if (expr[valueEnd] == ' ' || expr[valueEnd] == ')' || expr[valueEnd] == '(') && valueFF == -1 && parenCount == 0 {
+												break
+											}
+											if expr[valueEnd] == ' ' && valueFF == 0 && parenCount == 0 {
+												break
+											}
+											valueEnd++
+										}
+										valueToken := strings.TrimSpace(expr[valueStart:valueEnd])
+										if valueToken != "" && !strings.Contains(valueToken, "=") && !strings.Contains(valueToken, ">") && !strings.Contains(valueToken, "<") && !strings.Contains(valueToken, "!") && !strings.Contains(valueToken, "^") && !strings.Contains(valueToken, "~") && valueToken != "and" && valueToken != "or" && valueToken != "not" && !strings.Contains(valueToken, "page=") && !strings.Contains(valueToken, "sort=") && !strings.Contains(valueToken, "load=") {
+											combinedToken = combinedToken + " " + valueToken
+											j = valueEnd
+										}
+									}
+								} else {
+									// For simple operators, use simpler value extraction
+									valueStart := j
+									for valueStart < len(expr) && expr[valueStart] == ' ' {
+										valueStart++
+									}
+									if valueStart < len(expr) {
+										valueEnd := valueStart
+										valueFF := -1
+										for valueEnd < len(expr) {
+											if expr[valueEnd] == '"' && valueFF == -1 {
+												valueFF = 1
+												valueEnd++
+												continue
+											}
+											if expr[valueEnd] == '"' && valueFF == 1 {
+												valueFF = 0
+												valueEnd++
+												break
+											}
+											if expr[valueEnd] != '"' && valueFF == 1 {
+												valueEnd++
+												continue
+											}
+											// Stop at spaces, parentheses, or logical operators
+											if (expr[valueEnd] == ' ' || expr[valueEnd] == ')' || expr[valueEnd] == '(') && valueFF == -1 {
+												break
+											}
+											if expr[valueEnd] == ' ' && valueFF == 0 {
+												break
+											}
+											valueEnd++
+										}
+										valueToken := strings.TrimSpace(expr[valueStart:valueEnd])
+										if valueToken != "" && !strings.Contains(valueToken, "=") && !strings.Contains(valueToken, ">") && !strings.Contains(valueToken, "<") && !strings.Contains(valueToken, "!") && !strings.Contains(valueToken, "^") && !strings.Contains(valueToken, "~") && valueToken != "and" && valueToken != "or" && valueToken != "not" && !strings.Contains(valueToken, "page=") && !strings.Contains(valueToken, "sort=") && !strings.Contains(valueToken, "load=") {
+											combinedToken = combinedToken + " " + valueToken
+											j = valueEnd
+										}
+									}
+								}
+							}
+						}
+					}
+
+					operator, valueStr, field := parseToken(combinedToken)
+					value := f.parsFieldsValue(valueStr)
+
+					// Check if this is a logical operator
+					valueStrForOp := fmt.Sprintf("%v", value)
+					if operator == "" && Operation(valueStrForOp) != OperationAnd && Operation(valueStrForOp) != OperationOr && Operation(valueStrForOp) != OperationNot {
 						i = j
 						continue
 					} else {
@@ -427,9 +567,9 @@ outerLoop:
 
 					}
 
-					newNode := &Node{Operator: operator, Value: value, Field: f.parsFieldsName(field), Parent: current, Expression: make([]Expr, 0)}
-					if Operation(value) == OperationAnd || Operation(value) == OperationOr || Operation(value) == OperationNot {
-						newNode.Operator = Operation(value)
+					newNode := &Node{Operator: operator, Value: valueStrForOp, Field: f.parsFieldsName(field), Parent: current, Expression: make([]Expr, 0)}
+					if Operation(valueStrForOp) == OperationAnd || Operation(valueStrForOp) == OperationOr || Operation(valueStrForOp) == OperationNot {
+						newNode.Operator = Operation(valueStrForOp)
 					} else {
 
 						newNode.Expression = append(newNode.Expression, getClausesFromOperation(operator, f.parsFieldsName(field), value))
@@ -457,8 +597,71 @@ func (f *figo) parsFieldsName(str string) string {
 	}
 }
 
-func (f *figo) parsFieldsValue(str string) string {
-	return strings.TrimSpace(str)
+func (f *figo) parsFieldsValue(str string) any {
+	s := strings.TrimSpace(str)
+
+	// Handle quoted strings - remove quotes but keep as string
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1] // Remove quotes
+	}
+
+	// Parse boolean values (only for unquoted values)
+	if s == "true" {
+		return true
+	}
+	if s == "false" {
+		return false
+	}
+
+	// Parse numeric values (only for unquoted values)
+	if s != "" {
+		// Try to parse as integer
+		if intVal, err := strconv.ParseInt(s, 10, 64); err == nil {
+			return intVal
+		}
+		// Try to parse as float
+		if floatVal, err := strconv.ParseFloat(s, 64); err == nil {
+			return floatVal
+		}
+	}
+
+	// Return as string
+	return s
+}
+
+// isSimpleFieldName checks if a token looks like a simple field name
+func isSimpleFieldName(token string) bool {
+	// Must not be empty
+	if token == "" {
+		return false
+	}
+
+	// Must not contain operators or special characters
+	if strings.Contains(token, "=") || strings.Contains(token, ">") || strings.Contains(token, "<") ||
+		strings.Contains(token, "!") || strings.Contains(token, "^") || strings.Contains(token, "~") ||
+		strings.Contains(token, "page=") || strings.Contains(token, "sort=") || strings.Contains(token, "load=") {
+		return false
+	}
+
+	// Must not be logical operators
+	if token == "and" || token == "or" || token == "not" {
+		return false
+	}
+
+	// Must not be complex operators
+	if token == "like" || token == "in" || token == "between" || token == "null" || token == "notnull" {
+		return false
+	}
+
+	// Must contain only alphanumeric characters and underscores
+	for _, char := range token {
+		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
+			(char >= '0' && char <= '9') || char == '_') {
+			return false
+		}
+	}
+
+	return true
 }
 
 func parseToken(token string) (Operation, string, string) {
@@ -484,7 +687,8 @@ func parseToken(token string) (Operation, string, string) {
 			if len(parts) > 1 {
 				right = parts[1]
 			}
-			return op, right, strings.TrimSpace(parts[0])
+			field := strings.TrimSpace(parts[0])
+			return op, right, field
 		}
 	}
 	return "", token, ""
@@ -649,6 +853,7 @@ func expressionParser(node *Node) {
 
 				node.Expression = append(node.Expression, child.Expression...)
 			} else if child.Operator == OperationNot {
+				// NOT operation should only take one operand
 				if latestExpr == nil {
 					if i > 0 && len(node.Children[i-1].Expression) > 0 {
 						latestExpr = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
@@ -659,12 +864,6 @@ func expressionParser(node *Node) {
 
 				var v []Expr
 				v = append(v, latestExpr)
-
-				if node.Children[i+1].Operator == OperationChild {
-					expressionParser(node.Children[i+1])
-				}
-
-				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
 
 				exp := NotExpr{Operands: v}
 				latestExpr = exp
@@ -731,6 +930,7 @@ func expressionParser(node *Node) {
 
 				child.Expression = append(child.Expression, exp)
 			} else if child.Operator == OperationNot {
+				// NOT operation should only take one operand
 				if latestExpr == nil {
 					if i > 0 && len(node.Children[i-1].Expression) > 0 {
 						latestExpr = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
@@ -741,7 +941,6 @@ func expressionParser(node *Node) {
 
 				var v []Expr
 				v = append(v, latestExpr)
-				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
 
 				exp := NotExpr{Operands: v}
 				latestExpr = exp
