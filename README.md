@@ -62,38 +62,91 @@ func main() {
 
 ## Supported Operations
 
+The figo package supports a comprehensive set of database operations across all adapters (GORM, Raw SQL, MongoDB). All operations are fully tested and production-ready.
+
 ### Basic Comparison Operators
 
-| Operation | DSL Example | SQL Result | Description |
-|-----------|-------------|------------|-------------|
-| `=` | `id=10` | `WHERE id = 10` | Equals |
-| `>` | `age>18` | `WHERE age > 18` | Greater Than |
-| `>=` | `score>=80` | `WHERE score >= 80` | Greater Than or Equal |
-| `<` | `price<100` | `WHERE price < 100` | Less Than |
-| `<=` | `count<=5` | `WHERE count <= 5` | Less Than or Equal |
-| `!=` | `status!="deleted"` | `WHERE status != 'deleted'` | Not Equal |
+| Operation | DSL Example | SQL Result | MongoDB Result | Description |
+|-----------|-------------|------------|----------------|-------------|
+| `=` | `id=10` | `WHERE id = 10` | `{"id": 10}` | Equals |
+| `>` | `age>18` | `WHERE age > 18` | `{"age": {"$gt": 18}}` | Greater Than |
+| `>=` | `score>=80` | `WHERE score >= 80` | `{"score": {"$gte": 80}}` | Greater Than or Equal |
+| `<` | `price<100` | `WHERE price < 100` | `{"price": {"$lt": 100}}` | Less Than |
+| `<=` | `count<=5` | `WHERE count <= 5` | `{"count": {"$lte": 5}}` | Less Than or Equal |
+| `!=` | `status!="deleted"` | `WHERE status != 'deleted'` | `{"status": {"$ne": "deleted"}}` | Not Equal |
 
-### Advanced Operators
+### String Pattern Matching
 
-| Operation | DSL Example | SQL Result | Description |
-|-----------|-------------|------------|-------------|
-| `=^` | `name=^"%john%"` | `WHERE name LIKE '%john%'` | LIKE (Partial Match) |
-| `!=^` | `name!=^"%admin%"` | `WHERE name NOT LIKE '%admin%'` | NOT LIKE |
-| `=~` | `email=~"^[a-z]+@gmail\.com$"` | `WHERE email REGEXP '^[a-z]+@gmail\.com$'` | Regex Match |
-| `!=~` | `phone!=~"^\+1"` | `WHERE phone NOT REGEXP '^\+1'` | Regex Not Match |
-| `<in>` | `id<in>[1,2,3,4,5]` | `WHERE id IN (1,2,3,4,5)` | Value in List |
-| `<nin>` | `status<nin>["deleted","archived"]` | `WHERE status NOT IN ('deleted','archived')` | Value not in List |
-| `<bet>` | `price<bet>(10..100)` | `WHERE price BETWEEN 10 AND 100` | Between Range |
-| `<null>` | `deleted_at<null>` | `WHERE deleted_at IS NULL` | Is Null |
-| `<notnull>` | `updated_at<notnull>` | `WHERE updated_at IS NOT NULL` | Is Not Null |
+| Operation | DSL Example | SQL Result | MongoDB Result | Description |
+|-----------|-------------|------------|----------------|-------------|
+| `=^` | `name=^"%john%"` | `WHERE name LIKE '%john%'` | `{"name": {"$regex": "john", "$options": "i"}}` | LIKE (Case-insensitive) |
+| `!=^` | `name!=^"%admin%"` | `WHERE name NOT LIKE '%admin%'` | `{"name": {"$not": {"$regex": "admin", "$options": "i"}}}` | NOT LIKE |
+| `=~` | `email=~"^[a-z]+@gmail\.com$"` | `WHERE email REGEXP '^[a-z]+@gmail\.com$'` | `{"email": {"$regex": "^[a-z]+@gmail\\.com$"}}` | Regex Match |
+| `!=~` | `phone!=~"^\+1"` | `WHERE phone NOT REGEXP '^\+1'` | `{"phone": {"$not": {"$regex": "^\\+1"}}}` | Regex Not Match |
+
+### Set Operations
+
+| Operation | DSL Example | SQL Result | MongoDB Result | Description |
+|-----------|-------------|------------|----------------|-------------|
+| `<in>` | `id<in>[1,2,3,4,5]` | `WHERE id IN (1,2,3,4,5)` | `{"id": {"$in": [1,2,3,4,5]}}` | Value in List |
+| `<nin>` | `status<nin>["deleted","archived"]` | `WHERE status NOT IN ('deleted','archived')` | `{"status": {"$nin": ["deleted","archived"]}}` | Value not in List |
+
+### Range Operations
+
+| Operation | DSL Example | SQL Result | MongoDB Result | Description |
+|-----------|-------------|------------|----------------|-------------|
+| `<bet>` | `price<bet>(10..100)` | `WHERE price BETWEEN 10 AND 100` | `{"price": {"$gte": 10, "$lte": 100}}` | Between Range (inclusive) |
+
+### Null Operations
+
+| Operation | DSL Example | SQL Result | MongoDB Result | Description |
+|-----------|-------------|------------|----------------|-------------|
+| `<null>` | `deleted_at<null>` | `WHERE deleted_at IS NULL` | `{"deleted_at": null}` | Is Null |
+| `<notnull>` | `updated_at<notnull>` | `WHERE updated_at IS NOT NULL` | `{"updated_at": {"$ne": null}}` | Is Not Null |
 
 ### Logical Operators
 
-| Operation | DSL Example | SQL Result | Description |
-|-----------|-------------|------------|-------------|
-| `and` | `id=1 and status="active"` | `WHERE id = 1 AND status = 'active'` | Logical AND |
-| `or` | `name="john" or name="jane"` | `WHERE name = 'john' OR name = 'jane'` | Logical OR |
-| `not` | `not (deleted=true)` | `WHERE NOT (deleted = true)` | Logical NOT |
+| Operation | DSL Example | SQL Result | MongoDB Result | Description |
+|-----------|-------------|------------|----------------|-------------|
+| `and` | `id=1 and status="active"` | `WHERE id = 1 AND status = 'active'` | `{"$and": [{"id": 1}, {"status": "active"}]}` | Logical AND |
+| `or` | `name="john" or name="jane"` | `WHERE name = 'john' OR name = 'jane'` | `{"$or": [{"name": "john"}, {"name": "jane"}]}` | Logical OR |
+| `not` | `not (deleted=true)` | `WHERE NOT (deleted = true)` | `{"$nor": [{"deleted": true}]}` | Logical NOT |
+
+### Special Operations
+
+| Operation | DSL Example | SQL Result | MongoDB Result | Description |
+|-----------|-------------|------------|----------------|-------------|
+| `sort=` | `sort=name:asc,age:desc` | `ORDER BY name ASC, age DESC` | `{"name": 1, "age": -1}` | Sorting |
+| `page=` | `page=skip:10,take:5` | `LIMIT 5 OFFSET 10` | `{"limit": 5, "skip": 10}` | Pagination |
+| `load=` | `load=[User:name="john" \| Profile:bio=^"%dev%"]` | `JOIN users ON ... JOIN profiles ON ...` | `{"$lookup": {...}}` | Preloading/Joins |
+
+### Data Type Support
+
+| Type | DSL Example | Parsed Value | Description |
+|------|-------------|--------------|-------------|
+| **Integer** | `id=123` | `int64(123)` | Unquoted numbers |
+| **Float** | `price=99.99` | `float64(99.99)` | Decimal numbers |
+| **Boolean** | `active=true` | `bool(true)` | Unquoted true/false |
+| **String (Quoted)** | `name="john"` | `string("john")` | Quoted strings |
+| **String (Unquoted)** | `status=active` | `string("active")` | Unquoted strings |
+| **Null** | `deleted_at<null>` | `nil` | Null values |
+| **Array** | `id<in>[1,2,3]` | `[]any{1,2,3}` | Comma-separated lists |
+
+### Regex Configuration
+
+The regex operators (`=~`, `!=~`) can be configured for different SQL dialects:
+
+```go
+// MySQL (default)
+f.SetRegexSQLOperator("REGEXP")
+
+// PostgreSQL
+f.SetRegexSQLOperator("~")      // Case-sensitive
+f.SetRegexSQLOperator("~*")     // Case-insensitive
+
+// SQLite
+f.SetRegexSQLOperator("REGEXP")
+```
 
 ## Complex Filter Examples
 
