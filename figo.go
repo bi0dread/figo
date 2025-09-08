@@ -499,7 +499,7 @@ outerLoop:
 											valueEnd++
 										}
 										valueToken := strings.TrimSpace(expr[valueStart:valueEnd])
-										if valueToken != "" && !strings.Contains(valueToken, "=") && !strings.Contains(valueToken, ">") && !strings.Contains(valueToken, "<") && !strings.Contains(valueToken, "!") && !strings.Contains(valueToken, "^") && !strings.Contains(valueToken, "~") && valueToken != "and" && valueToken != "or" && valueToken != "not" && !strings.Contains(valueToken, "page=") && !strings.Contains(valueToken, "sort=") && !strings.Contains(valueToken, "load=") {
+										if valueToken != "" && !strings.Contains(valueToken, "=") && !strings.Contains(valueToken, ">") && !strings.Contains(valueToken, "<") && !strings.Contains(valueToken, "!") && valueToken != "and" && valueToken != "or" && valueToken != "not" && !strings.Contains(valueToken, "page=") && !strings.Contains(valueToken, "sort=") && !strings.Contains(valueToken, "load=") {
 											combinedToken = combinedToken + " " + valueToken
 											j = valueEnd
 										}
@@ -538,7 +538,7 @@ outerLoop:
 											valueEnd++
 										}
 										valueToken := strings.TrimSpace(expr[valueStart:valueEnd])
-										if valueToken != "" && !strings.Contains(valueToken, "=") && !strings.Contains(valueToken, ">") && !strings.Contains(valueToken, "<") && !strings.Contains(valueToken, "!") && !strings.Contains(valueToken, "^") && !strings.Contains(valueToken, "~") && valueToken != "and" && valueToken != "or" && valueToken != "not" && !strings.Contains(valueToken, "page=") && !strings.Contains(valueToken, "sort=") && !strings.Contains(valueToken, "load=") {
+										if valueToken != "" && !strings.Contains(valueToken, "=") && !strings.Contains(valueToken, ">") && !strings.Contains(valueToken, "<") && !strings.Contains(valueToken, "!") && valueToken != "and" && valueToken != "or" && valueToken != "not" && !strings.Contains(valueToken, "page=") && !strings.Contains(valueToken, "sort=") && !strings.Contains(valueToken, "load=") {
 											combinedToken = combinedToken + " " + valueToken
 											j = valueEnd
 										}

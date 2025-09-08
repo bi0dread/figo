@@ -19,7 +19,7 @@ go get github.com/bi0dread/figo/v3
 
 * **DSL-Based Filter Parsing** - Easily construct complex filters using a concise DSL format
 * **Rich Operations** - Support for all common database operations
-* **Multiple Adapters** - GORM, Raw SQL, and MongoDB support
+* **Multiple Adapters** - GORM, Raw SQL, MongoDB, and Elasticsearch support
 * **Type-Safe Parsing** - Automatic type detection for numbers, booleans, and strings
 * **Complex Expressions** - Nested parentheses and logical operators
 * **Production Ready** - Comprehensive test coverage and bug-free implementation
@@ -62,18 +62,18 @@ func main() {
 
 ## Supported Operations
 
-The figo package supports a comprehensive set of database operations across all adapters (GORM, Raw SQL, MongoDB). All operations are fully tested and production-ready.
+The figo package supports a comprehensive set of database operations across all adapters (GORM, Raw SQL, MongoDB, Elasticsearch). All operations are fully tested and production-ready.
 
 ### Basic Comparison Operators
 
-| Operation | DSL Example | SQL Result | MongoDB Result | Description |
-|-----------|-------------|------------|----------------|-------------|
-| `=` | `id=10` | `WHERE id = 10` | `{"id": 10}` | Equals |
-| `>` | `age>18` | `WHERE age > 18` | `{"age": {"$gt": 18}}` | Greater Than |
-| `>=` | `score>=80` | `WHERE score >= 80` | `{"score": {"$gte": 80}}` | Greater Than or Equal |
-| `<` | `price<100` | `WHERE price < 100` | `{"price": {"$lt": 100}}` | Less Than |
-| `<=` | `count<=5` | `WHERE count <= 5` | `{"count": {"$lte": 5}}` | Less Than or Equal |
-| `!=` | `status!="deleted"` | `WHERE status != 'deleted'` | `{"status": {"$ne": "deleted"}}` | Not Equal |
+| Operation | DSL Example | SQL Result | MongoDB Result | Elasticsearch Result | Description |
+|-----------|-------------|------------|----------------|---------------------|-------------|
+| `=` | `id=10` | `WHERE id = 10` | `{"id": 10}` | `{"term": {"id": 10}}` | Equals |
+| `>` | `age>18` | `WHERE age > 18` | `{"age": {"$gt": 18}}` | `{"range": {"age": {"gt": 18}}}` | Greater Than |
+| `>=` | `score>=80` | `WHERE score >= 80` | `{"score": {"$gte": 80}}` | `{"range": {"score": {"gte": 80}}}` | Greater Than or Equal |
+| `<` | `price<100` | `WHERE price < 100` | `{"price": {"$lt": 100}}` | `{"range": {"price": {"lt": 100}}}` | Less Than |
+| `<=` | `count<=5` | `WHERE count <= 5` | `{"count": {"$lte": 5}}` | `{"range": {"count": {"lte": 5}}}` | Less Than or Equal |
+| `!=` | `status!="deleted"` | `WHERE status != 'deleted'` | `{"status": {"$ne": "deleted"}}` | `{"bool": {"must_not": {"term": {"status": "deleted"}}}}` | Not Equal |
 
 ### String Pattern Matching
 
@@ -241,6 +241,23 @@ f.AddFiltersFromString(`id=1 and name="test"`)
 f.Build()
 query := f.GetQuery(nil)
 // Returns MongoFindQuery or MongoAggregateQuery
+```
+
+### Elasticsearch Adapter
+```go
+f := figo.New(figo.ElasticsearchAdapter{})
+f.AddFiltersFromString(`name = "john" and age > 25`)
+f.Build()
+query := figo.BuildElasticsearchQuery(f)
+// Returns ElasticsearchQuery with JSON structure
+
+// Get as JSON string
+jsonStr, err := figo.GetElasticsearchQueryString(f)
+// Returns: {"query":{"bool":{"must":[{"term":{"name":"john"}},{"range":{"age":{"gt":25}}}]}}}
+
+// Using fluent builder
+builder := figo.NewElasticsearchQueryBuilder()
+query := builder.FromFigo(f).AddSort("name", true).SetPagination(0, 10).Build()
 ```
 
 ## Advanced Features

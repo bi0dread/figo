@@ -905,6 +905,173 @@ func TestComplexFiltersWithAllOperators(t *testing.T) {
 	}
 }
 
+func TestElasticsearchAdapter(t *testing.T) {
+	// Test basic operations
+	f1 := New(ElasticsearchAdapter{})
+	f1.AddFiltersFromString(`name = "john" and age > 25`)
+	f1.Build()
+	query1 := BuildElasticsearchQuery(f1)
+
+	// Verify basic structure
+	assert.NotNil(t, query1.Query)
+	assert.Contains(t, fmt.Sprintf("%v", query1.Query), "bool")
+
+	// Test complex operations
+	f2 := New(ElasticsearchAdapter{})
+	f2.AddFiltersFromString(`name =^ "%john%" and age <in> [25,30,35] and score <bet> (80..100) and status <notnull>`)
+	f2.Build()
+	query2 := BuildElasticsearchQuery(f2)
+
+	// Verify complex query structure
+	queryStr := fmt.Sprintf("%v", query2.Query)
+	assert.Contains(t, queryStr, "wildcard")
+	assert.Contains(t, queryStr, "terms")
+	assert.Contains(t, queryStr, "range")
+	assert.Contains(t, queryStr, "exists")
+
+	// Test pagination
+	f3 := New(ElasticsearchAdapter{})
+	f3.AddFiltersFromString(`id > 0 page=skip:10,take:5`)
+	f3.Build()
+	query3 := BuildElasticsearchQuery(f3)
+
+	assert.Equal(t, 10, query3.From)
+	assert.Equal(t, 5, query3.Size)
+
+	// Test sorting
+	f4 := New(ElasticsearchAdapter{})
+	f4.AddFiltersFromString(`id > 0 sort=name:asc,age:desc`)
+	f4.Build()
+	query4 := BuildElasticsearchQuery(f4)
+
+	assert.Len(t, query4.Sort, 2)
+	assert.Contains(t, fmt.Sprintf("%v", query4.Sort), "name")
+	assert.Contains(t, fmt.Sprintf("%v", query4.Sort), "age")
+
+	// Test field selection
+	f5 := New(ElasticsearchAdapter{})
+	f5.AddSelectFields("id", "name", "email")
+	f5.AddFiltersFromString(`id > 0`)
+	f5.Build()
+	query5 := BuildElasticsearchQuery(f5)
+
+	assert.Len(t, query5.Source, 3)
+	assert.Contains(t, query5.Source, "id")
+	assert.Contains(t, query5.Source, "name")
+	assert.Contains(t, query5.Source, "email")
+}
+
+func TestElasticsearchQueryBuilder(t *testing.T) {
+	// Test fluent interface
+	builder := NewElasticsearchQueryBuilder()
+
+	// Test from figo
+	f := New(ElasticsearchAdapter{})
+	f.AddFiltersFromString(`name = "john" and age > 25`)
+	f.Build()
+
+	query := builder.FromFigo(f).AddSort("name", true).AddSort("age", false).SetPagination(0, 10).SetSource("id", "name").Build()
+
+	assert.NotNil(t, query.Query)
+	assert.Len(t, query.Sort, 2)
+	assert.Equal(t, 0, query.From)
+	assert.Equal(t, 10, query.Size)
+	assert.Len(t, query.Source, 2)
+
+	// Test JSON output
+	jsonStr, err := builder.ToJSON()
+	assert.NoError(t, err)
+	assert.Contains(t, jsonStr, "query")
+	assert.Contains(t, jsonStr, "sort")
+	assert.Contains(t, jsonStr, "size")
+	assert.Contains(t, jsonStr, "_source")
+	// Note: "from" field is omitted when it's 0 in JSON marshaling
+}
+
+func TestElasticsearchAllOperators(t *testing.T) {
+	tests := []struct {
+		name     string
+		dsl      string
+		expected string
+	}{
+		{
+			name:     "Term query",
+			dsl:      `name = "john"`,
+			expected: "term",
+		},
+		{
+			name:     "Range query",
+			dsl:      `age > 25 and score >= 80`,
+			expected: "range",
+		},
+		{
+			name:     "Wildcard query",
+			dsl:      `name =^ "%john%"`,
+			expected: "wildcard",
+		},
+		{
+			name:     "Terms query",
+			dsl:      `status <in> ["active","pending"]`,
+			expected: "terms",
+		},
+		{
+			name:     "Between query",
+			dsl:      `price <bet> (10..100)`,
+			expected: "range",
+		},
+		{
+			name:     "Exists query",
+			dsl:      `email <notnull>`,
+			expected: "exists",
+		},
+		{
+			name:     "Bool query with must_not",
+			dsl:      `status != "deleted"`,
+			expected: "must_not",
+		},
+		{
+			name:     "Regex query",
+			dsl:      `phone =~ "^\\+1[0-9]{10}$"`,
+			expected: "regexp",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			f := New(ElasticsearchAdapter{})
+			f.AddFiltersFromString(tt.dsl)
+			f.Build()
+			query := BuildElasticsearchQuery(f)
+
+			queryStr := fmt.Sprintf("%v", query.Query)
+			assert.Contains(t, queryStr, tt.expected, "Should contain expected Elasticsearch query type")
+		})
+	}
+}
+
+func TestElasticsearchComplexQueries(t *testing.T) {
+	// Test complex nested queries
+	f := New(ElasticsearchAdapter{})
+	f.AddFiltersFromString(`((name =^ "%john%" or email =^ "%gmail%") and (age >= 18 and age <= 65)) or (status = "active" and score > 80)`)
+	f.Build()
+	query := BuildElasticsearchQuery(f)
+
+	queryStr := fmt.Sprintf("%v", query.Query)
+	assert.Contains(t, queryStr, "bool")
+	assert.Contains(t, queryStr, "should")
+	assert.Contains(t, queryStr, "must")
+
+	// Test with pagination and sorting
+	f2 := New(ElasticsearchAdapter{})
+	f2.AddFiltersFromString(`id > 0 sort=name:asc,age:desc page=skip:20,take:10`)
+	f2.Build()
+	query2 := BuildElasticsearchQuery(f2)
+
+	assert.Equal(t, 20, query2.From)
+	assert.Equal(t, 10, query2.Size)
+	assert.Len(t, query2.Sort, 2)
+}
+
 func TestMissingScenarios(t *testing.T) {
 	// Test scenarios that were missing from our coverage
 
