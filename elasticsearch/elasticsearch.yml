@@ -1,0 +1,19 @@
+cluster.name: "figo-cluster"
+node.name: "figo-node"
+
+# Network settings
+network.host: 0.0.0.0
+http.port: 9200
+
+# Security settings (disabled for testing)
+xpack.security.enabled: false
+xpack.security.enrollment.enabled: false
+
+# Memory settings
+bootstrap.memory_lock: true
+
+# Index settings
+action.auto_create_index: true
+
+# Logging
+logger.level: INFO
