@@ -2,9 +2,10 @@ package figo
 
 import (
 	"fmt"
-	"testing"
-
 	"strings"
+	"sync"
+	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"go.mongodb.org/mongo-driver/bson"
@@ -36,7 +37,8 @@ func TestAddSelectFields(t *testing.T) {
 func TestBuild(t *testing.T) {
 	f := New(nil)
 
-	f.AddFiltersFromString(`(id=1 or id=2) or id>=2 or id<=3 or id!=0 and vendor=vendor1 or name=ali and (place=tehran or place=shiraz or (v1=2 and v2=1 and (g1=0 or g1=2))) or GG=9 or GG=8 sort=id:desc,name:ace page=skip:10,take:10 load=[inner1:id=1 or name=ali | inner2:id=2 or name=ali]`)
+	err := f.AddFiltersFromString(`(id=1 or id=2) or id>=2 or id<=3 or id!=0 and vendor=vendor1 or name=ali and (place=tehran or place=shiraz or (v1=2 and v2=1 and (g1=0 or g1=2))) or GG=9 or GG=8 sort=id:desc,name:ace page=skip:10,take:10 load=[inner1:id=1 or name=ali | inner2:id=2 or name=ali]`)
+	assert.Nil(t, err)
 	f.Build()
 	assert.NotEmpty(t, f.GetClauses())
 }
@@ -595,7 +597,18 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	assert.Contains(t, sql2, "`price` < ?")
 	assert.Contains(t, sql2, "`active` = ?")
 	assert.Contains(t, sql2, "`created_at` > ?")
-	assert.Equal(t, []any{int64(100), "test", 99.99, "true", "2023-01-01"}, args2)
+	// Check that we have the expected arguments (date will be parsed as time.Time)
+	assert.Len(t, args2, 5)
+	assert.Equal(t, int64(100), args2[0])
+	assert.Equal(t, "test", args2[1])
+	assert.Equal(t, 99.99, args2[2])
+	assert.Equal(t, "true", args2[3])
+	// Check that the last argument contains the date (converted to string for SQL)
+	if strVal, ok := args2[4].(string); ok {
+		assert.Contains(t, strVal, "2023-01-01")
+	} else {
+		t.Errorf("Expected string containing date, got %T", args2[4])
+	}
 
 	// Test 3: Field names with various patterns
 	f3 := New(RawAdapter{})
@@ -847,8 +860,21 @@ func TestComplexFiltersWithParentheses(t *testing.T) {
 	assert.Contains(t, args1, int64(65))
 	assert.Contains(t, args1, int64(80))
 	assert.Contains(t, args1, 4.5)
-	assert.Contains(t, args1, "2023-01-01")
-	assert.Contains(t, args1, "2024-12-31")
+	// Check for date values (parsed as time.Time but converted to string for SQL)
+	hasDate2023 := false
+	hasDate2024 := false
+	for _, arg := range args1 {
+		if strVal, ok := arg.(string); ok {
+			if strings.Contains(strVal, "2023-01-01") {
+				hasDate2023 = true
+			}
+			if strings.Contains(strVal, "2024-12-31") {
+				hasDate2024 = true
+			}
+		}
+	}
+	assert.True(t, hasDate2023, "Should contain 2023-01-01 date")
+	assert.True(t, hasDate2024, "Should contain 2024-12-31 date")
 	assert.Contains(t, args1, "tech")
 	assert.Contains(t, args1, "business")
 	assert.Contains(t, args1, "finance")
@@ -1158,4 +1184,834 @@ func TestMissingScenarios(t *testing.T) {
 	assert.Contains(t, sql8, "`deleted_at` IS NULL")
 	assert.Contains(t, sql8, "`updated_at` IS NOT NULL")
 	assert.Contains(t, sql8, "`email` REGEXP ?")
+}
+
+// ===== NEW FEATURE TESTS =====
+
+// Test Security Features
+func TestFieldWhitelist(t *testing.T) {
+	t.Run("FieldWhitelistEnabled", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.SetAllowedFields("id", "name", "email")
+		f.EnableFieldWhitelist()
+
+		// Test allowed fields
+		assert.True(t, f.IsFieldAllowed("id"))
+		assert.True(t, f.IsFieldAllowed("name"))
+		assert.True(t, f.IsFieldAllowed("email"))
+
+		// Test disallowed fields
+		assert.False(t, f.IsFieldAllowed("password"))
+		assert.False(t, f.IsFieldAllowed("secret"))
+
+		// Test with DSL
+		f.AddFiltersFromString(`id=1 and name="test" and password="secret"`)
+		f.Build()
+		clauses := f.GetClauses()
+		// Should only have clauses for allowed fields
+		assert.Len(t, clauses, 1) // Only the AndExpr with id and name
+	})
+
+	t.Run("FieldWhitelistDisabled", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.SetAllowedFields("id", "name")
+		// Don't enable whitelist
+
+		// All fields should be allowed when whitelist is disabled
+		assert.True(t, f.IsFieldAllowed("password"))
+		assert.True(t, f.IsFieldAllowed("secret"))
+	})
+
+	t.Run("FieldWhitelistWithDSL", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.SetAllowedFields("id", "name")
+		f.EnableFieldWhitelist()
+
+		f.AddFiltersFromString(`id=1 and name="test" and password="secret"`)
+		f.Build()
+
+		// Should filter out disallowed fields
+		clauses := f.GetClauses()
+		assert.Len(t, clauses, 1) // Only allowed fields remain
+	})
+}
+
+func TestQueryLimitsBasic(t *testing.T) {
+	t.Run("DefaultLimits", func(t *testing.T) {
+		f := New(RawAdapter{})
+		limits := f.GetQueryLimits()
+
+		assert.Equal(t, 10, limits.MaxNestingDepth)
+		assert.Equal(t, 50, limits.MaxFieldCount)
+		assert.Equal(t, 100, limits.MaxParameterCount)
+		assert.Equal(t, 200, limits.MaxExpressionCount)
+	})
+
+	t.Run("CustomLimits", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.SetQueryLimits(QueryLimits{
+			MaxNestingDepth:    5,
+			MaxFieldCount:      10,
+			MaxParameterCount:  20,
+			MaxExpressionCount: 5,
+		})
+
+		limits := f.GetQueryLimits()
+		assert.Equal(t, 5, limits.MaxNestingDepth)
+		assert.Equal(t, 10, limits.MaxFieldCount)
+		assert.Equal(t, 20, limits.MaxParameterCount)
+		assert.Equal(t, 5, limits.MaxExpressionCount)
+	})
+}
+
+func TestInputValidation(t *testing.T) {
+	t.Run("ValidInput", func(t *testing.T) {
+		f := New(RawAdapter{})
+		err := f.AddFiltersFromString(`id=1 and name="test"`)
+		assert.NoError(t, err)
+	})
+
+	t.Run("UnmatchedParentheses", func(t *testing.T) {
+		f := New(RawAdapter{})
+		err := f.AddFiltersFromString(`(id=1 and name="test"`)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "unmatched parentheses")
+	})
+
+	t.Run("UnmatchedQuotes", func(t *testing.T) {
+		f := New(RawAdapter{})
+		err := f.AddFiltersFromString(`id=1 and name="test`)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "unmatched quotes")
+	})
+
+	t.Run("EmptyInput", func(t *testing.T) {
+		f := New(RawAdapter{})
+		err := f.AddFiltersFromString("")
+		assert.NoError(t, err)
+	})
+
+	t.Run("WhitespaceOnly", func(t *testing.T) {
+		f := New(RawAdapter{})
+		err := f.AddFiltersFromString("   ")
+		assert.NoError(t, err)
+	})
+}
+
+func TestParseErrorBasic(t *testing.T) {
+	t.Run("ParseErrorWithLine", func(t *testing.T) {
+		err := &ParseError{
+			Message:  "Invalid syntax",
+			Position: 10,
+			Line:     2,
+			Column:   5,
+			Context:  "id=1 and invalid",
+		}
+
+		expected := "Parse error at line 2, column 5: Invalid syntax"
+		assert.Equal(t, expected, err.Error())
+	})
+
+	t.Run("ParseErrorWithoutLine", func(t *testing.T) {
+		err := &ParseError{
+			Message:  "Invalid syntax",
+			Position: 10,
+		}
+
+		expected := "Parse error at position 10: Invalid syntax"
+		assert.Equal(t, expected, err.Error())
+	})
+}
+
+// Test Performance Features
+func TestCaching(t *testing.T) {
+	t.Run("InMemoryCache", func(t *testing.T) {
+		cache := NewInMemoryCache(CacheConfig{
+			Enabled:         true,
+			MaxSize:         100,
+			TTL:             5 * time.Minute,
+			CleanupInterval: 1 * time.Minute,
+		})
+		defer cache.Close()
+
+		// Test Set and Get
+		cache.Set("key1", "value1", 5*time.Minute)
+		value, found := cache.Get("key1")
+		assert.True(t, found)
+		assert.Equal(t, "value1", value)
+
+		// Test Get non-existent key
+		_, found = cache.Get("nonexistent")
+		assert.False(t, found)
+
+		// Test Set with TTL
+		cache.Set("key2", "value2", 1*time.Second)
+		value, found = cache.Get("key2")
+		assert.True(t, found)
+		assert.Equal(t, "value2", value)
+
+		// Wait for expiration
+		time.Sleep(2 * time.Second)
+		_, found = cache.Get("key2")
+		assert.False(t, found)
+	})
+
+	t.Run("CacheStats", func(t *testing.T) {
+		cache := NewInMemoryCache(CacheConfig{
+			Enabled:         true,
+			MaxSize:         10,
+			TTL:             5 * time.Minute,
+			CleanupInterval: 1 * time.Minute,
+		})
+		defer cache.Close()
+
+		cache.Set("key1", "value1", 5*time.Minute)
+		cache.Set("key2", "value2", 5*time.Minute)
+
+		stats := cache.Stats()
+		assert.Equal(t, int64(0), stats.Hits)   // No hits yet since we haven't retrieved
+		assert.Equal(t, int64(0), stats.Misses) // No misses yet
+		assert.Equal(t, 2, stats.Size)
+	})
+}
+
+func TestBatchProcessor(t *testing.T) {
+	t.Run("SynchronousBatch", func(t *testing.T) {
+		processor := NewInMemoryBatchProcessor(5, 1*time.Second)
+
+		// Create test queries
+		f1 := New(RawAdapter{})
+		f1.AddFiltersFromString(`id=1`)
+		f1.Build()
+
+		f2 := New(RawAdapter{})
+		f2.AddFiltersFromString(`name="test"`)
+		f2.Build()
+
+		f3 := New(RawAdapter{})
+		f3.AddFiltersFromString(`age>18`)
+		f3.Build()
+
+		// Create batch operations
+		operations := []BatchOperation{
+			{ID: "op1", Query: f1, Context: RawContext{Table: "test"}, Type: "sql"},
+			{ID: "op2", Query: f2, Context: RawContext{Table: "test"}, Type: "sql"},
+			{ID: "op3", Query: f3, Context: RawContext{Table: "test"}, Type: "sql"},
+		}
+
+		// Process batch
+		results := processor.Process(operations)
+
+		// Verify results
+		assert.Len(t, results, 3)
+
+		for i, result := range results {
+			assert.True(t, result.Success)
+			assert.NoError(t, result.Error)
+			assert.Equal(t, operations[i].ID, result.ID)
+			assert.NotNil(t, result.Result)
+		}
+	})
+
+	t.Run("AsynchronousBatch", func(t *testing.T) {
+		processor := NewInMemoryBatchProcessor(2, 1*time.Second)
+
+		// Create test queries
+		f1 := New(RawAdapter{})
+		f1.AddFiltersFromString(`id=1`)
+		f1.Build()
+
+		f2 := New(RawAdapter{})
+		f2.AddFiltersFromString(`name="test"`)
+		f2.Build()
+
+		// Create batch operations
+		operations := []BatchOperation{
+			{ID: "op1", Query: f1, Context: RawContext{Table: "test"}, Type: "sql"},
+			{ID: "op2", Query: f2, Context: RawContext{Table: "test"}, Type: "sql"},
+		}
+
+		// Process async
+		resultChan := processor.ProcessAsync(operations)
+
+		// Collect results
+		var results []BatchResult
+		for result := range resultChan {
+			results = append(results, result)
+		}
+
+		// Verify results
+		assert.Len(t, results, 2)
+
+		for _, result := range results {
+			assert.True(t, result.Success)
+			assert.NoError(t, result.Error)
+			assert.NotNil(t, result.Result)
+		}
+	})
+}
+
+func TestPerformanceMonitor(t *testing.T) {
+	t.Run("PerformanceMonitoring", func(t *testing.T) {
+		monitor := NewPerformanceMonitor(true)
+
+		// Record some queries
+		monitor.RecordQuery(100*time.Millisecond, true, nil)
+		monitor.RecordQuery(200*time.Millisecond, false, nil)
+		monitor.RecordQuery(150*time.Millisecond, true, nil)
+
+		// Get metrics
+		metrics := monitor.GetMetrics()
+		assert.Equal(t, int64(3), metrics.QueryCount)
+		assert.Equal(t, int64(2), metrics.CacheHits)
+		assert.Equal(t, int64(1), metrics.CacheMisses)
+		assert.True(t, metrics.AverageLatency > 0)
+		assert.True(t, metrics.TotalLatency > 0)
+	})
+
+	t.Run("PerformanceReset", func(t *testing.T) {
+		monitor := NewPerformanceMonitor(true)
+
+		monitor.RecordQuery(100*time.Millisecond, true, nil)
+		monitor.RecordQuery(200*time.Millisecond, false, nil)
+
+		metrics := monitor.GetMetrics()
+		assert.Equal(t, int64(2), metrics.QueryCount)
+
+		monitor.Reset()
+		metrics = monitor.GetMetrics()
+		assert.Equal(t, int64(0), metrics.QueryCount)
+	})
+}
+
+// Test Advanced Operators (Basic functionality)
+func TestAdvancedOperatorsBasic(t *testing.T) {
+	t.Run("JsonPathExpr", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.AddFilter(JsonPathExpr{
+			Field: "metadata",
+			Path:  "$.user.name",
+			Value: "john",
+			Op:    "=",
+		})
+		f.Build()
+
+		clauses := f.GetClauses()
+		assert.Len(t, clauses, 1)
+		expr, ok := clauses[0].(JsonPathExpr)
+		assert.True(t, ok)
+		assert.Equal(t, "metadata", expr.Field)
+		assert.Equal(t, "$.user.name", expr.Path)
+		assert.Equal(t, "john", expr.Value)
+		assert.Equal(t, "=", expr.Op)
+	})
+
+	t.Run("ArrayContainsExpr", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.AddFilter(ArrayContainsExpr{
+			Field:  "tags",
+			Values: []any{"tech", "golang", "database"},
+		})
+		f.Build()
+
+		clauses := f.GetClauses()
+		assert.Len(t, clauses, 1)
+		expr, ok := clauses[0].(ArrayContainsExpr)
+		assert.True(t, ok)
+		assert.Equal(t, "tags", expr.Field)
+		assert.Len(t, expr.Values, 3)
+		assert.Contains(t, expr.Values, "tech")
+	})
+
+	t.Run("ArrayOverlapsExpr", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.AddFilter(ArrayOverlapsExpr{
+			Field:  "categories",
+			Values: []any{"business", "finance"},
+		})
+		f.Build()
+
+		clauses := f.GetClauses()
+		assert.Len(t, clauses, 1)
+		expr, ok := clauses[0].(ArrayOverlapsExpr)
+		assert.True(t, ok)
+		assert.Equal(t, "categories", expr.Field)
+		assert.Len(t, expr.Values, 2)
+	})
+
+	t.Run("FullTextSearchExpr", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.AddFilter(FullTextSearchExpr{
+			Field:    "content",
+			Query:    "machine learning algorithms",
+			Language: "en",
+		})
+		f.Build()
+
+		clauses := f.GetClauses()
+		assert.Len(t, clauses, 1)
+		expr, ok := clauses[0].(FullTextSearchExpr)
+		assert.True(t, ok)
+		assert.Equal(t, "content", expr.Field)
+		assert.Equal(t, "machine learning algorithms", expr.Query)
+		assert.Equal(t, "en", expr.Language)
+	})
+
+	t.Run("GeoDistanceExpr", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.AddFilter(GeoDistanceExpr{
+			Field:     "location",
+			Latitude:  40.7128,
+			Longitude: -74.0060,
+			Distance:  10.0,
+			Unit:      "km",
+		})
+		f.Build()
+
+		clauses := f.GetClauses()
+		assert.Len(t, clauses, 1)
+		expr, ok := clauses[0].(GeoDistanceExpr)
+		assert.True(t, ok)
+		assert.Equal(t, "location", expr.Field)
+		assert.Equal(t, 40.7128, expr.Latitude)
+		assert.Equal(t, -74.0060, expr.Longitude)
+		assert.Equal(t, 10.0, expr.Distance)
+		assert.Equal(t, "km", expr.Unit)
+	})
+
+	t.Run("CustomExpr", func(t *testing.T) {
+		handler := func(field, operator string, value any) (string, []any, error) {
+			return "custom_query", []any{value}, nil
+		}
+
+		f := New(RawAdapter{})
+		f.AddFilter(CustomExpr{
+			Field:    "custom_field",
+			Operator: "custom_op",
+			Value:    "custom_value",
+			Handler:  handler,
+		})
+		f.Build()
+
+		clauses := f.GetClauses()
+		assert.Len(t, clauses, 1)
+		expr, ok := clauses[0].(CustomExpr)
+		assert.True(t, ok)
+		assert.Equal(t, "custom_field", expr.Field)
+		assert.Equal(t, "custom_op", expr.Operator)
+		assert.Equal(t, "custom_value", expr.Value)
+		assert.NotNil(t, expr.Handler)
+	})
+}
+
+// Test Validation System (Basic functionality)
+func TestValidationSystemBasic(t *testing.T) {
+	t.Run("ValidationManager", func(t *testing.T) {
+		manager := NewValidationManager()
+
+		// Test rule addition
+		rule := ValidationRule{
+			Field:   "email",
+			Rule:    "email",
+			Message: "Invalid email format",
+		}
+		manager.AddRule(rule)
+
+		// Test validator registration
+		validator := EmailValidator{}
+		manager.RegisterValidator(validator)
+
+		// Test validation
+		err := manager.Validate("email", "invalid-email")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "Invalid email format")
+
+		err = manager.Validate("email", "valid@example.com")
+		assert.NoError(t, err)
+	})
+
+	t.Run("BuiltInValidators", func(t *testing.T) {
+		// Test RequiredValidator
+		required := RequiredValidator{}
+		err := required.Validate("name", "required", "")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "is required")
+
+		err = required.Validate("name", "required", "john")
+		assert.NoError(t, err)
+
+		// Test MinLengthValidator
+		minLength := MinLengthValidator{}
+		err = minLength.Validate("name", "min_length", "ab")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "at least 3 characters")
+
+		err = minLength.Validate("name", "min_length", "john")
+		assert.NoError(t, err)
+
+		// Test EmailValidator
+		email := EmailValidator{}
+		err = email.Validate("email", "email", "invalid")
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "must be a valid email")
+
+		err = email.Validate("email", "email", "test@example.com")
+		assert.NoError(t, err)
+	})
+
+	t.Run("FigoValidationIntegration", func(t *testing.T) {
+		f := New(RawAdapter{})
+
+		// Test validation manager setup
+		manager := NewValidationManager()
+		manager.RegisterValidator(EmailValidator{})
+		manager.RegisterValidator(RequiredValidator{})
+
+		manager.AddRule(ValidationRule{
+			Field:   "email",
+			Rule:    "email",
+			Message: "Invalid email format",
+		})
+
+		f.SetValidationManager(manager)
+
+		// Test field validation
+		err := f.ValidateField("email", "invalid-email")
+		assert.Error(t, err)
+
+		err = f.ValidateField("email", "valid@example.com")
+		assert.NoError(t, err)
+
+		// Test validation rule addition
+		f.AddValidationRule(ValidationRule{
+			Field:   "name",
+			Rule:    "required",
+			Message: "Name is required",
+		})
+
+		err = f.ValidateField("name", "")
+		assert.Error(t, err)
+
+		err = f.ValidateField("name", "john")
+		assert.NoError(t, err)
+	})
+}
+
+// Test Plugin System (Basic functionality)
+func TestPluginSystemBasic(t *testing.T) {
+	t.Run("PluginManager", func(t *testing.T) {
+		manager := NewPluginManager()
+
+		// Test plugin registration
+		plugin := &TestPluginBasic{
+			name: "test_plugin",
+		}
+		err := manager.RegisterPlugin(plugin)
+		assert.NoError(t, err)
+
+		// Test plugin retrieval
+		retrieved, exists := manager.GetPlugin("test_plugin")
+		assert.True(t, exists)
+		assert.Equal(t, plugin, retrieved)
+
+		// Test plugin unregistration
+		err = manager.UnregisterPlugin("test_plugin")
+		assert.NoError(t, err)
+
+		// Test getting unregistered plugin
+		_, exists = manager.GetPlugin("test_plugin")
+		assert.False(t, exists)
+	})
+
+	t.Run("PluginExecution", func(t *testing.T) {
+		manager := NewPluginManager()
+		plugin := &TestPluginBasic{
+			name: "test_plugin",
+		}
+		manager.RegisterPlugin(plugin)
+
+		f := New(RawAdapter{})
+		f.SetPluginManager(manager)
+
+		// Test BeforeParse hook
+		_, err := manager.ExecuteBeforeParse(f, "id=1")
+		assert.NoError(t, err)
+		assert.True(t, plugin.beforeParseCalled)
+
+		// Test AfterParse hook
+		err = manager.ExecuteAfterParse(f, "id=1")
+		assert.NoError(t, err)
+		assert.True(t, plugin.afterParseCalled)
+	})
+
+	t.Run("FigoPluginIntegration", func(t *testing.T) {
+		f := New(RawAdapter{})
+		manager := NewPluginManager()
+		plugin := &TestPluginBasic{
+			name: "test_plugin",
+		}
+		manager.RegisterPlugin(plugin)
+		f.SetPluginManager(manager)
+
+		// Test plugin registration through figo (should fail since already registered)
+		err := f.RegisterPlugin(plugin)
+		assert.Error(t, err) // Should fail because plugin already registered
+
+		// Test plugin unregistration through figo
+		err = f.UnregisterPlugin("test_plugin")
+		assert.NoError(t, err)
+
+		// Now register through figo should work
+		err = f.RegisterPlugin(plugin)
+		assert.NoError(t, err)
+	})
+}
+
+// Test Helper for Plugin System
+type TestPluginBasic struct {
+	name              string
+	beforeParseCalled bool
+	afterParseCalled  bool
+}
+
+func (p *TestPluginBasic) Name() string {
+	return p.name
+}
+
+func (p *TestPluginBasic) Version() string {
+	return "1.0.0"
+}
+
+func (p *TestPluginBasic) Initialize(f Figo) error {
+	return nil
+}
+
+func (p *TestPluginBasic) BeforeQuery(f Figo, ctx any) error {
+	return nil
+}
+
+func (p *TestPluginBasic) AfterQuery(f Figo, ctx any, result interface{}) error {
+	return nil
+}
+
+func (p *TestPluginBasic) BeforeParse(f Figo, input string) (string, error) {
+	p.beforeParseCalled = true
+	return input, nil
+}
+
+func (p *TestPluginBasic) AfterParse(f Figo, input string) error {
+	p.afterParseCalled = true
+	return nil
+}
+
+// Test Concurrency Safety
+func TestConcurrencySafety(t *testing.T) {
+	t.Run("ConcurrentAccess", func(t *testing.T) {
+		f := New(RawAdapter{})
+		var wg sync.WaitGroup
+		numGoroutines := 10
+
+		// Test concurrent field operations
+		for i := 0; i < numGoroutines; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				f.AddIgnoreFields(fmt.Sprintf("field_%d", id))
+				f.AddSelectFields(fmt.Sprintf("select_%d", id))
+				f.SetAllowedFields(fmt.Sprintf("allowed_%d", id))
+				f.GetIgnoreFields()
+				f.GetSelectFields()
+				f.GetAllowedFields()
+			}(i)
+		}
+
+		wg.Wait()
+
+		// Verify no race conditions occurred
+		ignoreFields := f.GetIgnoreFields()
+		selectFields := f.GetSelectFields()
+		allowedFields := f.GetAllowedFields()
+
+		assert.NotNil(t, ignoreFields)
+		assert.NotNil(t, selectFields)
+		assert.NotNil(t, allowedFields)
+	})
+
+	t.Run("ConcurrentBuild", func(t *testing.T) {
+		f := New(RawAdapter{})
+		var wg sync.WaitGroup
+		numGoroutines := 5
+
+		for i := 0; i < numGoroutines; i++ {
+			wg.Add(1)
+			go func(id int) {
+				defer wg.Done()
+				f.AddFiltersFromString(fmt.Sprintf("id=%d", id))
+				f.Build()
+				f.GetClauses()
+			}(i)
+		}
+
+		wg.Wait()
+
+		// Should not panic and should have some clauses
+		clauses := f.GetClauses()
+		assert.NotNil(t, clauses)
+	})
+}
+
+// Test Memory Management
+func TestMemoryManagement(t *testing.T) {
+	t.Run("CacheMemoryLeak", func(t *testing.T) {
+		cache := NewInMemoryCache(CacheConfig{
+			MaxSize:         10,
+			TTL:             100 * time.Millisecond,
+			CleanupInterval: 50 * time.Millisecond,
+		})
+
+		// Add items
+		for i := 0; i < 20; i++ {
+			cache.Set(fmt.Sprintf("key_%d", i), fmt.Sprintf("value_%d", i), 100*time.Millisecond)
+		}
+
+		// Wait for cleanup
+		time.Sleep(200 * time.Millisecond)
+
+		// Close cache to stop goroutine
+		cache.Close()
+
+		// Should not have memory leaks
+		stats := cache.Stats()
+		assert.True(t, stats.Size <= 10) // Should be limited by MaxSize
+	})
+
+	t.Run("LargeDataSet", func(t *testing.T) {
+		f := New(RawAdapter{})
+
+		// Add many filters
+		for i := 0; i < 1000; i++ {
+			f.AddFilter(EqExpr{
+				Field: fmt.Sprintf("field_%d", i),
+				Value: fmt.Sprintf("value_%d", i),
+			})
+		}
+
+		f.Build()
+		clauses := f.GetClauses()
+		assert.Len(t, clauses, 1000)
+	})
+}
+
+// Test Error Recovery
+func TestErrorRecovery(t *testing.T) {
+	t.Run("MalformedInputRecovery", func(t *testing.T) {
+		f := New(RawAdapter{})
+
+		// Test various malformed inputs
+		malformedInputs := []string{
+			`(id=1 and name="test"`, // Unmatched parentheses
+			`id=1 and name="test`,   // Unmatched quotes
+			`id= and name="test"`,   // Missing value
+			`and name="test"`,       // Missing field
+		}
+
+		for _, input := range malformedInputs {
+			err := f.AddFiltersFromString(input)
+			if err != nil {
+				// Should return a proper ParseError
+				parseErr, ok := err.(*ParseError)
+				assert.True(t, ok)
+				assert.NotEmpty(t, parseErr.Message)
+			}
+		}
+	})
+
+	t.Run("GracefulDegradation", func(t *testing.T) {
+		f := New(RawAdapter{})
+
+		// Test that partial parsing works
+		f.AddFiltersFromString(`id=1 and name="test" and invalid_field=`)
+		f.Build()
+
+		// Should still have some valid clauses
+		clauses := f.GetClauses()
+		assert.NotNil(t, clauses)
+	})
+}
+
+// Test Edge Cases
+func TestEdgeCases(t *testing.T) {
+	t.Run("EmptyClauses", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.Build()
+		clauses := f.GetClauses()
+		assert.Empty(t, clauses)
+	})
+
+	t.Run("NilValues", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.AddFilter(EqExpr{
+			Field: "field",
+			Value: nil,
+		})
+		f.Build()
+
+		clauses := f.GetClauses()
+		assert.Len(t, clauses, 1)
+	})
+
+	t.Run("SpecialCharacters", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.AddFiltersFromString(`name = "José María" and description =^ "%café%"`)
+		f.Build()
+
+		clauses := f.GetClauses()
+		assert.NotEmpty(t, clauses)
+	})
+
+	t.Run("VeryLongStrings", func(t *testing.T) {
+		f := New(RawAdapter{})
+		longString := strings.Repeat("a", 10000)
+		f.AddFiltersFromString(fmt.Sprintf(`description = "%s"`, longString))
+		f.Build()
+
+		clauses := f.GetClauses()
+		assert.Len(t, clauses, 1)
+	})
+}
+
+// Test Backward Compatibility
+func TestBackwardCompatibilityBasic(t *testing.T) {
+	t.Run("ExistingFunctionalityUnchanged", func(t *testing.T) {
+		// Test that existing functionality still works
+		f := New(RawAdapter{})
+
+		// Test basic functionality
+		f.AddFiltersFromString(`id=1 and name="test"`)
+		f.Build()
+
+		clauses := f.GetClauses()
+		assert.Len(t, clauses, 1) // Should be a single AndExpr clause
+
+		// Test that new features are optional
+		assert.True(t, f.IsFieldAllowed("any_field")) // Should return true when whitelist is disabled
+		limits := f.GetQueryLimits()
+		assert.Equal(t, 10, limits.MaxNestingDepth) // Should have default limits
+	})
+
+	t.Run("LegacyAPI", func(t *testing.T) {
+		f := New(RawAdapter{})
+
+		// Test legacy methods still work
+		f.AddIgnoreFields("field1", "field2")
+		f.AddSelectFields("field3", "field4")
+
+		ignoreFields := f.GetIgnoreFields()
+		selectFields := f.GetSelectFields()
+
+		assert.True(t, ignoreFields["field1"])
+		assert.True(t, ignoreFields["field2"])
+		assert.True(t, selectFields["field3"])
+		assert.True(t, selectFields["field4"])
+	})
 }

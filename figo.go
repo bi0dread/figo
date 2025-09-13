@@ -1,9 +1,13 @@
 package figo
 
 import (
+	"context"
+	"crypto/md5"
 	"fmt"
 	"strconv"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/gobeam/stringy"
 )
@@ -65,6 +69,574 @@ const (
 type Page struct {
 	Skip int
 	Take int
+}
+
+// QueryLimits defines limits for query complexity
+type QueryLimits struct {
+	MaxNestingDepth    int
+	MaxFieldCount      int
+	MaxParameterCount  int
+	MaxExpressionCount int
+}
+
+// CacheConfig defines caching configuration
+type CacheConfig struct {
+	Enabled         bool
+	TTL             time.Duration
+	MaxSize         int
+	CleanupInterval time.Duration
+}
+
+// CacheEntry represents a cached query result
+type CacheEntry struct {
+	Data      interface{}
+	ExpiresAt time.Time
+	CreatedAt time.Time
+	HitCount  int64
+}
+
+// QueryCache interface for different cache implementations
+type QueryCache interface {
+	Get(key string) (interface{}, bool)
+	Set(key string, value interface{}, ttl time.Duration)
+	Delete(key string)
+	Clear()
+	Stats() CacheStats
+}
+
+// CacheStats provides cache performance metrics
+type CacheStats struct {
+	Hits        int64
+	Misses      int64
+	Size        int
+	HitRate     float64
+	MemoryUsage int64
+}
+
+// BatchOperation represents a single operation in a batch
+type BatchOperation struct {
+	ID      string
+	Query   Figo
+	Context any
+	Type    string
+}
+
+// BatchResult represents the result of a batch operation
+type BatchResult struct {
+	ID      string
+	Result  interface{}
+	Error   error
+	Success bool
+}
+
+// BatchProcessor handles batch operations
+type BatchProcessor interface {
+	Process(operations []BatchOperation) []BatchResult
+	ProcessAsync(operations []BatchOperation) <-chan BatchResult
+}
+
+// InMemoryBatchProcessor implements BatchProcessor using in-memory processing
+type InMemoryBatchProcessor struct {
+	maxConcurrency int
+	timeout        time.Duration
+}
+
+// Metrics represents performance metrics
+type Metrics struct {
+	QueryCount     int64
+	CacheHits      int64
+	CacheMisses    int64
+	AverageLatency time.Duration
+	TotalLatency   time.Duration
+	ErrorCount     int64
+	LastQueryTime  time.Time
+}
+
+// PerformanceMonitor tracks query performance
+type PerformanceMonitor struct {
+	metrics *Metrics
+	enabled bool
+	mu      sync.RWMutex
+}
+
+// NewPerformanceMonitor creates a new performance monitor
+func NewPerformanceMonitor(enabled bool) *PerformanceMonitor {
+	return &PerformanceMonitor{
+		metrics: &Metrics{},
+		enabled: enabled,
+	}
+}
+
+// RecordQuery records a query execution
+func (pm *PerformanceMonitor) RecordQuery(latency time.Duration, cacheHit bool, err error) {
+	if !pm.enabled {
+		return
+	}
+
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	pm.metrics.QueryCount++
+	pm.metrics.TotalLatency += latency
+	pm.metrics.AverageLatency = time.Duration(int64(pm.metrics.TotalLatency) / pm.metrics.QueryCount)
+	pm.metrics.LastQueryTime = time.Now()
+
+	if cacheHit {
+		pm.metrics.CacheHits++
+	} else {
+		pm.metrics.CacheMisses++
+	}
+
+	if err != nil {
+		pm.metrics.ErrorCount++
+	}
+}
+
+// GetMetrics returns current metrics
+func (pm *PerformanceMonitor) GetMetrics() Metrics {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	// Create a copy to avoid returning a value that contains a lock
+	return Metrics{
+		QueryCount:     pm.metrics.QueryCount,
+		CacheHits:      pm.metrics.CacheHits,
+		CacheMisses:    pm.metrics.CacheMisses,
+		AverageLatency: pm.metrics.AverageLatency,
+		TotalLatency:   pm.metrics.TotalLatency,
+		ErrorCount:     pm.metrics.ErrorCount,
+		LastQueryTime:  pm.metrics.LastQueryTime,
+	}
+}
+
+// Reset resets all metrics
+func (pm *PerformanceMonitor) Reset() {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	pm.metrics = &Metrics{}
+}
+
+// Plugin System
+
+// Plugin interface for extending Figo functionality
+type Plugin interface {
+	Name() string
+	Version() string
+	Initialize(f Figo) error
+	BeforeQuery(f Figo, ctx any) error
+	AfterQuery(f Figo, ctx any, result interface{}) error
+	BeforeParse(f Figo, dsl string) (string, error)
+	AfterParse(f Figo, dsl string) error
+}
+
+// PluginManager manages plugins
+type PluginManager struct {
+	plugins map[string]Plugin
+	mu      sync.RWMutex
+}
+
+// NewPluginManager creates a new plugin manager
+func NewPluginManager() *PluginManager {
+	return &PluginManager{
+		plugins: make(map[string]Plugin),
+	}
+}
+
+// RegisterPlugin registers a plugin
+func (pm *PluginManager) RegisterPlugin(plugin Plugin) error {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if plugin == nil {
+		return fmt.Errorf("plugin cannot be nil")
+	}
+
+	name := plugin.Name()
+	if name == "" {
+		return fmt.Errorf("plugin name cannot be empty")
+	}
+
+	if _, exists := pm.plugins[name]; exists {
+		return fmt.Errorf("plugin %s already registered", name)
+	}
+
+	pm.plugins[name] = plugin
+	return nil
+}
+
+// UnregisterPlugin removes a plugin
+func (pm *PluginManager) UnregisterPlugin(name string) error {
+	pm.mu.Lock()
+	defer pm.mu.Unlock()
+
+	if _, exists := pm.plugins[name]; !exists {
+		return fmt.Errorf("plugin %s not found", name)
+	}
+
+	delete(pm.plugins, name)
+	return nil
+}
+
+// GetPlugin retrieves a plugin by name
+func (pm *PluginManager) GetPlugin(name string) (Plugin, bool) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	plugin, exists := pm.plugins[name]
+	return plugin, exists
+}
+
+// ListPlugins returns all registered plugins
+func (pm *PluginManager) ListPlugins() []Plugin {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	plugins := make([]Plugin, 0, len(pm.plugins))
+	for _, plugin := range pm.plugins {
+		plugins = append(plugins, plugin)
+	}
+	return plugins
+}
+
+// ExecuteBeforeQuery executes all plugins' BeforeQuery hooks
+func (pm *PluginManager) ExecuteBeforeQuery(f Figo, ctx any) error {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	for _, plugin := range pm.plugins {
+		if err := plugin.BeforeQuery(f, ctx); err != nil {
+			return fmt.Errorf("plugin %s BeforeQuery error: %w", plugin.Name(), err)
+		}
+	}
+	return nil
+}
+
+// ExecuteAfterQuery executes all plugins' AfterQuery hooks
+func (pm *PluginManager) ExecuteAfterQuery(f Figo, ctx any, result interface{}) error {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	for _, plugin := range pm.plugins {
+		if err := plugin.AfterQuery(f, ctx, result); err != nil {
+			return fmt.Errorf("plugin %s AfterQuery error: %w", plugin.Name(), err)
+		}
+	}
+	return nil
+}
+
+// ExecuteBeforeParse executes all plugins' BeforeParse hooks
+func (pm *PluginManager) ExecuteBeforeParse(f Figo, dsl string) (string, error) {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	modifiedDSL := dsl
+	for _, plugin := range pm.plugins {
+		var err error
+		modifiedDSL, err = plugin.BeforeParse(f, modifiedDSL)
+		if err != nil {
+			return "", fmt.Errorf("plugin %s BeforeParse error: %w", plugin.Name(), err)
+		}
+	}
+	return modifiedDSL, nil
+}
+
+// ExecuteAfterParse executes all plugins' AfterParse hooks
+func (pm *PluginManager) ExecuteAfterParse(f Figo, dsl string) error {
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+
+	for _, plugin := range pm.plugins {
+		if err := plugin.AfterParse(f, dsl); err != nil {
+			return fmt.Errorf("plugin %s AfterParse error: %w", plugin.Name(), err)
+		}
+	}
+	return nil
+}
+
+// NewInMemoryBatchProcessor creates a new batch processor
+func NewInMemoryBatchProcessor(maxConcurrency int, timeout time.Duration) *InMemoryBatchProcessor {
+	return &InMemoryBatchProcessor{
+		maxConcurrency: maxConcurrency,
+		timeout:        timeout,
+	}
+}
+
+// Process executes batch operations synchronously
+func (bp *InMemoryBatchProcessor) Process(operations []BatchOperation) []BatchResult {
+	results := make([]BatchResult, len(operations))
+
+	// Use a semaphore to limit concurrency
+	semaphore := make(chan struct{}, bp.maxConcurrency)
+	var wg sync.WaitGroup
+
+	for i, op := range operations {
+		wg.Add(1)
+		go func(index int, operation BatchOperation) {
+			defer wg.Done()
+
+			// Acquire semaphore
+			semaphore <- struct{}{}
+			defer func() { <-semaphore }()
+
+			// Execute operation with timeout
+			result := bp.executeOperation(operation)
+			results[index] = result
+		}(i, op)
+	}
+
+	wg.Wait()
+	return results
+}
+
+// ProcessAsync executes batch operations asynchronously
+func (bp *InMemoryBatchProcessor) ProcessAsync(operations []BatchOperation) <-chan BatchResult {
+	resultChan := make(chan BatchResult, len(operations))
+
+	go func() {
+		defer close(resultChan)
+
+		// Use a semaphore to limit concurrency
+		semaphore := make(chan struct{}, bp.maxConcurrency)
+		var wg sync.WaitGroup
+
+		for _, op := range operations {
+			wg.Add(1)
+			go func(operation BatchOperation) {
+				defer wg.Done()
+
+				// Acquire semaphore
+				semaphore <- struct{}{}
+				defer func() { <-semaphore }()
+
+				// Execute operation with timeout
+				result := bp.executeOperation(operation)
+				resultChan <- result
+			}(op)
+		}
+
+		wg.Wait()
+	}()
+
+	return resultChan
+}
+
+// executeOperation executes a single operation
+func (bp *InMemoryBatchProcessor) executeOperation(operation BatchOperation) BatchResult {
+	ctx, cancel := context.WithTimeout(context.Background(), bp.timeout)
+	defer cancel()
+
+	result := BatchResult{
+		ID:      operation.ID,
+		Success: false,
+	}
+
+	// Execute based on operation type
+	switch operation.Type {
+	case "sql":
+		sql := operation.Query.GetSqlString(operation.Context)
+		result.Result = sql
+		result.Success = true
+	case "query":
+		query := operation.Query.GetQuery(operation.Context)
+		result.Result = query
+		result.Success = true
+	case "cached_sql":
+		sql := operation.Query.GetCachedSqlString(operation.Context)
+		result.Result = sql
+		result.Success = true
+	case "cached_query":
+		query := operation.Query.GetCachedQuery(operation.Context)
+		result.Result = query
+		result.Success = true
+	default:
+		result.Error = fmt.Errorf("unknown operation type: %s", operation.Type)
+	}
+
+	// Check for timeout
+	select {
+	case <-ctx.Done():
+		result.Error = ctx.Err()
+		result.Success = false
+	default:
+	}
+
+	return result
+}
+
+// InMemoryCache implements QueryCache using in-memory storage
+type InMemoryCache struct {
+	mu       sync.RWMutex
+	entries  map[string]*CacheEntry
+	config   CacheConfig
+	hits     int64
+	misses   int64
+	stopChan chan struct{}
+}
+
+// NewInMemoryCache creates a new in-memory cache instance
+func NewInMemoryCache(config CacheConfig) *InMemoryCache {
+	cache := &InMemoryCache{
+		entries:  make(map[string]*CacheEntry),
+		config:   config,
+		stopChan: make(chan struct{}),
+	}
+
+	if config.Enabled && config.CleanupInterval > 0 {
+		go cache.cleanup()
+	}
+
+	return cache
+}
+
+// Close properly stops the cache and cleans up resources
+func (c *InMemoryCache) Close() {
+	c.Stop()
+}
+
+// Get retrieves a value from the cache
+func (c *InMemoryCache) Get(key string) (interface{}, bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	entry, exists := c.entries[key]
+	if !exists {
+		c.misses++
+		return nil, false
+	}
+
+	// Check if expired
+	if time.Now().After(entry.ExpiresAt) {
+		c.misses++
+		return nil, false
+	}
+
+	entry.HitCount++
+	c.hits++
+	return entry.Data, true
+}
+
+// Set stores a value in the cache
+func (c *InMemoryCache) Set(key string, value interface{}, ttl time.Duration) {
+	if !c.config.Enabled {
+		return
+	}
+
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	// Check size limit
+	if len(c.entries) >= c.config.MaxSize {
+		c.evictLRU()
+	}
+
+	c.entries[key] = &CacheEntry{
+		Data:      value,
+		ExpiresAt: time.Now().Add(ttl),
+		CreatedAt: time.Now(),
+		HitCount:  0,
+	}
+}
+
+// Delete removes a value from the cache
+func (c *InMemoryCache) Delete(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	delete(c.entries, key)
+}
+
+// Clear removes all entries from the cache
+func (c *InMemoryCache) Clear() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.entries = make(map[string]*CacheEntry)
+}
+
+// Stats returns cache performance statistics
+func (c *InMemoryCache) Stats() CacheStats {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+
+	total := c.hits + c.misses
+	hitRate := float64(0)
+	if total > 0 {
+		hitRate = float64(c.hits) / float64(total)
+	}
+
+	return CacheStats{
+		Hits:        c.hits,
+		Misses:      c.misses,
+		Size:        len(c.entries),
+		HitRate:     hitRate,
+		MemoryUsage: int64(len(c.entries) * 100), // Rough estimate
+	}
+}
+
+// evictLRU removes the least recently used entry
+func (c *InMemoryCache) evictLRU() {
+	var oldestKey string
+	var oldestTime time.Time
+
+	for key, entry := range c.entries {
+		if oldestKey == "" || entry.CreatedAt.Before(oldestTime) {
+			oldestKey = key
+			oldestTime = entry.CreatedAt
+		}
+	}
+
+	if oldestKey != "" {
+		delete(c.entries, oldestKey)
+	}
+}
+
+// cleanup removes expired entries periodically
+func (c *InMemoryCache) cleanup() {
+	ticker := time.NewTicker(c.config.CleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.cleanupExpired()
+		case <-c.stopChan:
+			return
+		}
+	}
+}
+
+// cleanupExpired removes expired entries
+func (c *InMemoryCache) cleanupExpired() {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	now := time.Now()
+	for key, entry := range c.entries {
+		if now.After(entry.ExpiresAt) {
+			delete(c.entries, key)
+		}
+	}
+}
+
+// Stop stops the cleanup goroutine
+func (c *InMemoryCache) Stop() {
+	close(c.stopChan)
+}
+
+// ParseError represents a DSL parsing error with context
+type ParseError struct {
+	Message    string
+	Position   int
+	Line       int
+	Column     int
+	Context    string
+	Suggestion string
+}
+
+func (e *ParseError) Error() string {
+	if e.Line > 0 {
+		return fmt.Sprintf("Parse error at line %d, column %d: %s", e.Line, e.Column, e.Message)
+	}
+	return fmt.Sprintf("Parse error at position %d: %s", e.Position, e.Message)
 }
 
 // Expr represents an ORM-agnostic expression node
@@ -176,11 +748,195 @@ func (IsNullExpr) isExpr()  {}
 func (NotNullExpr) isExpr() {}
 func (ILikeExpr) isExpr()   {}
 
+// Advanced Operators for Phase 3
+
+// JsonPathExpr represents JSON path operations
+type JsonPathExpr struct {
+	Field string
+	Path  string
+	Value any
+	Op    string // "=", "!=", ">", "<", ">=", "<=", "contains", "exists"
+}
+
+// ArrayContainsExpr represents array contains operations
+type ArrayContainsExpr struct {
+	Field  string
+	Values []any
+}
+
+// ArrayOverlapsExpr represents array overlap operations
+type ArrayOverlapsExpr struct {
+	Field  string
+	Values []any
+}
+
+// FullTextSearchExpr represents full-text search operations
+type FullTextSearchExpr struct {
+	Field    string
+	Query    string
+	Language string // Optional language for full-text search
+}
+
+// GeoDistanceExpr represents geographical distance operations
+type GeoDistanceExpr struct {
+	Field     string
+	Latitude  float64
+	Longitude float64
+	Distance  float64 // in kilometers
+	Unit      string  // "km", "miles", "meters"
+}
+
+// CustomExpr represents custom operations
+type CustomExpr struct {
+	Field    string
+	Operator string
+	Value    any
+	Handler  func(field, operator string, value any) (string, []any, error)
+}
+
+// Validation System
+
+// ValidationRule represents a validation rule
+type ValidationRule struct {
+	Field   string
+	Rule    string
+	Value   any
+	Message string
+	Handler func(field, rule string, value any) error
+}
+
+// Validator interface for custom validation
+type Validator interface {
+	Validate(field, rule string, value any) error
+	GetRuleName() string
+}
+
+// ValidationManager manages validation rules
+type ValidationManager struct {
+	rules      []ValidationRule
+	validators map[string]Validator
+	mu         sync.RWMutex
+}
+
+// NewValidationManager creates a new validation manager
+func NewValidationManager() *ValidationManager {
+	return &ValidationManager{
+		rules:      make([]ValidationRule, 0),
+		validators: make(map[string]Validator),
+	}
+}
+
+// AddRule adds a validation rule
+func (vm *ValidationManager) AddRule(rule ValidationRule) {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+	vm.rules = append(vm.rules, rule)
+}
+
+// RegisterValidator registers a custom validator
+func (vm *ValidationManager) RegisterValidator(validator Validator) {
+	vm.mu.Lock()
+	defer vm.mu.Unlock()
+	vm.validators[validator.GetRuleName()] = validator
+}
+
+// Validate validates a field value against all applicable rules
+func (vm *ValidationManager) Validate(field string, value any) error {
+	vm.mu.RLock()
+	defer vm.mu.RUnlock()
+
+	for _, rule := range vm.rules {
+		if rule.Field == field || rule.Field == "*" {
+			if rule.Handler != nil {
+				if err := rule.Handler(field, rule.Rule, value); err != nil {
+					return fmt.Errorf("validation failed for field %s: %s", field, rule.Message)
+				}
+			} else if validator, exists := vm.validators[rule.Rule]; exists {
+				if err := validator.Validate(field, rule.Rule, value); err != nil {
+					return fmt.Errorf("validation failed for field %s: %s", field, rule.Message)
+				}
+			}
+		}
+	}
+	return nil
+}
+
+// Built-in validators
+type RequiredValidator struct{}
+
+func (v RequiredValidator) Validate(field, rule string, value any) error {
+	if value == nil || value == "" {
+		return fmt.Errorf("field %s is required", field)
+	}
+	return nil
+}
+func (v RequiredValidator) GetRuleName() string { return "required" }
+
+type MinLengthValidator struct{}
+
+func (v MinLengthValidator) Validate(field, rule string, value any) error {
+	if str, ok := value.(string); ok {
+		if len(str) < 3 { // Example minimum length
+			return fmt.Errorf("field %s must be at least 3 characters", field)
+		}
+	}
+	return nil
+}
+func (v MinLengthValidator) GetRuleName() string { return "min_length" }
+
+type EmailValidator struct{}
+
+func (v EmailValidator) Validate(field, rule string, value any) error {
+	if str, ok := value.(string); ok {
+		if !strings.Contains(str, "@") {
+			return fmt.Errorf("field %s must be a valid email", field)
+		}
+	}
+	return nil
+}
+func (v EmailValidator) GetRuleName() string { return "email" }
+
+// Implement Expr interface for new operators
+func (JsonPathExpr) isExpr()       {}
+func (ArrayContainsExpr) isExpr()  {}
+func (ArrayOverlapsExpr) isExpr()  {}
+func (FullTextSearchExpr) isExpr() {}
+func (GeoDistanceExpr) isExpr()    {}
+func (CustomExpr) isExpr()         {}
+
 type Figo interface {
-	AddFiltersFromString(input string)
+	AddFiltersFromString(input string) error
 	AddFilter(exp Expr)
 	AddIgnoreFields(fields ...string)
 	AddSelectFields(fields ...string)
+	SetAllowedFields(fields ...string)
+	EnableFieldWhitelist()
+	DisableFieldWhitelist()
+	IsFieldAllowed(field string) bool
+	SetQueryLimits(limits QueryLimits)
+	GetQueryLimits() QueryLimits
+	ParseFieldsValue(str string) any
+	IsFieldWhitelistEnabled() bool
+	GetDSL() string
+	SetCache(cache QueryCache)
+	GetCache() QueryCache
+	SetCacheConfig(config CacheConfig)
+	GetCacheConfig() CacheConfig
+	GetCacheStats() CacheStats
+	ClearCache()
+	SetPerformanceMonitor(monitor *PerformanceMonitor)
+	GetPerformanceMonitor() *PerformanceMonitor
+	GetMetrics() Metrics
+	ResetMetrics()
+	SetPluginManager(manager *PluginManager)
+	GetPluginManager() *PluginManager
+	RegisterPlugin(plugin Plugin) error
+	UnregisterPlugin(name string) error
+	SetValidationManager(manager *ValidationManager)
+	GetValidationManager() *ValidationManager
+	AddValidationRule(rule ValidationRule)
+	RegisterValidator(validator Validator)
+	ValidateField(field string, value any) error
 	SetNamingStrategy(strategy NamingStrategy)
 	SetPage(skip, take int)
 	SetPageString(v string)
@@ -188,6 +944,7 @@ type Figo interface {
 	GetNamingStrategy() NamingStrategy
 	GetIgnoreFields() map[string]bool
 	GetSelectFields() map[string]bool
+	GetAllowedFields() map[string]bool
 	GetClauses() []Expr
 	GetPreloads() map[string][]Expr
 	GetPage() Page
@@ -195,6 +952,8 @@ type Figo interface {
 	GetSqlString(ctx any, conditionType ...string) string
 	GetExplainedSqlString(ctx any, conditionType ...string) string
 	GetQuery(ctx any, conditionType ...string) Query
+	GetCachedSqlString(ctx any, conditionType ...string) string
+	GetCachedQuery(ctx any, conditionType ...string) Query
 	Build()
 }
 
@@ -204,15 +963,24 @@ type Adapter interface {
 }
 
 type figo struct {
-	clauses        []Expr
-	preloads       map[string][]Expr
-	page           Page
-	sort           *OrderBy
-	ignoreFields   map[string]bool
-	selectFields   map[string]bool
-	dsl            string
-	namingStrategy NamingStrategy
-	adapterObj     Adapter
+	clauses           []Expr
+	preloads          map[string][]Expr
+	page              Page
+	sort              *OrderBy
+	ignoreFields      map[string]bool
+	selectFields      map[string]bool
+	allowedFields     map[string]bool
+	fieldWhitelist    bool
+	queryLimits       QueryLimits
+	cache             QueryCache
+	cacheConfig       CacheConfig
+	monitor           *PerformanceMonitor
+	pluginManager     *PluginManager
+	validationManager *ValidationManager
+	dsl               string
+	namingStrategy    NamingStrategy
+	adapterObj        Adapter
+	mu                sync.RWMutex // Mutex for concurrent access protection
 }
 
 // Constructor: use New(adapter) with an Adapter object (or nil)
@@ -222,7 +990,12 @@ func New(adapter Adapter) Figo {
 	f := &figo{page: Page{
 		Skip: 0,
 		Take: 20,
-	}, preloads: make(map[string][]Expr), ignoreFields: make(map[string]bool), selectFields: make(map[string]bool), clauses: make([]Expr, 0), namingStrategy: NAMING_STRATEGY_SNAKE_CASE}
+	}, preloads: make(map[string][]Expr), ignoreFields: make(map[string]bool), selectFields: make(map[string]bool), allowedFields: make(map[string]bool), fieldWhitelist: false, queryLimits: QueryLimits{
+		MaxNestingDepth:    10,
+		MaxFieldCount:      50,
+		MaxParameterCount:  100,
+		MaxExpressionCount: 200,
+	}, clauses: make([]Expr, 0), namingStrategy: NAMING_STRATEGY_SNAKE_CASE}
 	f.adapterObj = adapter
 	return f
 }
@@ -243,6 +1016,42 @@ type Node struct {
 	Field      string
 	Children   []*Node
 	Parent     *Node
+}
+
+// validateParentheses checks if parentheses are properly matched
+func (f *figo) validateParentheses(expr string) bool {
+	count := 0
+	for _, char := range expr {
+		if char == '(' {
+			count++
+		} else if char == ')' {
+			count--
+			if count < 0 {
+				return false // Unmatched closing parenthesis
+			}
+		}
+	}
+	return count == 0 // All parentheses matched
+}
+
+// validateQuotes checks if quotes are properly matched
+func (f *figo) validateQuotes(expr string) bool {
+	inQuotes := false
+	quoteChar := rune(0)
+
+	for _, char := range expr {
+		if char == '"' || char == '\'' {
+			if !inQuotes {
+				inQuotes = true
+				quoteChar = char
+			} else if char == quoteChar {
+				inQuotes = false
+				quoteChar = 0
+			}
+		}
+	}
+
+	return !inQuotes // All quotes properly closed
 }
 
 func (f *figo) parseDSL(expr string) *Node {
@@ -569,6 +1378,7 @@ outerLoop:
 						continue
 					} else {
 
+						// Check ignore fields
 						for ignoreField := range f.ignoreFields {
 							if field == ignoreField {
 								i = j
@@ -576,14 +1386,18 @@ outerLoop:
 							}
 						}
 
+						// Field whitelist check will be done during expression building
+
 					}
 
-					newNode := &Node{Operator: operator, Value: valueStrForOp, Field: f.parsFieldsName(field), Parent: current, Expression: make([]Expr, 0)}
+					// Convert field name after whitelist check
+					convertedField := f.parsFieldsName(field)
+					newNode := &Node{Operator: operator, Value: valueStrForOp, Field: convertedField, Parent: current, Expression: make([]Expr, 0)}
 					if Operation(valueStrForOp) == OperationAnd || Operation(valueStrForOp) == OperationOr || Operation(valueStrForOp) == OperationNot {
 						newNode.Operator = Operation(valueStrForOp)
 					} else {
 
-						newNode.Expression = append(newNode.Expression, getClausesFromOperation(operator, f.parsFieldsName(field), value))
+						newNode.Expression = append(newNode.Expression, getClausesFromOperation(operator, convertedField, value))
 					}
 					current.Children = append(current.Children, newNode)
 					i = j
@@ -613,7 +1427,14 @@ func (f *figo) parsFieldsValue(str string) any {
 
 	// Handle quoted strings - remove quotes but keep as string
 	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		return s[1 : len(s)-1] // Remove quotes
+		quotedStr := s[1 : len(s)-1] // Remove quotes
+
+		// Try to parse quoted string as date
+		if dateVal, err := parseDate(quotedStr); err == nil {
+			return dateVal
+		}
+
+		return quotedStr
 	}
 
 	// Parse boolean values (only for unquoted values)
@@ -622,6 +1443,11 @@ func (f *figo) parsFieldsValue(str string) any {
 	}
 	if s == "false" {
 		return false
+	}
+
+	// Parse null values
+	if s == "null" || s == "NULL" {
+		return nil
 	}
 
 	// Parse numeric values (only for unquoted values)
@@ -634,10 +1460,41 @@ func (f *figo) parsFieldsValue(str string) any {
 		if floatVal, err := strconv.ParseFloat(s, 64); err == nil {
 			return floatVal
 		}
+
+		// Try to parse as date (unquoted)
+		if dateVal, err := parseDate(s); err == nil {
+			return dateVal
+		}
 	}
 
 	// Return as string
 	return s
+}
+
+// parseDate attempts to parse a string as a date using common formats
+func parseDate(s string) (time.Time, error) {
+	// Common date formats to try
+	formats := []string{
+		time.RFC3339,           // 2006-01-02T15:04:05Z07:00
+		time.RFC3339Nano,       // 2006-01-02T15:04:05.999999999Z07:00
+		"2006-01-02T15:04:05Z", // 2006-01-02T15:04:05Z
+		"2006-01-02T15:04:05",  // 2006-01-02T15:04:05
+		"2006-01-02 15:04:05",  // 2006-01-02 15:04:05
+		"2006-01-02",           // 2006-01-02
+		"2006/01/02",           // 2006/01/02
+		"01/02/2006",           // 01/02/2006 (US format)
+		"02/01/2006",           // 02/01/2006 (EU format)
+		"Jan 2, 2006",          // Jan 2, 2006
+		"January 2, 2006",      // January 2, 2006
+	}
+
+	for _, format := range formats {
+		if t, err := time.Parse(format, s); err == nil {
+			return t, nil
+		}
+	}
+
+	return time.Time{}, fmt.Errorf("unable to parse date: %s", s)
 }
 
 // isSimpleFieldName checks if a token looks like a simple field name
@@ -1017,16 +1874,73 @@ func getFinalExpr(node Node) Expr {
 
 }
 
-func (f *figo) AddFiltersFromString(input string) {
+// validateInput validates the input DSL string
+func (f *figo) validateInput(input string) error {
+	// Validate parentheses
+	if !f.validateParentheses(input) {
+		return &ParseError{
+			Message: "unmatched parentheses",
+			Context: input,
+			Line:    1,
+		}
+	}
 
+	// Validate quotes
+	if !f.validateQuotes(input) {
+		return &ParseError{
+			Message: "unmatched quotes",
+			Context: input,
+			Line:    1,
+		}
+	}
+
+	return nil
+}
+
+func (f *figo) AddFiltersFromString(input string) error {
+	// Handle empty input
+	if strings.TrimSpace(input) == "" {
+		return nil
+	}
+
+	// Validate input before processing
+	if err := f.validateInput(input); err != nil {
+		return err
+	}
+
+	// Execute BeforeParse plugin hooks
+	if f.pluginManager != nil {
+		var err error
+		input, err = f.pluginManager.ExecuteBeforeParse(f, input)
+		if err != nil {
+			return fmt.Errorf("plugin BeforeParse error: %w", err)
+		}
+	}
+
+	// Update DSL string (replace existing)
 	f.dsl = input
+
+	// Execute AfterParse plugin hooks
+	if f.pluginManager != nil {
+		err := f.pluginManager.ExecuteAfterParse(f, input)
+		if err != nil {
+			return fmt.Errorf("plugin AfterParse error: %w", err)
+		}
+	}
+
+	return nil
 }
 
 func (f *figo) AddFilter(exp Expr) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	f.clauses = append(f.clauses, exp)
 }
 
 func (f *figo) AddIgnoreFields(fields ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	for _, field := range fields {
 		f.ignoreFields[field] = true
@@ -1034,6 +1948,8 @@ func (f *figo) AddIgnoreFields(fields ...string) {
 }
 
 func (f *figo) AddSelectFields(fields ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 
 	for _, field := range fields {
 		f.selectFields[field] = true
@@ -1041,13 +1957,25 @@ func (f *figo) AddSelectFields(fields ...string) {
 }
 
 func (f *figo) GetIgnoreFields() map[string]bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 
-	return f.ignoreFields
+	// Return a copy to avoid race conditions
+	result := make(map[string]bool)
+	for k, v := range f.ignoreFields {
+		result[k] = v
+	}
+	return result
 }
 
 func (f *figo) GetClauses() []Expr {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 
-	return f.clauses
+	// Return a copy to avoid race conditions
+	result := make([]Expr, len(f.clauses))
+	copy(result, f.clauses)
+	return result
 }
 
 func (f *figo) GetPreloads() map[string][]Expr {
@@ -1095,8 +2023,15 @@ func (f *figo) SetPageString(v string) {
 }
 
 func (f *figo) GetSelectFields() map[string]bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 
-	return f.selectFields
+	// Return a copy to avoid race conditions
+	result := make(map[string]bool)
+	for k, v := range f.selectFields {
+		result[k] = v
+	}
+	return result
 }
 
 func (f *figo) SetNamingStrategy(strategy NamingStrategy) {
@@ -1151,18 +2086,461 @@ func (f *figo) GetQuery(ctx any, conditionType ...string) Query {
 	return nil
 }
 
+// Field Whitelisting Methods
+
+// SetAllowedFields sets the list of allowed fields for querying
+func (f *figo) SetAllowedFields(fields ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.allowedFields = make(map[string]bool)
+	for _, field := range fields {
+		f.allowedFields[field] = true
+	}
+}
+
+// EnableFieldWhitelist enables field whitelist validation
+func (f *figo) EnableFieldWhitelist() {
+	f.fieldWhitelist = true
+}
+
+// DisableFieldWhitelist disables field whitelist validation
+func (f *figo) DisableFieldWhitelist() {
+	f.fieldWhitelist = false
+}
+
+// IsFieldAllowed checks if a field is allowed for querying
+func (f *figo) IsFieldAllowed(field string) bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	return f.isFieldAllowedUnsafe(field)
+}
+
+// isFieldAllowedUnsafe checks if a field is allowed without acquiring locks
+// This should only be called when the caller already holds the appropriate lock
+func (f *figo) isFieldAllowedUnsafe(field string) bool {
+	if !f.fieldWhitelist {
+		return true // If whitelist is disabled, all fields are allowed
+	}
+	return f.allowedFields[field]
+}
+
+// GetAllowedFields returns the map of allowed fields
+func (f *figo) GetAllowedFields() map[string]bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
+	// Return a copy to avoid race conditions
+	result := make(map[string]bool)
+	for k, v := range f.allowedFields {
+		result[k] = v
+	}
+	return result
+}
+
+// SetQueryLimits sets the query complexity limits
+func (f *figo) SetQueryLimits(limits QueryLimits) {
+	f.queryLimits = limits
+}
+
+// GetQueryLimits returns the current query limits
+func (f *figo) GetQueryLimits() QueryLimits {
+	return f.queryLimits
+}
+
+// ParseFieldsValue parses a string value with enhanced type support
+func (f *figo) ParseFieldsValue(str string) any {
+	return f.parsFieldsValue(str)
+}
+
+// IsFieldWhitelistEnabled returns whether field whitelist is enabled
+func (f *figo) IsFieldWhitelistEnabled() bool {
+	return f.fieldWhitelist
+}
+
+// GetDSL returns the current DSL string
+func (f *figo) GetDSL() string {
+	return f.dsl
+}
+
 func (f *figo) Build() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	if f.dsl == "" {
 		return
 	}
+
+	// Clear existing clauses before rebuilding
+	f.clauses = []Expr{}
+
 	root := f.parseDSL(f.dsl)
 	expressionParser(root)
 
 	finalExpr := getFinalExpr(*root)
 
 	if finalExpr != nil {
-		f.clauses = append(f.clauses, finalExpr)
+		// Apply field whitelist filtering if enabled
+		if f.fieldWhitelist {
+			filteredExpr := f.filterAllowedFields(finalExpr)
+			if filteredExpr != nil {
+				f.clauses = append(f.clauses, filteredExpr)
+			}
+		} else {
+			f.clauses = append(f.clauses, finalExpr)
+		}
+	}
+}
 
+// filterAllowedFields recursively filters out disallowed fields from expressions
+func (f *figo) filterAllowedFields(expr Expr) Expr {
+	switch e := expr.(type) {
+	case EqExpr:
+		if f.isFieldAllowedUnsafe(e.Field) {
+			return e
+		}
+		return nil
+	case GteExpr:
+		if f.isFieldAllowedUnsafe(e.Field) {
+			return e
+		}
+		return nil
+	case GtExpr:
+		if f.isFieldAllowedUnsafe(e.Field) {
+			return e
+		}
+		return nil
+	case LtExpr:
+		if f.isFieldAllowedUnsafe(e.Field) {
+			return e
+		}
+		return nil
+	case LteExpr:
+		if f.isFieldAllowedUnsafe(e.Field) {
+			return e
+		}
+		return nil
+	case NeqExpr:
+		if f.isFieldAllowedUnsafe(e.Field) {
+			return e
+		}
+		return nil
+	case LikeExpr:
+		if f.isFieldAllowedUnsafe(e.Field) {
+			return e
+		}
+		return nil
+	case ILikeExpr:
+		if f.isFieldAllowedUnsafe(e.Field) {
+			return e
+		}
+		return nil
+	case RegexExpr:
+		if f.isFieldAllowedUnsafe(e.Field) {
+			return e
+		}
+		return nil
+	case InExpr:
+		if f.isFieldAllowedUnsafe(e.Field) {
+			return e
+		}
+		return nil
+	case NotInExpr:
+		if f.isFieldAllowedUnsafe(e.Field) {
+			return e
+		}
+		return nil
+	case BetweenExpr:
+		if f.isFieldAllowedUnsafe(e.Field) {
+			return e
+		}
+		return nil
+	case IsNullExpr:
+		if f.isFieldAllowedUnsafe(e.Field) {
+			return e
+		}
+		return nil
+	case NotNullExpr:
+		if f.isFieldAllowedUnsafe(e.Field) {
+			return e
+		}
+		return nil
+	case AndExpr:
+		var filteredOperands []Expr
+		for _, operand := range e.Operands {
+			if filtered := f.filterAllowedFields(operand); filtered != nil {
+				filteredOperands = append(filteredOperands, filtered)
+			}
+		}
+		if len(filteredOperands) == 0 {
+			return nil
+		}
+		if len(filteredOperands) == 1 {
+			return filteredOperands[0]
+		}
+		return AndExpr{Operands: filteredOperands}
+	case OrExpr:
+		var filteredOperands []Expr
+		for _, operand := range e.Operands {
+			if filtered := f.filterAllowedFields(operand); filtered != nil {
+				filteredOperands = append(filteredOperands, filtered)
+			}
+		}
+		if len(filteredOperands) == 0 {
+			return nil
+		}
+		if len(filteredOperands) == 1 {
+			return filteredOperands[0]
+		}
+		return OrExpr{Operands: filteredOperands}
+	case NotExpr:
+		var filteredOperands []Expr
+		for _, operand := range e.Operands {
+			if filtered := f.filterAllowedFields(operand); filtered != nil {
+				filteredOperands = append(filteredOperands, filtered)
+			}
+		}
+		if len(filteredOperands) == 0 {
+			return nil
+		}
+		return NotExpr{Operands: filteredOperands}
+	default:
+		return e
+	}
+}
+
+// Cache Management Methods
+
+// SetCache sets the query cache instance
+func (f *figo) SetCache(cache QueryCache) {
+	f.cache = cache
+}
+
+// GetCache returns the current cache instance
+func (f *figo) GetCache() QueryCache {
+	return f.cache
+}
+
+// SetCacheConfig sets the cache configuration
+func (f *figo) SetCacheConfig(config CacheConfig) {
+	f.cacheConfig = config
+	if f.cache == nil && config.Enabled {
+		f.cache = NewInMemoryCache(config)
+	}
+}
+
+// GetCacheConfig returns the current cache configuration
+func (f *figo) GetCacheConfig() CacheConfig {
+	return f.cacheConfig
+}
+
+// GetCacheStats returns cache performance statistics
+func (f *figo) GetCacheStats() CacheStats {
+	if f.cache == nil {
+		return CacheStats{}
+	}
+	return f.cache.Stats()
+}
+
+// ClearCache clears all cached entries
+func (f *figo) ClearCache() {
+	if f.cache != nil {
+		f.cache.Clear()
+	}
+}
+
+// generateCacheKey creates a unique cache key for a query
+func (f *figo) generateCacheKey(ctx any, conditionType ...string) string {
+	// Create a hash of the query components
+	components := []string{
+		f.dsl,
+		fmt.Sprintf("%v", f.clauses),
+		fmt.Sprintf("%v", f.preloads),
+		fmt.Sprintf("%v", f.page),
+		fmt.Sprintf("%v", f.sort),
+		fmt.Sprintf("%v", f.ignoreFields),
+		fmt.Sprintf("%v", f.selectFields),
+		fmt.Sprintf("%v", f.allowedFields),
+		fmt.Sprintf("%v", f.fieldWhitelist),
+		fmt.Sprintf("%v", f.namingStrategy),
+		fmt.Sprintf("%v", ctx),
+		fmt.Sprintf("%v", conditionType),
 	}
 
+	content := strings.Join(components, "|")
+	hash := md5.Sum([]byte(content))
+	return fmt.Sprintf("figo:%x", hash)
+}
+
+// GetCachedSqlString retrieves SQL string from cache or generates it
+func (f *figo) GetCachedSqlString(ctx any, conditionType ...string) string {
+	start := time.Now()
+	var cacheHit bool
+	var err error
+
+	defer func() {
+		latency := time.Since(start)
+		f.recordQueryExecution(latency, cacheHit, err)
+	}()
+
+	if f.cache == nil || !f.cacheConfig.Enabled {
+		return f.GetSqlString(ctx, conditionType...)
+	}
+
+	key := f.generateCacheKey(ctx, conditionType...)
+
+	// Try to get from cache
+	if cached, found := f.cache.Get(key); found {
+		if sql, ok := cached.(string); ok {
+			cacheHit = true
+			return sql
+		}
+	}
+
+	// Generate and cache
+	sql := f.GetSqlString(ctx, conditionType...)
+	f.cache.Set(key, sql, f.cacheConfig.TTL)
+	cacheHit = false
+
+	return sql
+}
+
+// GetCachedQuery retrieves query from cache or generates it
+func (f *figo) GetCachedQuery(ctx any, conditionType ...string) Query {
+	start := time.Now()
+	var cacheHit bool
+	var err error
+
+	defer func() {
+		latency := time.Since(start)
+		f.recordQueryExecution(latency, cacheHit, err)
+	}()
+
+	if f.cache == nil || !f.cacheConfig.Enabled {
+		return f.GetQuery(ctx, conditionType...)
+	}
+
+	key := f.generateCacheKey(ctx, conditionType...)
+
+	// Try to get from cache
+	if cached, found := f.cache.Get(key); found {
+		if query, ok := cached.(Query); ok {
+			cacheHit = true
+			return query
+		}
+	}
+
+	// Generate and cache
+	query := f.GetQuery(ctx, conditionType...)
+	if query != nil {
+		f.cache.Set(key, query, f.cacheConfig.TTL)
+	}
+	cacheHit = false
+
+	return query
+}
+
+// Performance Monitoring Methods
+
+// SetPerformanceMonitor sets the performance monitor
+func (f *figo) SetPerformanceMonitor(monitor *PerformanceMonitor) {
+	f.monitor = monitor
+}
+
+// GetPerformanceMonitor returns the current performance monitor
+func (f *figo) GetPerformanceMonitor() *PerformanceMonitor {
+	return f.monitor
+}
+
+// GetMetrics returns current performance metrics
+func (f *figo) GetMetrics() Metrics {
+	if f.monitor == nil {
+		return Metrics{}
+	}
+	return f.monitor.GetMetrics()
+}
+
+// ResetMetrics resets all performance metrics
+func (f *figo) ResetMetrics() {
+	if f.monitor != nil {
+		f.monitor.Reset()
+	}
+}
+
+// recordQueryExecution records a query execution for monitoring
+func (f *figo) recordQueryExecution(latency time.Duration, cacheHit bool, err error) {
+	if f.monitor != nil {
+		f.monitor.RecordQuery(latency, cacheHit, err)
+	}
+}
+
+// Plugin Management Methods
+
+// SetPluginManager sets the plugin manager
+func (f *figo) SetPluginManager(manager *PluginManager) {
+	f.pluginManager = manager
+}
+
+// GetPluginManager returns the current plugin manager
+func (f *figo) GetPluginManager() *PluginManager {
+	return f.pluginManager
+}
+
+// RegisterPlugin registers a plugin
+func (f *figo) RegisterPlugin(plugin Plugin) error {
+	if f.pluginManager == nil {
+		f.pluginManager = NewPluginManager()
+	}
+
+	if err := f.pluginManager.RegisterPlugin(plugin); err != nil {
+		return err
+	}
+
+	// Initialize the plugin
+	return plugin.Initialize(f)
+}
+
+// UnregisterPlugin removes a plugin
+func (f *figo) UnregisterPlugin(name string) error {
+	if f.pluginManager == nil {
+		return fmt.Errorf("no plugin manager available")
+	}
+	return f.pluginManager.UnregisterPlugin(name)
+}
+
+// Validation Management Methods
+
+// SetValidationManager sets the validation manager
+func (f *figo) SetValidationManager(manager *ValidationManager) {
+	f.validationManager = manager
+}
+
+// GetValidationManager returns the current validation manager
+func (f *figo) GetValidationManager() *ValidationManager {
+	return f.validationManager
+}
+
+// AddValidationRule adds a validation rule
+func (f *figo) AddValidationRule(rule ValidationRule) {
+	if f.validationManager == nil {
+		f.validationManager = NewValidationManager()
+	}
+	f.validationManager.AddRule(rule)
+}
+
+// RegisterValidator registers a custom validator
+func (f *figo) RegisterValidator(validator Validator) {
+	if f.validationManager == nil {
+		f.validationManager = NewValidationManager()
+	}
+	f.validationManager.RegisterValidator(validator)
+}
+
+// ValidateField validates a field value
+func (f *figo) ValidateField(field string, value any) error {
+	if f.validationManager == nil {
+		return nil // No validation if no manager
+	}
+	return f.validationManager.Validate(field, value)
 }

@@ -178,7 +178,12 @@ func buildElasticsearchQueryFromExpr(expr Expr) map[string]interface{} {
 		}
 	case LikeExpr:
 		// Convert SQL LIKE wildcards (%) to Elasticsearch wildcards (*)
-		wildcardValue := strings.ReplaceAll(x.Value.(string), "%", "*")
+		var wildcardValue string
+		if str, ok := x.Value.(string); ok {
+			wildcardValue = strings.ReplaceAll(str, "%", "*")
+		} else {
+			wildcardValue = fmt.Sprintf("%v", x.Value)
+		}
 		return map[string]interface{}{
 			"wildcard": map[string]interface{}{
 				x.Field: wildcardValue,
@@ -186,7 +191,12 @@ func buildElasticsearchQueryFromExpr(expr Expr) map[string]interface{} {
 		}
 	case ILikeExpr:
 		// Convert SQL LIKE wildcards (%) to Elasticsearch wildcards (*)
-		wildcardValue := strings.ReplaceAll(x.Value.(string), "%", "*")
+		var wildcardValue string
+		if str, ok := x.Value.(string); ok {
+			wildcardValue = strings.ReplaceAll(str, "%", "*")
+		} else {
+			wildcardValue = fmt.Sprintf("%v", x.Value)
+		}
 		return map[string]interface{}{
 			"wildcard": map[string]interface{}{
 				x.Field: map[string]interface{}{
