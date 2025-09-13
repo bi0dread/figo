@@ -259,8 +259,10 @@ outerLoop:
 			current = newNode
 			i++
 		case ')':
-			stack = stack[:len(stack)-1]
-			current = stack[len(stack)-1]
+			if len(stack) > 1 {
+				stack = stack[:len(stack)-1]
+				current = stack[len(stack)-1]
+			}
 			i++
 		case ' ':
 			i++
@@ -318,7 +320,12 @@ outerLoop:
 						loadLabel := fmt.Sprintf("%v=[", string(OperationLoad))
 
 						v := strings.TrimSpace(expr[i:k])
-						content := v[strings.Index(v, loadLabel)+len(loadLabel) : len(v)-1]
+						labelIndex := strings.Index(v, loadLabel)
+						if labelIndex == -1 {
+							i = k
+							continue
+						}
+						content := v[labelIndex+len(loadLabel) : len(v)-1]
 						if content == "" {
 							i = k
 							continue
@@ -326,9 +333,13 @@ outerLoop:
 
 						loadSplit := strings.Split(content, "|")
 						for _, l := range loadSplit {
-							rawTable := l[:strings.Index(l, ":")]
+							colonIndex := strings.Index(l, ":")
+							if colonIndex == -1 {
+								continue
+							}
+							rawTable := l[:colonIndex]
 							table := strings.TrimSpace(rawTable)
-							loadContent := strings.TrimSpace(l[len(rawTable)+1:])
+							loadContent := strings.TrimSpace(l[colonIndex+1:])
 
 							loadRootNode := f.parseDSL(loadContent)
 							expressionParser(loadRootNode)
@@ -812,14 +823,18 @@ func expressionParser(node *Node) {
 				var v []Expr
 				v = append(v, latestExpr)
 
-				if node.Children[i+1].Operator == OperationChild {
-					expressionParser(node.Children[i+1])
-				}
+				if i+1 < len(node.Children) {
+					if node.Children[i+1].Operator == OperationChild {
+						expressionParser(node.Children[i+1])
+					}
 
-				if len(node.Children[i+1].Expression) == 0 {
+					if len(node.Children[i+1].Expression) == 0 {
+						continue
+					}
+					v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
+				} else {
 					continue
 				}
-				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
 
 				exp := AndExpr{Operands: v}
 				latestExpr = exp
@@ -840,11 +855,15 @@ func expressionParser(node *Node) {
 				var v []Expr
 				v = append(v, latestExpr)
 
-				if node.Children[i+1].Operator == OperationChild {
-					expressionParser(node.Children[i+1])
-				}
+				if i+1 < len(node.Children) {
+					if node.Children[i+1].Operator == OperationChild {
+						expressionParser(node.Children[i+1])
+					}
 
-				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
+					v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
+				} else {
+					continue
+				}
 
 				exp := OrExpr{Operands: v}
 				latestExpr = exp
@@ -893,14 +912,18 @@ func expressionParser(node *Node) {
 				var v []Expr
 				v = append(v, latestExpr)
 
-				if node.Children[i+1].Operator == OperationChild {
-					expressionParser(node.Children[i+1])
-				}
+				if i+1 < len(node.Children) {
+					if node.Children[i+1].Operator == OperationChild {
+						expressionParser(node.Children[i+1])
+					}
 
-				if len(node.Children[i+1].Expression) == 0 {
+					if len(node.Children[i+1].Expression) == 0 {
+						continue
+					}
+					v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
+				} else {
 					continue
 				}
-				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
 
 				exp := AndExpr{Operands: v}
 				latestExpr = exp
@@ -919,11 +942,15 @@ func expressionParser(node *Node) {
 				var v []Expr
 				v = append(v, latestExpr)
 
-				if node.Children[i+1].Operator == OperationChild {
-					expressionParser(node.Children[i+1])
-				}
+				if i+1 < len(node.Children) {
+					if node.Children[i+1].Operator == OperationChild {
+						expressionParser(node.Children[i+1])
+					}
 
-				v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
+					v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
+				} else {
+					continue
+				}
 
 				exp := OrExpr{Operands: v}
 				latestExpr = exp
