@@ -330,6 +330,9 @@ func AdapterRawGetSql(f Figo, ctx any, conditionType ...string) (string, []any, 
 type RawAdapter struct{}
 
 func (RawAdapter) GetSqlString(f Figo, ctx any, conditionType ...string) (string, bool) {
+	if f == nil {
+		return "", false
+	}
 	sql, args, ok := AdapterRawGetSql(f, ctx, conditionType...)
 	if !ok {
 		return "", false
@@ -338,6 +341,9 @@ func (RawAdapter) GetSqlString(f Figo, ctx any, conditionType ...string) (string
 }
 
 func (RawAdapter) GetQuery(f Figo, ctx any, conditionType ...string) (Query, bool) {
+	if f == nil {
+		return nil, false
+	}
 	sql, args, ok := AdapterRawGetSql(f, ctx, conditionType...)
 	if !ok {
 		return nil, false

@@ -126,7 +126,12 @@ func ApplyGorm(f Figo, trx *gorm.DB) *gorm.DB {
 // GetGormSqlString renders the SQL string from a configured GORM DB instance using DryRun.
 func getGormSqlString(trx *gorm.DB, conditionType ...string) string {
 	tr := trx.Begin()
-	tr = tr.Session(&gorm.Session{DryRun: true, NewDB: true})
+	if tr.Error != nil {
+		// If Begin fails, use the original DB with dry run
+		tr = trx.Session(&gorm.Session{DryRun: true, NewDB: true})
+	} else {
+		tr = tr.Session(&gorm.Session{DryRun: true, NewDB: true})
+	}
 	tr.Logger = logger.Default.LogMode(logger.Silent)
 
 	stmt := tr.Statement
@@ -138,7 +143,10 @@ func getGormSqlString(trx *gorm.DB, conditionType ...string) string {
 
 	fullSQL := tr.Dialector.Explain(sqlWithPlaceholders, params...)
 
-	tr.Rollback()
+	// Only rollback if we successfully began a transaction
+	if tr.Error == nil {
+		tr.Rollback()
+	}
 
 	return fullSQL
 }
@@ -156,10 +164,16 @@ func AdapterGormGetSql(_ Figo, ctx any, conditionType ...string) (string, bool) 
 type GormAdapter struct{}
 
 func (GormAdapter) GetSqlString(f Figo, ctx any, conditionType ...string) (string, bool) {
+	if f == nil {
+		return "", false
+	}
 	return AdapterGormGetSql(f, ctx, conditionType...)
 }
 
 func (GormAdapter) GetQuery(f Figo, ctx any, conditionType ...string) (Query, bool) {
+	if f == nil {
+		return nil, false
+	}
 	db, ok := ctx.(*gorm.DB)
 	if !ok || db == nil {
 		return nil, false

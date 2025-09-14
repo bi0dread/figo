@@ -156,7 +156,11 @@ func mongoExpr(e Expr) bson.M {
 			return bson.M{x.Field: bson.M{"$regex": v}}
 		case string:
 			// do not escape: treat as raw pattern
-			return bson.M{x.Field: bson.M{"$regex": regexp.MustCompile(v)}}
+			if compiled, err := regexp.Compile(v); err == nil {
+				return bson.M{x.Field: bson.M{"$regex": compiled}}
+			}
+			// If regex compilation fails, return empty filter
+			return bson.M{}
 		default:
 			return bson.M{}
 		}
@@ -225,7 +229,11 @@ func mongoExprQualified(e Expr, qualifier string) bson.M {
 		case *regexp.Regexp:
 			return bson.M{q(x.Field): bson.M{"$regex": v}}
 		case string:
-			return bson.M{q(x.Field): bson.M{"$regex": regexp.MustCompile(v)}}
+			if compiled, err := regexp.Compile(v); err == nil {
+				return bson.M{q(x.Field): bson.M{"$regex": compiled}}
+			}
+			// If regex compilation fails, return empty filter
+			return bson.M{}
 		default:
 			return bson.M{}
 		}
@@ -306,6 +314,9 @@ type MongoAdapter struct{}
 
 func (MongoAdapter) GetSqlString(f Figo, ctx any, conditionType ...string) (string, bool) {
 	// Mongo adapter doesn't produce SQL strings; return false
+	if f == nil {
+		return "", false
+	}
 	return "", false
 }
 
@@ -327,6 +338,9 @@ type MongoAggregateQuery struct {
 func (MongoAggregateQuery) isQuery() {}
 
 func (MongoAdapter) GetQuery(f Figo, ctx any, conditionType ...string) (Query, bool) {
+	if f == nil {
+		return nil, false
+	}
 	// Decide between Find and Aggregate based on conditionType hint
 	isAgg := false
 	for _, ct := range conditionType {

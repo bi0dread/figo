@@ -11,6 +11,9 @@ type ElasticsearchAdapter struct{}
 
 // GetSqlString returns the JSON representation of the Elasticsearch query
 func (e ElasticsearchAdapter) GetSqlString(f Figo, ctx any, conditionType ...string) (string, bool) {
+	if f == nil {
+		return "", false
+	}
 	query := BuildElasticsearchQuery(f)
 	jsonBytes, err := json.Marshal(query)
 	if err != nil {
@@ -21,6 +24,9 @@ func (e ElasticsearchAdapter) GetSqlString(f Figo, ctx any, conditionType ...str
 
 // GetQuery returns the Elasticsearch query for the given figo instance
 func (e ElasticsearchAdapter) GetQuery(f Figo, ctx any, conditionType ...string) (Query, bool) {
+	if f == nil {
+		return nil, false
+	}
 	query := BuildElasticsearchQuery(f)
 	return ElasticsearchQueryWrapper{Query: query}, true
 }

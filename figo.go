@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/md5"
 	"fmt"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -906,6 +907,7 @@ func (CustomExpr) isExpr()         {}
 
 type Figo interface {
 	AddFiltersFromString(input string) error
+	AddFiltersFromStringWithRepair(input string, useRepair bool) error
 	AddFilter(exp Expr)
 	AddIgnoreFields(fields ...string)
 	AddSelectFields(fields ...string)
@@ -1034,6 +1036,53 @@ func (f *figo) validateParentheses(expr string) bool {
 	return count == 0 // All parentheses matched
 }
 
+// validateParenthesesWithPosition checks parentheses with detailed error reporting
+func (f *figo) validateParenthesesWithPosition(expr string) error {
+	count := 0
+	line := 1
+	column := 1
+	var lastOpenPos int
+
+	for i, char := range expr {
+		if char == '\n' {
+			line++
+			column = 1
+		} else {
+			column++
+		}
+
+		if char == '(' {
+			count++
+			lastOpenPos = i
+		} else if char == ')' {
+			count--
+			if count < 0 {
+				return &ParseError{
+					Message:    "unmatched closing parenthesis",
+					Position:   i,
+					Line:       line,
+					Column:     column,
+					Context:    expr,
+					Suggestion: "Remove extra closing parenthesis or add opening parenthesis",
+				}
+			}
+		}
+	}
+
+	if count > 0 {
+		return &ParseError{
+			Message:    "unmatched opening parenthesis",
+			Position:   lastOpenPos,
+			Line:       line,
+			Column:     column,
+			Context:    expr,
+			Suggestion: "Add closing parenthesis to match opening one",
+		}
+	}
+
+	return nil
+}
+
 // validateQuotes checks if quotes are properly matched
 func (f *figo) validateQuotes(expr string) bool {
 	inQuotes := false
@@ -1052,6 +1101,140 @@ func (f *figo) validateQuotes(expr string) bool {
 	}
 
 	return !inQuotes // All quotes properly closed
+}
+
+// validateQuotesWithPosition checks quotes with detailed error reporting
+func (f *figo) validateQuotesWithPosition(expr string) error {
+	inQuotes := false
+	quoteChar := rune(0)
+	line := 1
+	column := 1
+	var quoteStartPos int
+
+	for i, char := range expr {
+		if char == '\n' {
+			line++
+			column = 1
+		} else {
+			column++
+		}
+
+		if char == '"' || char == '\'' {
+			if !inQuotes {
+				inQuotes = true
+				quoteChar = char
+				quoteStartPos = i
+			} else if char == quoteChar {
+				inQuotes = false
+				quoteChar = 0
+			}
+		}
+	}
+
+	if inQuotes {
+		return &ParseError{
+			Message:    "unmatched quote",
+			Position:   quoteStartPos,
+			Line:       line,
+			Column:     column,
+			Context:    expr,
+			Suggestion: "Add closing quote to match opening one",
+		}
+	}
+
+	return nil
+}
+
+// validateBrackets checks if brackets are properly matched for load expressions
+func (f *figo) validateBrackets(expr string) error {
+	count := 0
+	line := 1
+	column := 1
+	var lastOpenPos int
+
+	for i, char := range expr {
+		if char == '\n' {
+			line++
+			column = 1
+		} else {
+			column++
+		}
+
+		if char == '[' {
+			count++
+			lastOpenPos = i
+		} else if char == ']' {
+			count--
+			if count < 0 {
+				return &ParseError{
+					Message:    "unmatched closing bracket",
+					Position:   i,
+					Line:       line,
+					Column:     column,
+					Context:    expr,
+					Suggestion: "Remove extra closing bracket or add opening bracket",
+				}
+			}
+		}
+	}
+
+	if count > 0 {
+		return &ParseError{
+			Message:    "unmatched opening bracket",
+			Position:   lastOpenPos,
+			Line:       line,
+			Column:     column,
+			Context:    expr,
+			Suggestion: "Add closing bracket to match opening one",
+		}
+	}
+
+	return nil
+}
+
+// validateBasicSyntax checks for common syntax errors
+func (f *figo) validateBasicSyntax(expr string) error {
+	// Check for common malformed patterns
+	patterns := []struct {
+		pattern    string
+		message    string
+		suggestion string
+	}{
+		{`\s+and\s*$`, "incomplete AND expression", "Add field and value after AND"},
+		{`\s+or\s*$`, "incomplete OR expression", "Add field and value after OR"},
+		{`\s+not\s*$`, "incomplete NOT expression", "Add expression after NOT"},
+		{`=\s*$`, "incomplete equality expression", "Add value after ="},
+		{`>\s*$`, "incomplete greater than expression", "Add value after >"},
+		{`<\s*$`, "incomplete less than expression", "Add value after <"},
+		{`!=\s*$`, "incomplete not equal expression", "Add value after !="},
+		{`>=\s*$`, "incomplete greater than or equal expression", "Add value after >="},
+		{`<=\s*$`, "incomplete less than or equal expression", "Add value after <="},
+		{`=^\s*$`, "incomplete LIKE expression", "Add value after =^"},
+		{`!=^\s*$`, "incomplete NOT LIKE expression", "Add value after !=^"},
+		{`=~\s*$`, "incomplete regex expression", "Add value after =~"},
+		{`!=~\s*$`, "incomplete NOT regex expression", "Add value after !=~"},
+		{`<in>\s*$`, "incomplete IN expression", "Add value list after <in>"},
+		{`<nin>\s*$`, "incomplete NOT IN expression", "Add value list after <nin>"},
+		{`<bet>\s*$`, "incomplete BETWEEN expression", "Add value range after <bet>"},
+		{`^\s*and\b`, "expression starts with AND", "Remove AND or add field before it"},
+		{`^\s*or\b`, "expression starts with OR", "Remove OR or add field before it"},
+		{`^\s*not\b`, "expression starts with NOT", "Add expression after NOT"},
+	}
+
+	for _, p := range patterns {
+		if matched, _ := regexp.MatchString(p.pattern, expr); matched {
+			return &ParseError{
+				Message:    p.message,
+				Position:   0,
+				Line:       1,
+				Column:     1,
+				Context:    expr,
+				Suggestion: p.suggestion,
+			}
+		}
+	}
+
+	return nil
 }
 
 func (f *figo) parseDSL(expr string) *Node {
@@ -1109,6 +1292,26 @@ outerLoop:
 			}
 			token := strings.TrimSpace(expr[i:j])
 			if token != "" {
+				// Check if this is a logical operator (not, and, or)
+				if token == "not" || token == "and" || token == "or" {
+					// Handle logical operators
+					var op Operation
+					switch token {
+					case "not":
+						op = OperationNot
+					case "and":
+						op = OperationAnd
+					case "or":
+						op = OperationOr
+					}
+
+					// Create a node for the logical operator
+					newNode := &Node{Operator: op, Value: token, Field: "", Parent: current, Expression: make([]Expr, 0)}
+					current.Children = append(current.Children, newNode)
+					i = j
+					continue
+				}
+
 				if strings.HasPrefix(token, string(OperationSort)) || strings.HasPrefix(token, string(OperationPage)) || strings.HasPrefix(token, string(OperationLoad)) {
 					k := j - 1
 					if strings.HasPrefix(token, string(OperationLoad)) {
@@ -1657,255 +1860,429 @@ func getClausesFromOperation(o Operation, field string, value any) Expr {
 }
 
 func expressionParser(node *Node) {
+	// First, recursively process all child nodes to build their expressions
+	for _, child := range node.Children {
+		if child.Operator == OperationChild {
+			expressionParser(child)
+		}
+	}
 
 	if node.Operator == OperationChild {
-
 		if len(node.Children) == 1 {
 			node.Expression = append(node.Expression, node.Children[0].Expression...)
+			return
 		}
 
-		var latestExpr Expr
-
-		for i, child := range node.Children {
-			if child.Operator == OperationAnd {
-
-				if latestExpr == nil {
-					if i > 0 && len(node.Children[i-1].Expression) > 0 {
-						latestExpr = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
-					} else {
-						continue
-					}
-				}
-
-				var v []Expr
-				v = append(v, latestExpr)
-
-				if i+1 < len(node.Children) {
-					if node.Children[i+1].Operator == OperationChild {
-						expressionParser(node.Children[i+1])
-					}
-
-					if len(node.Children[i+1].Expression) == 0 {
-						continue
-					}
-					v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
-				} else {
-					continue
-				}
-
-				exp := AndExpr{Operands: v}
-				latestExpr = exp
-
-				child.Expression = append(child.Expression, exp)
-
-				node.Expression = append(node.Expression, child.Expression...)
-
-			} else if child.Operator == OperationOr {
-				if latestExpr == nil {
-					if i > 0 && len(node.Children[i-1].Expression) > 0 {
-						latestExpr = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
-					} else {
-						continue
-					}
-				}
-
-				var v []Expr
-				v = append(v, latestExpr)
-
-				if i+1 < len(node.Children) {
-					if node.Children[i+1].Operator == OperationChild {
-						expressionParser(node.Children[i+1])
-					}
-
-					v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
-				} else {
-					continue
-				}
-
-				exp := OrExpr{Operands: v}
-				latestExpr = exp
-
-				child.Expression = append(child.Expression, exp)
-
-				node.Expression = append(node.Expression, child.Expression...)
-			} else if child.Operator == OperationNot {
-				// NOT operation should only take one operand
-				if latestExpr == nil {
-					if i > 0 && len(node.Children[i-1].Expression) > 0 {
-						latestExpr = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
-					} else {
-						continue
-					}
-				}
-
-				var v []Expr
-				v = append(v, latestExpr)
-
-				exp := NotExpr{Operands: v}
-				latestExpr = exp
-
-				child.Expression = append(child.Expression, exp)
-
-				node.Expression = append(node.Expression, child.Expression...)
-
-			} else if child.Operator == OperationChild {
+		// For multiple children, build proper logical expression tree with precedence
+		expr := buildExpressionTreeWithPrecedence(node.Children)
+		if expr != nil {
+			node.Expression = append(node.Expression, expr)
+		}
+	} else {
+		// For non-child nodes, recursively process children
+		for _, child := range node.Children {
+			if child.Operator == OperationChild {
 				expressionParser(child)
 			}
 		}
-	} else {
-		var latestExpr Expr
-		for i, child := range node.Children {
 
-			if child.Operator == OperationAnd {
+		// After processing children, build expression tree with precedence
+		expr := buildExpressionTreeWithPrecedence(node.Children)
+		if expr != nil {
+			node.Expression = append(node.Expression, expr)
+		}
+	}
+}
 
-				if latestExpr == nil {
-					if i > 0 && len(node.Children[i-1].Expression) > 0 {
-						latestExpr = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
-					} else {
-						continue
-					}
-				}
+// buildExpressionTree builds a simple expression tree
+func buildExpressionTree(children []*Node) Expr {
+	if len(children) == 0 {
+		return nil
+	}
 
-				var v []Expr
-				v = append(v, latestExpr)
+	// If we have only one child, return its expression
+	if len(children) == 1 {
+		child := children[0]
+		if len(child.Expression) > 0 {
+			return child.Expression[len(child.Expression)-1]
+		}
+		return nil
+	}
 
-				if i+1 < len(node.Children) {
-					if node.Children[i+1].Operator == OperationChild {
-						expressionParser(node.Children[i+1])
-					}
+	// For multiple children, we need to build a proper logical expression tree
+	// The expressionParser should have already built the logical expressions
+	// We just need to find the final expression that represents the entire tree
 
-					if len(node.Children[i+1].Expression) == 0 {
-						continue
-					}
-					v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
-				} else {
-					continue
-				}
+	// Look for the most recent logical expression that combines all operands
+	for i := len(children) - 1; i >= 0; i-- {
+		child := children[i]
 
-				exp := AndExpr{Operands: v}
-				latestExpr = exp
+		// Skip child nodes (parentheses groups) as they should be processed separately
+		if child.Operator == OperationChild {
+			continue
+		}
 
-				child.Expression = append(child.Expression, exp)
+		// Look for logical operators that have expressions
+		if (child.Operator == OperationAnd || child.Operator == OperationOr || child.Operator == OperationNot) &&
+			len(child.Expression) > 0 {
+			// Return the most recent expression from this logical operator
+			return child.Expression[len(child.Expression)-1]
+		}
+	}
 
-			} else if child.Operator == OperationOr {
-				if latestExpr == nil {
-					if i > 0 && len(node.Children[i-1].Expression) > 0 {
-						latestExpr = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
-					} else {
-						continue
-					}
-				}
+	// If no logical expressions found, return nil
+	return nil
+}
 
-				var v []Expr
-				v = append(v, latestExpr)
+// buildExpressionTreeWithPrecedence builds a proper expression tree respecting operator precedence
+func buildExpressionTreeWithPrecedence(children []*Node) Expr {
+	if len(children) == 0 {
+		return nil
+	}
 
-				if i+1 < len(node.Children) {
-					if node.Children[i+1].Operator == OperationChild {
-						expressionParser(node.Children[i+1])
-					}
+	// Build a list of expressions and operators in order
+	var items []interface{} // Can be Expr or Operation
 
-					v = append(v, node.Children[i+1].Expression[len(node.Children[i+1].Expression)-1])
-				} else {
-					continue
-				}
+	for _, child := range children {
+		// Add expressions from this child
+		if len(child.Expression) > 0 {
+			items = append(items, child.Expression[len(child.Expression)-1])
+		}
+		// Add operators
+		if child.Operator == OperationAnd || child.Operator == OperationOr || child.Operator == OperationNot {
+			items = append(items, child.Operator)
+		}
+	}
 
-				exp := OrExpr{Operands: v}
-				latestExpr = exp
+	if len(items) == 0 {
+		return nil
+	}
 
-				child.Expression = append(child.Expression, exp)
-			} else if child.Operator == OperationNot {
-				// NOT operation should only take one operand
-				if latestExpr == nil {
-					if i > 0 && len(node.Children[i-1].Expression) > 0 {
-						latestExpr = node.Children[i-1].Expression[len(node.Children[i-1].Expression)-1]
-					} else {
-						continue
-					}
-				}
+	// If we have only one item and it's an expression, return it
+	if len(items) == 1 {
+		if expr, ok := items[0].(Expr); ok {
+			return expr
+		}
+		return nil
+	}
 
-				var v []Expr
-				v = append(v, latestExpr)
+	// Process with proper precedence: NOT > AND > OR
+	return processWithPrecedence(items)
+}
 
-				exp := NotExpr{Operands: v}
-				latestExpr = exp
+// processWithPrecedence processes expressions with proper operator precedence
+func processWithPrecedence(items []interface{}) Expr {
+	if len(items) == 0 {
+		return nil
+	}
 
-				child.Expression = append(child.Expression, exp)
-			} else if child.Operator == OperationChild {
-				expressionParser(child)
+	// Convert to a more manageable structure
+	var expressions []Expr
+	var operators []Operation
+
+	for _, item := range items {
+		switch v := item.(type) {
+		case Expr:
+			expressions = append(expressions, v)
+		case Operation:
+			operators = append(operators, v)
+		}
+	}
+
+	if len(expressions) == 0 {
+		return nil
+	}
+
+	// If we have only one expression, return it
+	if len(expressions) == 1 {
+		return expressions[0]
+	}
+
+	// Process operators in precedence order: NOT > AND > OR
+	// We need to handle this more carefully to respect the tree structure
+
+	// First pass: Handle NOT operators (highest precedence)
+	// NOT operators should be applied to the next expression
+	for i := 0; i < len(operators); i++ {
+		if operators[i] == OperationNot {
+			// Find the next expression to negate
+			if i < len(expressions) {
+				expressions[i] = NotExpr{Operands: []Expr{expressions[i]}}
+				// Remove the NOT operator
+				operators = append(operators[:i], operators[i+1:]...)
+				i-- // Adjust index
 			}
 		}
 	}
 
+	// Second pass: Handle AND operators (medium precedence)
+	// Process AND operators from left to right
+	for i := 0; i < len(operators); i++ {
+		if operators[i] == OperationAnd {
+			// Find the expressions to combine
+			left := i
+			right := i + 1
+
+			if left < len(expressions) && right < len(expressions) {
+				// Create AND expression
+				andExpr := AndExpr{Operands: []Expr{expressions[left], expressions[right]}}
+
+				// Replace the two expressions with the combined one
+				expressions = append(expressions[:left], append([]Expr{andExpr}, expressions[right+1:]...)...)
+
+				// Remove the AND operator
+				operators = append(operators[:i], operators[i+1:]...)
+				i-- // Adjust index
+			}
+		}
+	}
+
+	// Third pass: Handle OR operators (lowest precedence)
+	// Process OR operators from left to right
+	for i := 0; i < len(operators); i++ {
+		if operators[i] == OperationOr {
+			// Find the expressions to combine
+			left := i
+			right := i + 1
+
+			if left < len(expressions) && right < len(expressions) {
+				// Create OR expression
+				orExpr := OrExpr{Operands: []Expr{expressions[left], expressions[right]}}
+
+				// Replace the two expressions with the combined one
+				expressions = append(expressions[:left], append([]Expr{orExpr}, expressions[right+1:]...)...)
+
+				// Remove the OR operator
+				operators = append(operators[:i], operators[i+1:]...)
+				i-- // Adjust index
+			}
+		}
+	}
+
+	// Return the final expression
+	if len(expressions) > 0 {
+		return expressions[0]
+	}
+	return nil
 }
 
 func getFinalExpr(node Node) Expr {
+	// If the node itself has expressions, return the last one
+	if len(node.Expression) > 0 {
+		return node.Expression[len(node.Expression)-1]
+	}
 
+	// If no children, return nil
 	if len(node.Children) == 0 {
 		return nil
-	} else if len(node.Children) == 1 {
+	}
 
-		if len(node.Children[0].Expression) == 1 {
-			return node.Children[0].Expression[0]
+	// If only one child, return its expression
+	if len(node.Children) == 1 {
+		child := node.Children[0]
+		if len(child.Expression) > 0 {
+			// Return the last (most recent) expression from the child
+			return child.Expression[len(child.Expression)-1]
 		}
-		for i := len(node.Children[0].Expression) - 1; i >= 0; i-- {
+		return nil
+	}
 
-			if node.Children[0].Operator == OperationAnd || node.Children[0].Operator == OperationOr || node.Children[0].Operator == OperationNot || node.Children[0].Operator == OperationChild {
+	// For multiple children, we need to build a proper logical expression tree
+	// The expressionParser should have already built the logical expressions
+	// We just need to find the final expression that represents the entire tree
 
-				return node.Children[0].Expression[i]
+	// Look for the most recent logical expression that combines all operands
+	for i := len(node.Children) - 1; i >= 0; i-- {
+		child := node.Children[i]
 
-			}
+		// Skip child nodes (parentheses groups) as they should be processed separately
+		if child.Operator == OperationChild {
+			continue
 		}
 
-	} else {
-		for i := len(node.Children) - 1; i >= 0; i-- {
-			if node.Children[i].Operator == OperationAnd || node.Children[i].Operator == OperationOr || node.Children[i].Operator == OperationNot || node.Children[i].Operator == OperationChild {
-				if node.Children[i].Operator == OperationChild {
-					continue
-				}
-				if len(node.Children[i].Expression) == 0 {
-					continue
-				}
-				return node.Children[i].Expression[len(node.Children[i].Expression)-1]
-			}
+		// Look for logical operators that have expressions
+		if (child.Operator == OperationAnd || child.Operator == OperationOr || child.Operator == OperationNot) &&
+			len(child.Expression) > 0 {
+			// Return the most recent expression from this logical operator
+			return child.Expression[len(child.Expression)-1]
 		}
 	}
 
+	// If no logical expressions found, return nil
 	return nil
-
 }
 
-// validateInput validates the input DSL string
+// validateInput validates the input DSL string with enhanced error reporting
 func (f *figo) validateInput(input string) error {
-	// Validate parentheses
-	if !f.validateParentheses(input) {
-		return &ParseError{
-			Message: "unmatched parentheses",
-			Context: input,
-			Line:    1,
-		}
+	// Validate parentheses with position tracking
+	if err := f.validateParenthesesWithPosition(input); err != nil {
+		return err
 	}
 
-	// Validate quotes
-	if !f.validateQuotes(input) {
-		return &ParseError{
-			Message: "unmatched quotes",
-			Context: input,
-			Line:    1,
-		}
+	// Validate quotes with position tracking
+	if err := f.validateQuotesWithPosition(input); err != nil {
+		return err
+	}
+
+	// Validate brackets for load expressions
+	if err := f.validateBrackets(input); err != nil {
+		return err
+	}
+
+	// Validate basic syntax patterns
+	if err := f.validateBasicSyntax(input); err != nil {
+		return err
 	}
 
 	return nil
+}
+
+// attemptInputRepair tries to fix common malformed input patterns
+func (f *figo) attemptInputRepair(input string) (string, error) {
+	original := input
+	fixed := input
+
+	// Fix common patterns - be more conservative
+	repairs := []struct {
+		pattern     *regexp.Regexp
+		replacement string
+		description string
+	}{
+		{regexp.MustCompile(`\s+and\s*$`), "", "Remove trailing AND"},
+		{regexp.MustCompile(`\s+or\s*$`), "", "Remove trailing OR"},
+		{regexp.MustCompile(`\s+not\s*$`), "", "Remove trailing NOT"},
+		{regexp.MustCompile(`^\s*and\b`), "", "Remove leading AND"},
+		{regexp.MustCompile(`^\s*or\b`), "", "Remove leading OR"},
+		{regexp.MustCompile(`^\s*not\b`), "", "Remove leading NOT"},
+	}
+
+	// Apply repairs
+	for _, repair := range repairs {
+		if repair.pattern.MatchString(fixed) {
+			fixed = repair.pattern.ReplaceAllString(fixed, repair.replacement)
+		}
+	}
+
+	// Try to fix unmatched parentheses
+	if !f.validateParentheses(fixed) {
+		fixed = f.fixUnmatchedParentheses(fixed)
+	}
+
+	// Try to fix unmatched quotes
+	if !f.validateQuotes(fixed) {
+		fixed = f.fixUnmatchedQuotes(fixed)
+	}
+
+	// Try to fix unmatched brackets
+	if err := f.validateBrackets(fixed); err != nil {
+		fixed = f.fixUnmatchedBrackets(fixed)
+	}
+
+	// If no changes were made, return original
+	if fixed == original {
+		return original, fmt.Errorf("no repairs could be applied")
+	}
+
+	// Validate the fixed input
+	if err := f.validateInput(fixed); err != nil {
+		return original, fmt.Errorf("repair failed validation: %w", err)
+	}
+
+	return fixed, nil
+}
+
+// fixUnmatchedParentheses attempts to fix unmatched parentheses
+func (f *figo) fixUnmatchedParentheses(input string) string {
+	count := 0
+	result := strings.Builder{}
+
+	for _, char := range input {
+		if char == '(' {
+			count++
+			result.WriteRune(char)
+		} else if char == ')' {
+			if count > 0 {
+				count--
+				result.WriteRune(char)
+			}
+			// Skip extra closing parentheses
+		} else {
+			result.WriteRune(char)
+		}
+	}
+
+	// Add missing closing parentheses
+	for i := 0; i < count; i++ {
+		result.WriteRune(')')
+	}
+
+	return result.String()
+}
+
+// fixUnmatchedQuotes attempts to fix unmatched quotes
+func (f *figo) fixUnmatchedQuotes(input string) string {
+	inQuotes := false
+	quoteChar := rune(0)
+	result := strings.Builder{}
+
+	for _, char := range input {
+		if char == '"' || char == '\'' {
+			if !inQuotes {
+				inQuotes = true
+				quoteChar = char
+				result.WriteRune(char)
+			} else if char == quoteChar {
+				inQuotes = false
+				quoteChar = 0
+				result.WriteRune(char)
+			} else {
+				result.WriteRune(char)
+			}
+		} else {
+			result.WriteRune(char)
+		}
+	}
+
+	// Add missing closing quote
+	if inQuotes {
+		result.WriteRune(quoteChar)
+	}
+
+	return result.String()
+}
+
+// fixUnmatchedBrackets attempts to fix unmatched brackets
+func (f *figo) fixUnmatchedBrackets(input string) string {
+	count := 0
+	result := strings.Builder{}
+
+	for _, char := range input {
+		if char == '[' {
+			count++
+			result.WriteRune(char)
+		} else if char == ']' {
+			if count > 0 {
+				count--
+				result.WriteRune(char)
+			}
+			// Skip extra closing brackets
+		} else {
+			result.WriteRune(char)
+		}
+	}
+
+	// Add missing closing brackets
+	for i := 0; i < count; i++ {
+		result.WriteRune(']')
+	}
+
+	return result.String()
 }
 
 func (f *figo) AddFiltersFromString(input string) error {
 	// Handle empty input
 	if strings.TrimSpace(input) == "" {
 		return nil
-	}
-
-	// Validate input before processing
-	if err := f.validateInput(input); err != nil {
-		return err
 	}
 
 	// Execute BeforeParse plugin hooks
@@ -1917,12 +2294,67 @@ func (f *figo) AddFiltersFromString(input string) error {
 		}
 	}
 
-	// Update DSL string (replace existing)
+	// Update DSL string (replace existing) - protected by mutex
+	f.mu.Lock()
 	f.dsl = input
+	f.mu.Unlock()
 
 	// Execute AfterParse plugin hooks
 	if f.pluginManager != nil {
 		err := f.pluginManager.ExecuteAfterParse(f, input)
+		if err != nil {
+			return fmt.Errorf("plugin AfterParse error: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// AddFiltersFromStringWithRepair allows controlling whether input repair is used
+func (f *figo) AddFiltersFromStringWithRepair(input string, useRepair bool) error {
+	// Handle empty input
+	if strings.TrimSpace(input) == "" {
+		return nil
+	}
+
+	var fixedInput string
+	var err error
+
+	if useRepair {
+		// Try to fix common malformed input patterns
+		fixedInput, err = f.attemptInputRepair(input)
+		if err != nil {
+			// If repair fails, validate original input
+			if validationErr := f.validateInput(input); validationErr != nil {
+				return validationErr
+			}
+			fixedInput = input
+		}
+	} else {
+		// Validate input without repair
+		if err := f.validateInput(input); err != nil {
+			return err
+		}
+		fixedInput = input
+	}
+
+	// Execute BeforeParse plugin hooks
+	if f.pluginManager != nil {
+		var err error
+		fixedInput, err = f.pluginManager.ExecuteBeforeParse(f, fixedInput)
+		if err != nil {
+			return fmt.Errorf("plugin BeforeParse error: %w", err)
+		}
+	}
+
+	// Update DSL string (replace existing) - protected by mutex
+	f.mu.Lock()
+	f.dsl = fixedInput
+	f.mu.Unlock()
+
+	// Execute AfterParse plugin hooks
+	if f.pluginManager != nil {
+		err := f.pluginManager.ExecuteAfterParse(f, fixedInput)
 		if err != nil {
 			return fmt.Errorf("plugin AfterParse error: %w", err)
 		}
@@ -2101,11 +2533,15 @@ func (f *figo) SetAllowedFields(fields ...string) {
 
 // EnableFieldWhitelist enables field whitelist validation
 func (f *figo) EnableFieldWhitelist() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.fieldWhitelist = true
 }
 
 // DisableFieldWhitelist disables field whitelist validation
 func (f *figo) DisableFieldWhitelist() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.fieldWhitelist = false
 }
 
@@ -2156,11 +2592,15 @@ func (f *figo) ParseFieldsValue(str string) any {
 
 // IsFieldWhitelistEnabled returns whether field whitelist is enabled
 func (f *figo) IsFieldWhitelistEnabled() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.fieldWhitelist
 }
 
 // GetDSL returns the current DSL string
 func (f *figo) GetDSL() string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.dsl
 }
 
