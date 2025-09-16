@@ -37,9 +37,10 @@ func BuildMongoFindOptions(f Figo) *options.FindOptions {
 		opts.SetSkip(skip)
 	}
 	// sort
-	if x, ok := f.(*figo); ok && x.sort != nil {
+	sort := f.GetSort()
+	if sort != nil {
 		var sd bson.D
-		for _, c := range x.sort.Columns {
+		for _, c := range sort.Columns {
 			order := 1
 			if c.Desc {
 				order = -1

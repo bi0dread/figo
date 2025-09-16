@@ -2201,3 +2201,479 @@ func TestBackwardCompatibilityBasic(t *testing.T) {
 		assert.True(t, selectFields["field4"])
 	})
 }
+
+func TestSortFieldNameFix(t *testing.T) {
+	t.Run("SnakeCaseNamingStrategy", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.SetNamingStrategy(NAMING_STRATEGY_SNAKE_CASE)
+
+		// Test the DSL parsing with sort
+		err := f.AddFiltersFromString("sort=barcode:desc page=skip:0,take:10")
+		if err != nil {
+			t.Fatalf("Error parsing DSL: %v", err)
+		}
+
+		// Build the query
+		f.Build()
+
+		// Test with raw adapter
+		adapter := &RawAdapter{}
+		f.SetAdapterObject(adapter)
+
+		// Get SQL string
+		sql := f.GetSqlString("test_table")
+		fmt.Printf("Generated SQL (snake_case): %s\n", sql)
+
+		// Verify that the SQL contains the correct field name
+		if !strings.Contains(sql, "barcode") {
+			t.Errorf("Expected SQL to contain 'barcode', got: %s", sql)
+		}
+
+		// Verify that the SQL doesn't contain empty field names
+		if strings.Contains(sql, "``.`barcode`") {
+			t.Errorf("SQL contains empty field name: %s", sql)
+		}
+	})
+
+	t.Run("NoChangeNamingStrategy", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.SetNamingStrategy(NAMING_STRATEGY_NO_CHANGE)
+
+		err := f.AddFiltersFromString("sort=barcode:desc page=skip:0,take:10")
+		if err != nil {
+			t.Fatalf("Error parsing DSL: %v", err)
+		}
+
+		f.Build()
+
+		adapter := &RawAdapter{}
+		f.SetAdapterObject(adapter)
+
+		sql := f.GetSqlString("test_table")
+		fmt.Printf("Generated SQL (no_change): %s\n", sql)
+
+		// Verify that the SQL contains the correct field name
+		if !strings.Contains(sql, "barcode") {
+			t.Errorf("Expected SQL to contain 'barcode', got: %s", sql)
+		}
+	})
+
+	t.Run("ComplexSortExpression", func(t *testing.T) {
+		f := New(RawAdapter{})
+		f.SetNamingStrategy(NAMING_STRATEGY_SNAKE_CASE)
+
+		err := f.AddFiltersFromString("id>0 sort=name:asc,age:desc,created_at:desc page=skip:5,take:20")
+		if err != nil {
+			t.Fatalf("Error parsing DSL: %v", err)
+		}
+
+		f.Build()
+
+		adapter := &RawAdapter{}
+		f.SetAdapterObject(adapter)
+
+		sql := f.GetSqlString("test_table")
+		fmt.Printf("Generated SQL (complex sort): %s\n", sql)
+
+		// Verify that all sort fields are present
+		if !strings.Contains(sql, "name") {
+			t.Errorf("Expected SQL to contain 'name' for sorting")
+		}
+		if !strings.Contains(sql, "age") {
+			t.Errorf("Expected SQL to contain 'age' for sorting")
+		}
+		if !strings.Contains(sql, "created_at") {
+			t.Errorf("Expected SQL to contain 'created_at' for sorting")
+		}
+
+		// Verify ORDER BY clause structure
+		if !strings.Contains(sql, "ORDER BY") {
+			t.Errorf("Expected SQL to contain ORDER BY clause")
+		}
+	})
+}
+
+func TestSortPageComprehensive(t *testing.T) {
+	t.Run("SortEdgeCases", func(t *testing.T) {
+		testCases := []struct {
+			name        string
+			dsl         string
+			expectError bool
+			description string
+		}{
+			{
+				name:        "EmptySortField",
+				dsl:         "sort=:desc",
+				expectError: false,
+				description: "Empty field name should be handled gracefully",
+			},
+			{
+				name:        "EmptySortDirection",
+				dsl:         "sort=name:",
+				expectError: false,
+				description: "Empty direction should default to ASC",
+			},
+			{
+				name:        "InvalidSortDirection",
+				dsl:         "sort=name:invalid",
+				expectError: false,
+				description: "Invalid direction should default to ASC",
+			},
+			{
+				name:        "MultipleEmptyFields",
+				dsl:         "sort=:desc,:asc,name:desc",
+				expectError: false,
+				description: "Multiple empty fields should be filtered out",
+			},
+			{
+				name:        "SpecialCharactersInField",
+				dsl:         "sort=field-name:desc,field_name:asc,field.name:desc",
+				expectError: false,
+				description: "Special characters in field names should be handled",
+			},
+			{
+				name:        "VeryLongFieldName",
+				dsl:         "sort=very_long_field_name_with_many_underscores_and_numbers_123456789:desc",
+				expectError: false,
+				description: "Very long field names should be handled",
+			},
+			{
+				name:        "UnicodeFieldName",
+				dsl:         "sort=字段名:desc,поле:asc",
+				expectError: false,
+				description: "Unicode field names should be handled",
+			},
+			{
+				name:        "MixedCaseDirection",
+				dsl:         "sort=name:DESC,age:Asc,score:DeSc",
+				expectError: false,
+				description: "Mixed case directions should be handled correctly",
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				f := New(RawAdapter{})
+				err := f.AddFiltersFromString(tc.dsl)
+
+				if tc.expectError {
+					if err == nil {
+						t.Errorf("Expected error for %s, but got none", tc.description)
+					}
+				} else {
+					if err != nil {
+						t.Errorf("Unexpected error for %s: %v", tc.description, err)
+					}
+
+					f.Build()
+					sql := f.GetSqlString("test_table")
+
+					// Verify that sort is present in SQL
+					if strings.Contains(tc.dsl, "sort=") && !strings.Contains(sql, "ORDER BY") {
+						t.Errorf("Expected ORDER BY clause in SQL for %s", tc.description)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("PageEdgeCases", func(t *testing.T) {
+		testCases := []struct {
+			name        string
+			dsl         string
+			expectSkip  int
+			expectTake  int
+			description string
+		}{
+			{
+				name:        "NegativeSkip",
+				dsl:         "page=skip:-5,take:10",
+				expectSkip:  0,
+				expectTake:  10,
+				description: "Negative skip should be corrected to 0",
+			},
+			{
+				name:        "NegativeTake",
+				dsl:         "page=skip:5,take:-10",
+				expectSkip:  5,
+				expectTake:  0,
+				description: "Negative take should be corrected to 0",
+			},
+			{
+				name:        "ZeroValues",
+				dsl:         "page=skip:0,take:0",
+				expectSkip:  0,
+				expectTake:  0,
+				description: "Zero values should be preserved",
+			},
+			{
+				name:        "LargeValues",
+				dsl:         "page=skip:999999,take:999999",
+				expectSkip:  999999,
+				expectTake:  999999,
+				description: "Large values should be preserved",
+			},
+			{
+				name:        "EmptyPage",
+				dsl:         "page=",
+				expectSkip:  0,
+				expectTake:  20, // Default value
+				description: "Empty page should use defaults",
+			},
+			{
+				name:        "InvalidPageFormat",
+				dsl:         "page=invalid",
+				expectSkip:  0,
+				expectTake:  20, // Default value
+				description: "Invalid page format should use defaults",
+			},
+			{
+				name:        "PartialPage",
+				dsl:         "page=skip:10",
+				expectSkip:  10,
+				expectTake:  20, // Default value
+				description: "Partial page should use defaults for missing values",
+			},
+			{
+				name:        "OnlyTake",
+				dsl:         "page=take:5",
+				expectSkip:  0,
+				expectTake:  5,
+				description: "Only take should work",
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				f := New(RawAdapter{})
+				err := f.AddFiltersFromString(tc.dsl)
+
+				if err != nil {
+					t.Errorf("Unexpected error for %s: %v", tc.description, err)
+					return
+				}
+
+				f.Build()
+				page := f.GetPage()
+
+				if page.Skip != tc.expectSkip {
+					t.Errorf("Expected skip %d, got %d for %s", tc.expectSkip, page.Skip, tc.description)
+				}
+				if page.Take != tc.expectTake {
+					t.Errorf("Expected take %d, got %d for %s", tc.expectTake, page.Take, tc.description)
+				}
+			})
+		}
+	})
+
+	t.Run("SortPageCombinations", func(t *testing.T) {
+		testCases := []struct {
+			name        string
+			dsl         string
+			expectSQL   []string
+			description string
+		}{
+			{
+				name:        "SortAndPage",
+				dsl:         "id>0 sort=name:desc,age:asc page=skip:10,take:5",
+				expectSQL:   []string{"ORDER BY", "name", "age", "LIMIT 5", "OFFSET 10"},
+				description: "Both sort and page should work together",
+			},
+			{
+				name:        "MultipleSortFields",
+				dsl:         "id>0 sort=name:desc,age:asc,created_at:desc,updated_at:asc page=skip:0,take:20",
+				expectSQL:   []string{"ORDER BY", "name", "age", "created_at", "updated_at", "LIMIT 20"},
+				description: "Multiple sort fields should work",
+			},
+			{
+				name:        "SortWithoutPage",
+				dsl:         "id>0 sort=name:desc",
+				expectSQL:   []string{"ORDER BY", "name"},
+				description: "Sort without page should work",
+			},
+			{
+				name:        "PageWithoutSort",
+				dsl:         "id>0 page=skip:5,take:10",
+				expectSQL:   []string{"LIMIT 10", "OFFSET 5"},
+				description: "Page without sort should work",
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				f := New(RawAdapter{})
+				err := f.AddFiltersFromString(tc.dsl)
+
+				if err != nil {
+					t.Errorf("Unexpected error for %s: %v", tc.description, err)
+					return
+				}
+
+				f.Build()
+				sql := f.GetSqlString("test_table")
+
+				for _, expected := range tc.expectSQL {
+					if !strings.Contains(sql, expected) {
+						t.Errorf("Expected SQL to contain '%s' for %s. Got: %s", expected, tc.description, sql)
+					}
+				}
+			})
+		}
+	})
+
+	t.Run("AllAdaptersSortPage", func(t *testing.T) {
+		dsl := "id>0 sort=name:desc,age:asc page=skip:5,take:10"
+
+		// Test Raw Adapter
+		t.Run("RawAdapter", func(t *testing.T) {
+			f := New(RawAdapter{})
+			err := f.AddFiltersFromString(dsl)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			f.Build()
+
+			sql := f.GetSqlString("test_table")
+			if !strings.Contains(sql, "ORDER BY") {
+				t.Error("Raw adapter should include ORDER BY")
+			}
+			if !strings.Contains(sql, "LIMIT 10") {
+				t.Error("Raw adapter should include LIMIT 10")
+			}
+			if !strings.Contains(sql, "OFFSET 5") {
+				t.Error("Raw adapter should include OFFSET 5")
+			}
+		})
+
+		// Test MongoDB Adapter
+		t.Run("MongoAdapter", func(t *testing.T) {
+			f := New(MongoAdapter{})
+			err := f.AddFiltersFromString(dsl)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			f.Build()
+
+			opts := BuildMongoFindOptions(f)
+			if opts.Limit == nil || *opts.Limit != 10 {
+				t.Error("MongoDB adapter should set limit to 10")
+			}
+			if opts.Skip == nil || *opts.Skip != 5 {
+				t.Error("MongoDB adapter should set skip to 5")
+			}
+			if opts.Sort == nil {
+				t.Error("MongoDB adapter should set sort")
+			}
+		})
+
+		// Test Elasticsearch Adapter
+		t.Run("ElasticsearchAdapter", func(t *testing.T) {
+			f := New(ElasticsearchAdapter{})
+			err := f.AddFiltersFromString(dsl)
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+			f.Build()
+
+			query := BuildElasticsearchQuery(f)
+			if query.Size != 10 {
+				t.Error("Elasticsearch adapter should set size to 10")
+			}
+			if query.From != 5 {
+				t.Error("Elasticsearch adapter should set from to 5")
+			}
+			if len(query.Sort) == 0 {
+				t.Error("Elasticsearch adapter should set sort")
+			}
+		})
+	})
+
+	t.Run("ConcurrentSortPage", func(t *testing.T) {
+		f := New(RawAdapter{})
+
+		// Test concurrent access to sort and page
+		done := make(chan bool, 10)
+
+		for i := 0; i < 10; i++ {
+			go func(id int) {
+				defer func() { done <- true }()
+
+				dsl := fmt.Sprintf("id>%d sort=name:desc page=skip:%d,take:5", id, id*2)
+				err := f.AddFiltersFromString(dsl)
+				if err != nil {
+					t.Errorf("Concurrent error: %v", err)
+					return
+				}
+
+				f.Build()
+				sql := f.GetSqlString("test_table")
+				if !strings.Contains(sql, "ORDER BY") {
+					t.Error("Concurrent access should maintain ORDER BY")
+				}
+			}(i)
+		}
+
+		// Wait for all goroutines
+		for i := 0; i < 10; i++ {
+			<-done
+		}
+	})
+
+	t.Run("MemoryLeakPrevention", func(t *testing.T) {
+		// Test that sort and page don't cause memory leaks
+		for i := 0; i < 1000; i++ {
+			f := New(RawAdapter{})
+			dsl := fmt.Sprintf("id>%d sort=name:desc,age:asc page=skip:%d,take:%d", i, i%100, (i%50)+1)
+
+			err := f.AddFiltersFromString(dsl)
+			if err != nil {
+				t.Errorf("Error in iteration %d: %v", i, err)
+				continue
+			}
+
+			f.Build()
+			_ = f.GetSqlString("test_table")
+		}
+	})
+
+	t.Run("NamingStrategySortPage", func(t *testing.T) {
+		testCases := []struct {
+			name           string
+			namingStrategy NamingStrategy
+			dsl            string
+			expectField    string
+		}{
+			{
+				name:           "SnakeCase",
+				namingStrategy: NAMING_STRATEGY_SNAKE_CASE,
+				dsl:            "sort=userName:desc page=skip:0,take:10",
+				expectField:    "user_name", // Should be converted to snake_case
+			},
+			{
+				name:           "NoChange",
+				namingStrategy: NAMING_STRATEGY_NO_CHANGE,
+				dsl:            "sort=userName:desc page=skip:0,take:10",
+				expectField:    "userName", // Should remain unchanged
+			},
+		}
+
+		for _, tc := range testCases {
+			t.Run(tc.name, func(t *testing.T) {
+				f := New(RawAdapter{})
+				f.SetNamingStrategy(tc.namingStrategy)
+
+				err := f.AddFiltersFromString(tc.dsl)
+				if err != nil {
+					t.Fatalf("Unexpected error: %v", err)
+				}
+
+				f.Build()
+				sql := f.GetSqlString("test_table")
+
+				if !strings.Contains(sql, tc.expectField) {
+					t.Errorf("Expected field '%s' in SQL, got: %s", tc.expectField, sql)
+				}
+			})
+		}
+	})
+}

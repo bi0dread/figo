@@ -269,9 +269,10 @@ func joinGroupQualified(op string, operands []Expr, qualifier string) (string, [
 }
 
 func buildOrderBy(f Figo) string {
-	if x, ok := f.(*figo); ok && x.sort != nil {
-		cols := make([]string, 0, len(x.sort.Columns))
-		for _, c := range x.sort.Columns {
+	sort := f.GetSort()
+	if sort != nil {
+		cols := make([]string, 0, len(sort.Columns))
+		for _, c := range sort.Columns {
 			dir := "ASC"
 			if c.Desc {
 				dir = "DESC"

@@ -950,6 +950,7 @@ type Figo interface {
 	GetClauses() []Expr
 	GetPreloads() map[string][]Expr
 	GetPage() Page
+	GetSort() *OrderBy
 	GetAdapterObject() Adapter
 	GetSqlString(ctx any, conditionType ...string) string
 	GetExplainedSqlString(ctx any, conditionType ...string) string
@@ -1619,7 +1620,13 @@ func (f *figo) parsFieldsName(str string) string {
 	case NAMING_STRATEGY_NO_CHANGE:
 		return str
 	case NAMING_STRATEGY_SNAKE_CASE:
-		return stringy.New(str).SnakeCase("?", "").ToLower()
+		// Use stringy to convert to snake_case, but handle edge cases
+		result := stringy.New(str).SnakeCase("?", "").ToLower()
+		// If stringy returns empty string, fallback to original string
+		if result == "" {
+			return str
+		}
+		return result
 	default:
 		return ""
 	}
@@ -2416,18 +2423,29 @@ func (f *figo) GetPreloads() map[string][]Expr {
 }
 
 func (f *figo) GetPage() Page {
-
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.page
 }
 
-func (f *figo) SetPage(skip, take int) {
+func (f *figo) GetSort() *OrderBy {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.sort
+}
 
+func (f *figo) SetPage(skip, take int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.page.Skip = skip
 	f.page.Take = take
 	f.page.validate()
 }
 
 func (f *figo) SetPageString(v string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
 	pageContent := strings.Split(v, ",")
 
 	for _, s := range pageContent {

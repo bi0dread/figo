@@ -75,8 +75,9 @@ func BuildElasticsearchQuery(f Figo) ElasticsearchQuery {
 	}
 
 	// Handle sorting
-	if x, ok := f.(*figo); ok && x.sort != nil {
-		for _, c := range x.sort.Columns {
+	sort := f.GetSort()
+	if sort != nil {
+		for _, c := range sort.Columns {
 			sortField := map[string]interface{}{
 				c.Name: map[string]string{
 					"order": "asc",
