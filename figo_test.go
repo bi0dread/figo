@@ -2293,6 +2293,58 @@ func TestSortFieldNameFix(t *testing.T) {
 	})
 }
 
+func TestGormGetSqlStringWithConditionTypes(t *testing.T) {
+	t.Run("GormGetSqlStringWithOrderBy", func(t *testing.T) {
+		// Create a test database
+		db, err := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
+		if err != nil {
+			t.Fatalf("failed to connect database: %v", err)
+		}
+
+		type TestModel struct {
+			ID      int
+			Barcode string
+		}
+
+		if err := db.AutoMigrate(&TestModel{}); err != nil {
+			t.Fatalf("failed to migrate: %v", err)
+		}
+
+		f := New(GormAdapter{})
+		f.SetNamingStrategy(NAMING_STRATEGY_SNAKE_CASE)
+
+		// Test the DSL parsing with sort
+		err = f.AddFiltersFromString("sort=barcode:desc page=skip:0,take:10")
+		if err != nil {
+			t.Fatalf("Error parsing DSL: %v", err)
+		}
+
+		// Build the query
+		f.Build()
+
+		// Test GetSqlString with specific condition types (like the user's case)
+		// Use a model to set the table name
+		modelDB := db.Model(&TestModel{})
+		sql := f.GetSqlString(modelDB, "WHERE", "JOIN", "ORDER BY", "GROUP BY", "LIMIT", "OFFSET", "SORT")
+		fmt.Printf("Generated GORM SQL with condition types: %s\n", sql)
+
+		// Verify that the SQL contains the correct field name
+		if !strings.Contains(sql, "barcode") {
+			t.Errorf("Expected SQL to contain 'barcode', got: %s", sql)
+		}
+
+		// Verify that the SQL doesn't contain empty field names
+		if strings.Contains(sql, "``.`barcode`") {
+			t.Errorf("SQL contains empty field name: %s", sql)
+		}
+
+		// Verify ORDER BY clause structure
+		if !strings.Contains(sql, "ORDER BY") {
+			t.Errorf("Expected SQL to contain ORDER BY clause")
+		}
+	})
+}
+
 func TestGormSortFieldNameFix(t *testing.T) {
 	t.Run("GormSnakeCaseNamingStrategy", func(t *testing.T) {
 		// Create a test database
@@ -2325,8 +2377,8 @@ func TestGormSortFieldNameFix(t *testing.T) {
 		// Apply GORM operations
 		db2 := ApplyGorm(f, db.Model(&TestModel{}))
 
-		// Get SQL string
-		sql := f.GetSqlString(db2, "SELECT")
+		// Get SQL string with all condition types
+		sql := f.GetSqlString(db2, "SELECT", "FROM", "WHERE", "ORDER BY", "LIMIT")
 		fmt.Printf("Generated GORM SQL (snake_case): %s\n", sql)
 
 		// Verify that the SQL contains the correct field name
@@ -2369,7 +2421,7 @@ func TestGormSortFieldNameFix(t *testing.T) {
 		// Apply GORM operations
 		db2 := ApplyGorm(f, db.Model(&TestModel{}))
 
-		sql := f.GetSqlString(db2, "SELECT")
+		sql := f.GetSqlString(db2, "SELECT", "FROM", "WHERE", "ORDER BY", "LIMIT")
 		fmt.Printf("Generated GORM SQL (no_change): %s\n", sql)
 
 		// Verify that the SQL contains the correct field name
@@ -2409,7 +2461,7 @@ func TestGormSortFieldNameFix(t *testing.T) {
 		// Apply GORM operations
 		db2 := ApplyGorm(f, db.Model(&TestModel{}))
 
-		sql := f.GetSqlString(db2, "SELECT")
+		sql := f.GetSqlString(db2, "SELECT", "FROM", "WHERE", "ORDER BY", "LIMIT")
 		fmt.Printf("Generated GORM SQL (complex sort): %s\n", sql)
 
 		// Verify that all sort fields are present
