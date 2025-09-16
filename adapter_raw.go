@@ -553,7 +553,12 @@ func escapeSQLString(s string) string {
 func normalizeColumnName(f Figo, name string) string {
 	switch f.GetNamingStrategy() {
 	case NAMING_STRATEGY_SNAKE_CASE:
-		return stringy.New(name).SnakeCase("?", "").ToLower()
+		result := stringy.New(name).SnakeCase("?", "").ToLower()
+		// If stringy returns empty string, fallback to original name
+		if result == "" {
+			return name
+		}
+		return result
 	case NAMING_STRATEGY_NO_CHANGE:
 		fallthrough
 	default:

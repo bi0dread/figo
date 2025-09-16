@@ -115,9 +115,21 @@ func ApplyGorm(f Figo, trx *gorm.DB) *gorm.DB {
 		trx = trx.Clauses(conv...)
 	}
 
-	// Access internal sort if available
-	if x, ok := f.(*figo); ok && x.sort != nil {
-		trx = trx.Clauses(toGormClause(*x.sort))
+	// Access sort using GetSort method
+	sort := f.GetSort()
+	if sort != nil {
+		// Create a normalized copy of the OrderBy with proper field names
+		normalizedSort := &OrderBy{
+			Columns: make([]OrderByColumn, len(sort.Columns)),
+		}
+		for i, c := range sort.Columns {
+			normalizedName := normalizeColumnName(f, c.Name)
+			normalizedSort.Columns[i] = OrderByColumn{
+				Name: normalizedName,
+				Desc: c.Desc,
+			}
+		}
+		trx = trx.Clauses(toGormClause(*normalizedSort))
 	}
 
 	return trx
@@ -137,7 +149,7 @@ func getGormSqlString(trx *gorm.DB, conditionType ...string) string {
 	stmt := tr.Statement
 
 	tr.Callback().Query().Execute(tr)
-	stmt.Build(conditionType...)
+	stmt.Build("SELECT", "FROM", "WHERE", "ORDER BY", "LIMIT")
 	sqlWithPlaceholders := stmt.SQL.String()
 	params := stmt.Vars
 
