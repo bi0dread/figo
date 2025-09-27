@@ -140,13 +140,9 @@ func ApplyGorm(f Figo, trx *gorm.DB) *gorm.DB {
 
 // GetGormSqlString renders the SQL string from a configured GORM DB instance using DryRun.
 func getGormSqlString(trx *gorm.DB, conditionType ...string) string {
-	tr := trx.Begin()
-	if tr.Error != nil {
-		// If Begin fails, use the original DB with dry run
-		tr = trx.Session(&gorm.Session{DryRun: true, NewDB: true})
-	} else {
-		tr = tr.Session(&gorm.Session{DryRun: true, NewDB: true})
-	}
+	// Create a new session with DryRun mode without starting a transaction
+
+	tr := trx.Session(&gorm.Session{DryRun: true, NewDB: true})
 	tr.Logger = logger.Default.LogMode(logger.Silent)
 
 	stmt := tr.Statement
@@ -157,11 +153,6 @@ func getGormSqlString(trx *gorm.DB, conditionType ...string) string {
 	params := stmt.Vars
 
 	fullSQL := tr.Dialector.Explain(sqlWithPlaceholders, params...)
-
-	// Only rollback if we successfully began a transaction
-	if tr.Error == nil {
-		tr.Rollback()
-	}
 
 	return fullSQL
 }
