@@ -1291,7 +1291,8 @@ outerLoop:
 		default:
 			j := i
 			ff := -1
-			parenDepth := 0 // balance of '(' opened *within* this token (e.g. BETWEEN's "(10..20)")
+			parenDepth := 0   // balance of '(' opened *within* this token (e.g. BETWEEN's "(10..20)")
+			bracketDepth := 0 // balance of '[' for list values (<in>[...], <nin>[...])
 			for j < len(expr) {
 
 				if expr[j] == '"' && ff == -1 {
@@ -1302,6 +1303,13 @@ outerLoop:
 				if expr[j] == '"' && ff == 1 {
 					ff = 0
 					j++
+					// A closing quote ends the token only outside a bracketed list.
+					// Inside a list (e.g. <in>["a,b","c"]) more quoted elements can
+					// follow, so keep scanning and reset the quote state.
+					if bracketDepth > 0 {
+						ff = -1
+						continue
+					}
 					break
 
 				}
@@ -1311,12 +1319,29 @@ outerLoop:
 					continue
 				}
 
-				if expr[j] == ' ' && ff == -1 {
+				// Spaces and the closing quote only terminate the token outside a
+				// bracketed list value; inside one, "[1, 2, 3]" stays a single token.
+				if expr[j] == ' ' && ff == -1 && bracketDepth == 0 {
 					break
 				}
 
-				if expr[j] == ' ' && ff == 0 {
+				if expr[j] == ' ' && ff == 0 && bracketDepth == 0 {
 					break
+				}
+
+				// Track list brackets so their commas/spaces/quoted strings don't
+				// split the token prematurely.
+				if expr[j] == '[' {
+					bracketDepth++
+					j++
+					continue
+				}
+				if expr[j] == ']' {
+					if bracketDepth > 0 {
+						bracketDepth--
+					}
+					j++
+					continue
 				}
 
 				// Parentheses are overloaded: they group logical expressions but
@@ -1364,9 +1389,12 @@ outerLoop:
 					continue
 				}
 
-				if strings.HasPrefix(token, string(OperationSort)) || strings.HasPrefix(token, string(OperationPage)) || strings.HasPrefix(token, string(OperationLoad)) {
+				// Require the '=' so ordinary field names that merely start with
+				// these keywords (sortOrder, pageCount, loadedAt) are parsed as
+				// filters rather than swallowed as sort/page/load directives.
+				if strings.HasPrefix(token, string(OperationSort)+"=") || strings.HasPrefix(token, string(OperationPage)+"=") || strings.HasPrefix(token, string(OperationLoad)+"=") {
 					k := j - 1
-					if strings.HasPrefix(token, string(OperationLoad)) {
+					if strings.HasPrefix(token, string(OperationLoad)+"=") {
 						bracketCount := 1
 						for k < len(expr) && bracketCount > 0 {
 
@@ -1425,7 +1453,7 @@ outerLoop:
 						i = k
 						continue
 
-					} else if strings.HasPrefix(token, string(OperationPage)) {
+					} else if strings.HasPrefix(token, string(OperationPage)+"=") {
 
 						pageLabel := fmt.Sprintf("%v=", string(OperationPage))
 						content := token[strings.Index(token, pageLabel)+len(pageLabel):]
@@ -1455,8 +1483,13 @@ outerLoop:
 							}
 
 						}
+						// Advance past the whole page token. (k = j-1 would re-scan
+						// the token's last char; when it is '=' that produced a bogus
+						// empty-field EqExpr.)
+						i = j
+						continue
 
-					} else if strings.HasPrefix(token, string(OperationSort)) {
+					} else if strings.HasPrefix(token, string(OperationSort)+"=") {
 
 						sortLabel := fmt.Sprintf("%v=", string(OperationSort))
 						content := token[strings.Index(token, sortLabel)+len(sortLabel):]
@@ -1485,11 +1518,10 @@ outerLoop:
 							Columns: c,
 						}
 						f.sort = &sortExpr
+						// Advance past the whole sort token (see the page branch).
+						i = j
+						continue
 
-					} else {
-						for k < len(expr) && expr[k] != ' ' && expr[k] != '(' && expr[k] != ')' {
-							k++
-						}
 					}
 
 					i = k
@@ -1826,17 +1858,57 @@ func parseToken(token string) (Operation, string, string) {
 		OperationNeq, OperationGt, OperationLt, OperationEq,
 	}
 	for _, op := range operators {
-		if strings.Contains(token, string(op)) {
-			parts := strings.Split(token, string(op))
-			var right string
-			if len(parts) > 1 {
-				right = parts[1]
-			}
-			field := strings.TrimSpace(parts[0])
+		// Match the operator only OUTSIDE quotes, so operator characters inside a
+		// quoted value (name="x=y", url="http://h?a=1") don't split the token.
+		if idx := indexOutsideQuotes(token, string(op)); idx >= 0 {
+			field := strings.TrimSpace(token[:idx])
+			right := token[idx+len(string(op)):]
 			return op, right, field
 		}
 	}
 	return "", token, ""
+}
+
+// indexOutsideQuotes returns the first index of substr in s that lies outside a
+// double-quoted region, or -1 if there is none.
+func indexOutsideQuotes(s, substr string) int {
+	if substr == "" {
+		return -1
+	}
+	inQuote := false
+	for i := 0; i+len(substr) <= len(s); i++ {
+		if s[i] == '"' {
+			inQuote = !inQuote
+			continue
+		}
+		if !inQuote && strings.HasPrefix(s[i:], substr) {
+			return i
+		}
+	}
+	return -1
+}
+
+// splitOutsideQuotes splits s on sep, ignoring separators inside double quotes.
+func splitOutsideQuotes(s string, sep byte) []string {
+	var parts []string
+	var b strings.Builder
+	inQuote := false
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if c == '"' {
+			inQuote = !inQuote
+			b.WriteByte(c)
+			continue
+		}
+		if c == sep && !inQuote {
+			parts = append(parts, b.String())
+			b.Reset()
+			continue
+		}
+		b.WriteByte(c)
+	}
+	parts = append(parts, b.String())
+	return parts
 }
 
 func getClausesFromOperation(o Operation, field string, value any) Expr {
@@ -1868,7 +1940,7 @@ func getClausesFromOperation(o Operation, field string, value any) Expr {
 		return s
 	}
 
-	// helper to parse a list literal like [1,2,"x"]
+	// helper to parse a list literal like [1,2,"x"] or ["a,b","c"]
 	parseListValue := func(raw string) []any {
 		s := strings.TrimSpace(raw)
 		if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
@@ -1878,7 +1950,8 @@ func getClausesFromOperation(o Operation, field string, value any) Expr {
 		if s == "" {
 			return nil
 		}
-		parts := strings.Split(s, ",")
+		// Split on commas OUTSIDE quotes so quoted elements can contain commas.
+		parts := splitOutsideQuotes(s, ',')
 		vals := make([]any, 0, len(parts))
 		for _, p := range parts {
 			vals = append(vals, parseScalarValue(p))
@@ -2148,9 +2221,15 @@ func processWithPrecedence(items []interface{}) Expr {
 		}
 	}
 
-	// Return the final expression
-	if len(expressions) > 0 {
+	// Any expressions still left are adjacent with no logical operator between
+	// them (e.g. "a=1 b=2", or a filter following a load=/sort=/page= segment
+	// that emits no connector). Combine them with an implicit AND instead of
+	// silently dropping all but the first.
+	if len(expressions) == 1 {
 		return expressions[0]
+	}
+	if len(expressions) > 1 {
+		return AndExpr{Operands: expressions}
 	}
 	return nil
 }
