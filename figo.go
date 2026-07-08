@@ -958,6 +958,7 @@ type Figo interface {
 	GetCachedSqlString(ctx any, conditionType ...string) string
 	GetCachedQuery(ctx any, conditionType ...string) Query
 	Build()
+	Explain() string
 }
 
 type Adapter interface {
@@ -1262,6 +1263,7 @@ outerLoop:
 		default:
 			j := i
 			ff := -1
+			parenDepth := 0 // balance of '(' opened *within* this token (e.g. BETWEEN's "(10..20)")
 			for j < len(expr) {
 
 				if expr[j] == '"' && ff == -1 {
@@ -1286,6 +1288,27 @@ outerLoop:
 				}
 
 				if expr[j] == ' ' && ff == 0 {
+					break
+				}
+
+				// Parentheses are overloaded: they group logical expressions but
+				// also delimit value syntax such as BETWEEN's "<bet>(10..20)".
+				// A '(' encountered mid-token belongs to the value, so track its
+				// depth. A ')' only terminates the token (leaving it for the outer
+				// loop to pop the group) when it has no matching '(' in this token;
+				// otherwise it closes the value's own parenthesis. Quoted parens
+				// (ff == 1) are handled above and never reach here.
+				if expr[j] == '(' {
+					parenDepth++
+					j++
+					continue
+				}
+				if expr[j] == ')' {
+					if parenDepth > 0 {
+						parenDepth--
+						j++
+						continue
+					}
 					break
 				}
 
@@ -1779,6 +1802,19 @@ func getClausesFromOperation(o Operation, field string, value any) Expr {
 		if len(s) >= 2 && strings.HasPrefix(s, "\"") && strings.HasSuffix(s, "\"") {
 			return strings.Trim(s, "\"")
 		}
+		// Type detection for unquoted values, kept consistent with parsFieldsValue
+		// (and the documented "automatic type detection for booleans"). Without
+		// this, active=true parsed to the string "true" rather than a boolean,
+		// producing `active = 'true'` instead of `active = true`.
+		if s == "true" {
+			return true
+		}
+		if s == "false" {
+			return false
+		}
+		if s == "null" || s == "NULL" {
+			return nil
+		}
 		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
 			return i
 		}
@@ -2000,16 +2036,13 @@ func processWithPrecedence(items []interface{}) Expr {
 		return nil
 	}
 
-	// If we have only one expression, return it
-	if len(expressions) == 1 {
-		return expressions[0]
-	}
-
 	// Process operators in precedence order: NOT > AND > OR
 	// We need to handle this more carefully to respect the tree structure
 
-	// First pass: Handle NOT operators (highest precedence)
-	// NOT operators should be applied to the next expression
+	// First pass: Handle NOT operators (highest precedence, unary prefix).
+	// This must run BEFORE the single-expression short-circuit below, otherwise
+	// a leading NOT applied to a single operand ("not a=1") or to a parenthesized
+	// group ("not (a=1 or b=2)") is silently dropped, inverting query semantics.
 	for i := 0; i < len(operators); i++ {
 		if operators[i] == OperationNot {
 			// Find the next expression to negate
@@ -2020,6 +2053,11 @@ func processWithPrecedence(items []interface{}) Expr {
 				i-- // Adjust index
 			}
 		}
+	}
+
+	// If only one expression remains (after applying any NOT), return it
+	if len(expressions) == 1 {
+		return expressions[0]
 	}
 
 	// Second pass: Handle AND operators (medium precedence)

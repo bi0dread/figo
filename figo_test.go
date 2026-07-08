@@ -610,7 +610,7 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	assert.Equal(t, int64(100), args2[0])
 	assert.Equal(t, "test", args2[1])
 	assert.Equal(t, 99.99, args2[2])
-	assert.Equal(t, "true", args2[3])
+	assert.Equal(t, true, args2[3]) // booleans are type-detected, not strings
 	// Check that the last argument contains the date (converted to string for SQL)
 	if strVal, ok := args2[4].(string); ok {
 		assert.Contains(t, strVal, "2023-01-01")
@@ -1176,7 +1176,7 @@ func TestMissingScenarios(t *testing.T) {
 	assert.Contains(t, sql5, "`price` = ?")
 	assert.Contains(t, sql5, "`active` = ?")
 	assert.Contains(t, sql5, "`count` = ?")
-	assert.Equal(t, []any{int64(0), int64(0), "false", int64(-1)}, args5)
+	assert.Equal(t, []any{int64(0), int64(0), false, int64(-1)}, args5)
 
 	// Test 6: Operator precedence and complex combinations
 	f6 := New(RawAdapter{})
