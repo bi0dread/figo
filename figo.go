@@ -987,7 +987,7 @@ type Figo interface {
 	GetQuery(ctx any, conditionType ...string) Query
 	GetCachedSqlString(ctx any, conditionType ...string) string
 	GetCachedQuery(ctx any, conditionType ...string) Query
-	Build()
+	Build(adapter ...Adapter)
 	Explain() string
 	Clone() Figo
 }
@@ -1019,10 +1019,10 @@ type figo struct {
 	mu                sync.RWMutex // Mutex for concurrent access protection
 }
 
-// Constructor: use New(adapter) with an Adapter object (or nil)
-
-// New constructs a new instance with the specified adapter object. Pass nil for no adapter.
-func New(adapter Adapter) Figo {
+// New constructs a new instance. The adapter is optional: you may pass it here,
+// New(GormAdapter{}), or defer it to Build(GormAdapter{}). Both styles work; the
+// adapter passed to Build (if any) wins.
+func New(adapter ...Adapter) Figo {
 	f := &figo{page: Page{
 		Skip: 0,
 		Take: 20,
@@ -1032,7 +1032,9 @@ func New(adapter Adapter) Figo {
 		MaxParameterCount:  100,
 		MaxExpressionCount: 200,
 	}, clauses: make([]Expr, 0), namingStrategy: NAMING_STRATEGY_SNAKE_CASE}
-	f.adapterObj = adapter
+	if len(adapter) > 0 {
+		f.adapterObj = adapter[0]
+	}
 	return f
 }
 
@@ -2832,9 +2834,16 @@ func (f *figo) GetDSL() string {
 	return f.dsl
 }
 
-func (f *figo) Build() {
+// Build parses the DSL into the internal clause tree. The adapter is optional
+// here: pass it to Build(GormAdapter{}) to set (or override) the adapter that
+// GetSqlString/GetQuery will use, or set it earlier via New / SetAdapterObject.
+func (f *figo) Build(adapter ...Adapter) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+
+	if len(adapter) > 0 {
+		f.adapterObj = adapter[0]
+	}
 
 	if f.dsl == "" {
 		return

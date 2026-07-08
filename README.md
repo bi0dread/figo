@@ -47,13 +47,13 @@ func main() {
     }
 
     // Create a Figo instance
-    f := figo.New(figo.GormAdapter{})
+    f := figo.New()
 
     // Add filters from DSL
     f.AddFiltersFromString(`(id=1 and vendorId=22) and bank_id>11 or expedition_type="eq" load=[TestInner1:id=3 or name=test1 | TestInner2:id=4] sort=id:desc page=skip:0,take:10`)
 
-    // Build and apply filters
-    f.Build()
+    // Build with the adapter, and apply
+    f.Build(figo.GormAdapter{})
     db = figo.ApplyGorm(f, db)
 
     // Execute query
@@ -62,6 +62,10 @@ func main() {
     fmt.Println("Query Results:", results)
 }
 ```
+
+> The adapter can be supplied either to `New(figo.GormAdapter{})` or to
+> `Build(figo.GormAdapter{})` — whichever fits your flow. If given in both, the
+> one passed to `Build` wins. `New()` with no arguments is also valid.
 
 ## Supported Operations
 
