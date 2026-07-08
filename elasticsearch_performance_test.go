@@ -26,9 +26,9 @@ func TestElasticsearchPerformance(t *testing.T) {
 				defer wg.Done()
 
 				for j := 0; j < queriesPerGoroutine; j++ {
-					f := New(ElasticsearchAdapter{})
+					f := New()
 					f.AddFiltersFromString(`status = "active" and age > 25`)
-					f.Build()
+					f.Build(ElasticsearchAdapter{})
 
 					query, _ := BuildElasticsearchQuery(f)
 					results := executeElasticsearchQuery(t, "stress_users", query)
@@ -57,9 +57,9 @@ func TestElasticsearchPerformance(t *testing.T) {
 		start := time.Now()
 
 		for i := 0; i < numQueries; i++ {
-			f := New(ElasticsearchAdapter{})
+			f := New()
 			f.AddFiltersFromString(`((name =^ "%John%" or email =^ "%gmail%") and (age >= 18 and age <= 65)) or (status = "active" and score > 80)`)
-			f.Build()
+			f.Build(ElasticsearchAdapter{})
 
 			query, _ := BuildElasticsearchQuery(f)
 			jsonStr, _ := GetElasticsearchQueryString(f)
@@ -86,9 +86,9 @@ func TestElasticsearchPerformance(t *testing.T) {
 		start := time.Now()
 
 		for i := 0; i < numQueries; i++ {
-			f := New(ElasticsearchAdapter{})
+			f := New()
 			f.AddFiltersFromString(`((category = "tech" and score > 80) or (category = "business" and age > 30)) and (status = "active" or status = "pending") and price <bet> (100..1000) and email =^ "%gmail%" and phone =~ "^\\+1[0-9]{10}$" and last_login <notnull> and deleted_at <null>`)
-			f.Build()
+			f.Build(ElasticsearchAdapter{})
 
 			query, _ := BuildElasticsearchQuery(f)
 			results := executeElasticsearchQuery(t, "stress_users", query)
@@ -148,9 +148,9 @@ func TestElasticsearchPerformance(t *testing.T) {
 		instances := make([]Figo, numInstances)
 
 		for i := 0; i < numInstances; i++ {
-			f := New(ElasticsearchAdapter{})
+			f := New()
 			f.AddFiltersFromString(`id > 0 and status = "active"`)
-			f.Build()
+			f.Build(ElasticsearchAdapter{})
 			instances[i] = f
 		}
 
@@ -186,18 +186,18 @@ func BenchmarkElasticsearchAdapter(b *testing.B) {
 
 	b.Run("BasicQuery", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			f := New(ElasticsearchAdapter{})
+			f := New()
 			f.AddFiltersFromString(`status = "active"`)
-			f.Build()
+			f.Build(ElasticsearchAdapter{})
 			BuildElasticsearchQuery(f)
 		}
 	})
 
 	b.Run("ComplexQuery", func(b *testing.B) {
 		for i := 0; i < b.N; i++ {
-			f := New(ElasticsearchAdapter{})
+			f := New()
 			f.AddFiltersFromString(`((name =^ "%John%" or email =^ "%gmail%") and (age >= 18 and age <= 65)) or (status = "active" and score > 80)`)
-			f.Build()
+			f.Build(ElasticsearchAdapter{})
 			BuildElasticsearchQuery(f)
 		}
 	})
@@ -215,9 +215,9 @@ func BenchmarkElasticsearchAdapter(b *testing.B) {
 	})
 
 	b.Run("JSONGeneration", func(b *testing.B) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`status = "active" and age > 25`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {

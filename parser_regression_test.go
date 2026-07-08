@@ -9,11 +9,11 @@ import (
 // whereFor renders the raw SQL WHERE clause (and args) for a DSL string.
 func whereFor(t *testing.T, dsl string) (string, []any) {
 	t.Helper()
-	f := New(RawAdapter{})
+	f := New()
 	if err := f.AddFiltersFromString(dsl); err != nil {
 		t.Fatalf("AddFiltersFromString(%q): %v", dsl, err)
 	}
-	f.Build()
+	f.Build(RawAdapter{})
 	return BuildRawWhere(f)
 }
 

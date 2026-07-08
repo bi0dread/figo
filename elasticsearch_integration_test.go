@@ -19,9 +19,9 @@ func TestElasticsearchIntegration(t *testing.T) {
 	setupTestData(t)
 
 	t.Run("BasicTermQuery", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`status = "active"`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
@@ -43,9 +43,9 @@ func TestElasticsearchIntegration(t *testing.T) {
 	})
 
 	t.Run("RangeQuery", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`age > 25 and score >= 80`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
@@ -66,9 +66,9 @@ func TestElasticsearchIntegration(t *testing.T) {
 	})
 
 	t.Run("WildcardQuery", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`email =^ "%gmail%"`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
@@ -86,9 +86,9 @@ func TestElasticsearchIntegration(t *testing.T) {
 	})
 
 	t.Run("TermsQuery", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`category <in> [tech,business,finance]`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
@@ -106,9 +106,9 @@ func TestElasticsearchIntegration(t *testing.T) {
 	})
 
 	t.Run("BetweenQuery", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`price <bet> (100..500)`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
@@ -129,9 +129,9 @@ func TestElasticsearchIntegration(t *testing.T) {
 	})
 
 	t.Run("ExistsQuery", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`last_login <notnull>`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
@@ -146,9 +146,9 @@ func TestElasticsearchIntegration(t *testing.T) {
 	})
 
 	t.Run("ComplexNestedQuery", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`((name =^ "%John%" or email =^ "%gmail%") and (age >= 18 and age <= 65)) or (status = "active" and score > 80)`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
@@ -169,9 +169,9 @@ func TestElasticsearchIntegration(t *testing.T) {
 	})
 
 	t.Run("PaginationAndSorting", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`status = "active" sort=score:desc,age:asc page=skip:0,take:3`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
@@ -207,10 +207,10 @@ func TestElasticsearchIntegration(t *testing.T) {
 	})
 
 	t.Run("FieldSelection", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddSelectFields("id", "name", "email", "score")
 		f.AddFiltersFromString(`status = "active"`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
@@ -255,9 +255,9 @@ func TestElasticsearchIntegration(t *testing.T) {
 	})
 
 	t.Run("RegexQuery", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`phone =~ "^\\+1[0-9]{10}$"`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
@@ -272,9 +272,9 @@ func TestElasticsearchIntegration(t *testing.T) {
 	})
 
 	t.Run("NotQuery", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`status != "inactive"`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
@@ -289,9 +289,9 @@ func TestElasticsearchIntegration(t *testing.T) {
 	})
 
 	t.Run("NullQuery", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`deleted_at <null>`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)

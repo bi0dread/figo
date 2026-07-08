@@ -10,9 +10,9 @@ import (
 
 // #22: a zero timeout must not fail an operation that completed successfully.
 func TestBatchZeroTimeoutSucceeds(t *testing.T) {
-	f := New(RawAdapter{})
+	f := New()
 	f.AddFiltersFromString(`id=1`)
-	f.Build()
+	f.Build(RawAdapter{})
 
 	bp := NewInMemoryBatchProcessor(2, 0) // 0 => no timeout
 	results := bp.Process([]BatchOperation{
@@ -27,14 +27,14 @@ func TestBatchZeroTimeoutSucceeds(t *testing.T) {
 // #26: Mongo IS NULL / IS NOT NULL use null semantics (match explicit null),
 // not $exists (which only matches missing fields).
 func TestMongoNullSemantics(t *testing.T) {
-	f := New(nil)
+	f := New()
 	f.AddFilter(IsNullExpr{Field: "deleted_at"})
 	f.Build()
 	m := BuildMongoFilterMust(t, f)
 	assert.Contains(t, m, "deleted_at")
 	assert.Nil(t, m["deleted_at"], "IS NULL should be {field: nil}")
 
-	f2 := New(nil)
+	f2 := New()
 	f2.AddFilter(NotNullExpr{Field: "deleted_at"})
 	f2.Build()
 	m2 := BuildMongoFilterMust(t, f2)
@@ -45,7 +45,7 @@ func TestMongoNullSemantics(t *testing.T) {
 
 // #27: an AndExpr with no operands must not emit an invalid {$and: null}.
 func TestMongoEmptyLogicalNotNull(t *testing.T) {
-	f := New(nil)
+	f := New()
 	f.AddFilter(AndExpr{Operands: nil})
 	f.Build()
 	m := BuildMongoFilterMust(t, f)
@@ -62,9 +62,9 @@ func BuildMongoFilterMust(t *testing.T, f Figo) bson.M {
 
 // #28: OFFSET without LIMIT must include a LIMIT (MySQL/SQLite reject bare OFFSET).
 func TestOffsetWithoutLimitIncludesLimit(t *testing.T) {
-	f := New(RawAdapter{})
+	f := New()
 	f.SetPage(5, 0) // skip 5, take 0
-	f.Build()
+	f.Build(RawAdapter{})
 	sql, _ := BuildRawSelect(f, "t")
 	assert.Contains(t, sql, "OFFSET 5")
 	assert.Contains(t, sql, "LIMIT", "bare OFFSET is invalid on MySQL/SQLite")
@@ -73,9 +73,9 @@ func TestOffsetWithoutLimitIncludesLimit(t *testing.T) {
 // #29: column and JOIN ordering is deterministic across builds.
 func TestDeterministicColumnAndJoinOrder(t *testing.T) {
 	build := func() string {
-		f := New(RawAdapter{})
+		f := New()
 		f.AddSelectFields("zeta", "alpha", "mu")
-		f.Build()
+		f.Build(RawAdapter{})
 		sql, _ := BuildRawSelect(f, "t")
 		return sql
 	}

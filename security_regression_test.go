@@ -16,9 +16,9 @@ func TestUnclosedLoadDoesNotPanic(t *testing.T) {
 					t.Errorf("input %q panicked: %v", in, r)
 				}
 			}()
-			f := New(RawAdapter{})
+			f := New()
 			_ = f.AddFiltersFromString(in)
-			f.Build()
+			f.Build(RawAdapter{})
 			_, _ = BuildRawWhere(f) // must not panic
 		}()
 	}
@@ -26,23 +26,23 @@ func TestUnclosedLoadDoesNotPanic(t *testing.T) {
 
 // #6: an empty IN set must match nothing (not drop the predicate → match all).
 func TestEmptyInDoesNotBypassFilter(t *testing.T) {
-	f := New(RawAdapter{})
+	f := New()
 	f.AddFiltersFromString(`id<in>[]`)
-	f.Build()
+	f.Build(RawAdapter{})
 	where, _ := BuildRawWhere(f)
 	assert.Equal(t, "1=0", where, "empty IN must match nothing, not vanish")
 
 	// Empty NOT IN matches everything.
-	f2 := New(RawAdapter{})
+	f2 := New()
 	f2.AddFilter(NotInExpr{Field: "id", Values: nil})
-	f2.Build()
+	f2.Build(RawAdapter{})
 	where2, _ := BuildRawWhere(f2)
 	assert.Equal(t, "1=1", where2)
 
 	// And it must still combine correctly inside AND.
-	f3 := New(RawAdapter{})
+	f3 := New()
 	f3.AddFiltersFromString(`status="active" and id<in>[]`)
-	f3.Build()
+	f3.Build(RawAdapter{})
 	where3, _ := BuildRawWhere(f3)
 	assert.Contains(t, where3, "1=0")
 	assert.Contains(t, where3, "status")

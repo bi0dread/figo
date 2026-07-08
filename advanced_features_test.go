@@ -42,7 +42,7 @@ func TestPluginSystem(t *testing.T) {
 	})
 
 	t.Run("FigoPluginIntegration", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test plugin registration
 		plugin := &TestPlugin{name: "test-plugin", version: "1.0.0"}
@@ -64,7 +64,7 @@ func TestPluginSystem(t *testing.T) {
 		err = manager.ExecuteAfterParse(f, `id=1`)
 		assert.NoError(t, err)
 
-		f.Build()
+		f.Build(RawAdapter{})
 
 		// Verify plugin was called
 		assert.True(t, plugin.initialized)
@@ -77,7 +77,7 @@ func TestPluginSystem(t *testing.T) {
 		plugin := &TestPlugin{name: "hook-test", version: "1.0.0"}
 		manager.RegisterPlugin(plugin)
 
-		f := New(RawAdapter{})
+		f := New()
 		f.SetPluginManager(manager)
 
 		// Test BeforeQuery hook
@@ -243,7 +243,7 @@ func TestValidationSystem(t *testing.T) {
 	})
 
 	t.Run("FigoValidationIntegration", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test validation manager setup
 		manager := NewValidationManager()
@@ -313,7 +313,7 @@ func TestValidationSystem(t *testing.T) {
 func TestPhase3Integration(t *testing.T) {
 	t.Run("CompleteAdvancedWorkflow", func(t *testing.T) {
 		// Create figo instance with all Phase 3 features
-		f := New(RawAdapter{})
+		f := New()
 
 		// Set up plugin system
 		plugin := &TestPlugin{name: "integration-test", version: "1.0.0"}
@@ -346,7 +346,7 @@ func TestPhase3Integration(t *testing.T) {
 		err = manager.ExecuteAfterParse(f, `id=1`)
 		assert.NoError(t, err)
 
-		f.Build()
+		f.Build(RawAdapter{})
 
 		// Verify plugin was called
 		assert.True(t, plugin.initialized)
@@ -379,7 +379,7 @@ func TestPhase3Integration(t *testing.T) {
 		errorPlugin := &ErrorPlugin{name: "error-plugin", version: "1.0.0"}
 		manager.RegisterPlugin(errorPlugin)
 
-		f := New(RawAdapter{})
+		f := New()
 		f.SetPluginManager(manager)
 
 		// Test plugin error handling

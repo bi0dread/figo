@@ -10,7 +10,7 @@ import (
 
 // #5: LIKE/ILIKE/regex must serialize as a real BSON regex, not "$regex": {}.
 func TestMongoRegexSerializesCorrectly(t *testing.T) {
-	f := New(nil)
+	f := New()
 	f.AddFilter(LikeExpr{Field: "name", Value: "%foo%"})
 	f.Build()
 	m, _ := BuildMongoFilter(f)
@@ -52,7 +52,7 @@ func TestMongoLikeEscapesMeta(t *testing.T) {
 // ILIKE carries the case-insensitive option on the regex itself (not a separate
 // $options key paired with a regex object, which Mongo rejects).
 func TestMongoILikeUsesOptions(t *testing.T) {
-	f := New(nil)
+	f := New()
 	f.AddFilter(ILikeExpr{Field: "name", Value: "%bar%"})
 	f.Build()
 	m, _ := BuildMongoFilter(f)

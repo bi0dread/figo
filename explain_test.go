@@ -9,11 +9,11 @@ import (
 
 func explainFor(t *testing.T, dsl string) string {
 	t.Helper()
-	f := New(RawAdapter{})
+	f := New()
 	if err := f.AddFiltersFromString(dsl); err != nil {
 		t.Fatalf("AddFiltersFromString(%q): %v", dsl, err)
 	}
-	f.Build()
+	f.Build(RawAdapter{})
 	return f.Explain()
 }
 
@@ -31,8 +31,8 @@ func TestExplainMatchesExample(t *testing.T) {
 
 func TestExplainVariants(t *testing.T) {
 	t.Run("Empty", func(t *testing.T) {
-		f := New(RawAdapter{})
-		f.Build()
+		f := New()
+		f.Build(RawAdapter{})
 		assert.Equal(t, "(no filters)", f.Explain())
 	})
 

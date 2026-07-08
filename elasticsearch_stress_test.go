@@ -19,9 +19,9 @@ func TestElasticsearchStressTest(t *testing.T) {
 	setupStressTestData(t)
 
 	t.Run("LargeDatasetQuery", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`id > 0 and id <= 1000`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
@@ -35,9 +35,9 @@ func TestElasticsearchStressTest(t *testing.T) {
 	})
 
 	t.Run("ComplexNestedQueryWithLargeDataset", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`((category = "tech" and score > 80) or (category = "business" and age > 30)) and (status = "active" or status = "pending") and price <bet> (100..1000)`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
@@ -53,9 +53,9 @@ func TestElasticsearchStressTest(t *testing.T) {
 
 	t.Run("PaginationStressTest", func(t *testing.T) {
 		// Test pagination with large dataset
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`id > 0 sort=id:asc page=skip:500,take:100`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
@@ -77,9 +77,9 @@ func TestElasticsearchStressTest(t *testing.T) {
 	})
 
 	t.Run("MultipleSortFields", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`id > 0 sort=category:asc,score:desc,age:asc,price:desc page=skip:0,take:50`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
@@ -93,10 +93,10 @@ func TestElasticsearchStressTest(t *testing.T) {
 	})
 
 	t.Run("FieldSelectionStressTest", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddSelectFields("id", "name", "email", "category", "score", "age", "price", "status")
 		f.AddFiltersFromString(`id > 0`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
@@ -110,9 +110,9 @@ func TestElasticsearchStressTest(t *testing.T) {
 	})
 
 	t.Run("RegexStressTest", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`email =~ ".*@(gmail|yahoo|outlook)\\.com$"`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
@@ -128,9 +128,9 @@ func TestElasticsearchStressTest(t *testing.T) {
 
 	t.Run("TermsStressTest", func(t *testing.T) {
 		// Test with many terms
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`category <in> [tech,business,finance,health,education,entertainment,sports,travel,food,automotive]`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
@@ -145,9 +145,9 @@ func TestElasticsearchStressTest(t *testing.T) {
 	})
 
 	t.Run("RangeStressTest", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`age >= 18 and age <= 65 and score >= 50 and score <= 100 and price >= 100 and price <= 1000`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
@@ -162,9 +162,9 @@ func TestElasticsearchStressTest(t *testing.T) {
 	})
 
 	t.Run("NotStressTest", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`status != "inactive" and category != "deprecated" and score != 0`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
@@ -179,9 +179,9 @@ func TestElasticsearchStressTest(t *testing.T) {
 	})
 
 	t.Run("NullStressTest", func(t *testing.T) {
-		f := New(ElasticsearchAdapter{})
+		f := New()
 		f.AddFiltersFromString(`deleted_at <null> and last_login <notnull> and phone <notnull>`)
-		f.Build()
+		f.Build(ElasticsearchAdapter{})
 
 		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)

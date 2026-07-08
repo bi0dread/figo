@@ -15,28 +15,28 @@ import (
 )
 
 func TestNew(t *testing.T) {
-	f := New(nil)
+	f := New()
 	assert.NotNil(t, f)
 	assert.Equal(t, 0, f.GetPage().Skip)
 	assert.Equal(t, 20, f.GetPage().Take)
 }
 
 func TestAddBanFields(t *testing.T) {
-	f := New(nil)
+	f := New()
 	f.AddIgnoreFields("sensitive_field", "internal_use_only")
 	assert.True(t, f.GetIgnoreFields()["sensitive_field"])
 	assert.True(t, f.GetIgnoreFields()["internal_use_only"])
 }
 
 func TestAddSelectFields(t *testing.T) {
-	f := New(nil)
+	f := New()
 	f.AddSelectFields("field1", "field2")
 	assert.True(t, f.GetSelectFields()["field1"])
 	assert.True(t, f.GetSelectFields()["field2"])
 }
 
 func TestBuild(t *testing.T) {
-	f := New(nil)
+	f := New()
 
 	err := f.AddFiltersFromString(`(id=1 or id=2) or id>=2 or id<=3 or id!=0 and vendor=vendor1 or name=ali and (place=tehran or place=shiraz or (v1=2 and v2=1 and (g1=0 or g1=2))) or GG=9 or GG=8 sort=id:desc,name:ace page=skip:10,take:10 load=[inner1:id=1 or name=ali | inner2:id=2 or name=ali]`)
 	assert.Nil(t, err)
@@ -45,7 +45,7 @@ func TestBuild(t *testing.T) {
 }
 
 func TestAdapterSelection(t *testing.T) {
-	f := New(GormAdapter{})
+	f := New(GormAdapter{}) // exercises the adapter-on-New construction path
 	if _, ok := f.GetAdapterObject().(GormAdapter); !ok {
 		t.Fatalf("expected GormAdapter")
 	}
@@ -106,9 +106,9 @@ func TestGormAndRawAdapters(t *testing.T) {
 	db.Create(&TestModel{ID: 2, VendorID: 22, BankID: 13, ExpeditionType: "eq", TestInner2: []*TestInnerModel2{{XX: 2, ID: 4, Name: "test2"}}})
 
 	// Build filters
-	f := New(GormAdapter{})
+	f := New()
 	f.AddFiltersFromString(`load=[inner1:id=1 or name=ali | inner2:id=2 or name=ali] and gg=~"^ab.*" and (id=1 and vendorId="22") and bank_id=11 or expedition_type=^"%e%" sort=id:desc page=skip:0,take:10 and (id<in>[1,2,3] and name.=^"%ab%") and (price<bet>10..20 and deleted_at<null>) and kind<notnull> and status<nin>[x,y]`)
-	f.Build()
+	f.Build(GormAdapter{})
 
 	// GORM adapter - apply and get SQL (expanded by GORM explain)
 	db2 := ApplyGorm(f, db.Model(&TestModel{}))
@@ -128,10 +128,10 @@ func TestGormAndRawAdapters(t *testing.T) {
 }
 
 func TestRawAdapterBuild(t *testing.T) {
-	f := New(RawAdapter{})
+	f := New()
 	f.AddFiltersFromString(`(id=1 and vendorId="22") and bank_id=11 or expedition_type=^"%e%" sort=id:desc page=skip:0,take:10`)
 	f.AddIgnoreFields("bank_id")
-	f.Build()
+	f.Build(RawAdapter{})
 
 	sql, args := BuildRawSelect(f, "test_models")
 	// With proper operator precedence and bank_id ignored: (id=1 AND vendor_id=22) AND expedition_type LIKE %e%
@@ -140,7 +140,7 @@ func TestRawAdapterBuild(t *testing.T) {
 }
 
 func TestMongoAdapterBuild(t *testing.T) {
-	f := New(nil)
+	f := New()
 	f.AddFiltersFromString(`(id=1 and vendorId="22") and bank_id=11 or expedition_type=^"%e%" sort=id:desc page=skip:0,take:10`)
 	f.AddIgnoreFields("bank_id")
 	f.Build()
@@ -199,7 +199,7 @@ func TestMongoAdapterBuild(t *testing.T) {
 	}
 
 	// Preloads to joins
-	f2 := New(nil)
+	f2 := New()
 	f2.AddFiltersFromString(`load=[TestInner1:id="3" or name="test1" | TestInner2:id=4]`)
 	f2.Build()
 	joins := map[string]MongoJoin{
@@ -248,9 +248,9 @@ func TestPageValidation(t *testing.T) {
 }
 
 func TestRawSelectFieldsColumns(t *testing.T) {
-	f := New(RawAdapter{})
+	f := New()
 	f.AddSelectFields("id", "vendorId")
-	f.Build()
+	f.Build(RawAdapter{})
 
 	sql := f.GetSqlString(RawContext{Table: "test_models"}, "SELECT", "FROM")
 	assert.Contains(t, sql, "SELECT ")
@@ -274,9 +274,9 @@ func TestGormSelectFieldsColumns(t *testing.T) {
 		t.Fatalf("failed to migrate: %v", err)
 	}
 
-	f := New(GormAdapter{})
+	f := New()
 	f.AddSelectFields("id", "vendorId")
-	f.Build()
+	f.Build(GormAdapter{})
 
 	db2 := ApplyGorm(f, db.Model(&TestModel{}))
 	sql := f.GetSqlString(db2, "SELECT")
@@ -302,8 +302,8 @@ func TestAdapterObjectDelegation(t *testing.T) {
 }
 
 func TestGetQueryRaw(t *testing.T) {
-	f := New(RawAdapter{})
-	f.Build()
+	f := New()
+	f.Build(RawAdapter{})
 	q := f.GetQuery(RawContext{Table: "test_models"}, "SELECT", "FROM")
 	sqlq, ok := q.(SQLQuery)
 	assert.True(t, ok)
@@ -317,8 +317,8 @@ func TestGetQueryGorm(t *testing.T) {
 	}
 	type TestModel struct{ ID int }
 	_ = db.AutoMigrate(&TestModel{})
-	f := New(GormAdapter{})
-	f.Build()
+	f := New()
+	f.Build(GormAdapter{})
 	db2 := ApplyGorm(f, db.Model(&TestModel{}))
 	q := f.GetQuery(db2, "SELECT")
 	_, ok := q.(SQLQuery)
@@ -327,17 +327,17 @@ func TestGetQueryGorm(t *testing.T) {
 
 func TestGetQueryMongoFindAndAgg(t *testing.T) {
 	// FIND
-	f := New(MongoAdapter{})
+	f := New()
 	f.AddFiltersFromString(`id=1 or expedition_type=^"%e%"`)
-	f.Build()
+	f.Build(MongoAdapter{})
 	q := f.GetQuery(nil)
 	_, isFind := q.(MongoFindQuery)
 	assert.True(t, isFind)
 
 	// AGGREGATE
-	f2 := New(MongoAdapter{})
+	f2 := New()
 	f2.AddFiltersFromString(`load=[Rel:id=1]`)
-	f2.Build()
+	f2.Build(MongoAdapter{})
 	joins := map[string]MongoJoin{"Rel": {From: "rels", LocalField: "id", ForeignField: "pid", As: "Rel"}}
 	q2 := f2.GetQuery(joins, "AGG")
 	_, isAgg := q2.(MongoAggregateQuery)
@@ -345,14 +345,14 @@ func TestGetQueryMongoFindAndAgg(t *testing.T) {
 }
 
 func TestRawNewOperations(t *testing.T) {
-	f := New(RawAdapter{})
+	f := New()
 	f.AddFilter(InExpr{Field: "id", Values: []any{1, 2, 3}})
 	f.AddFilter(ILikeExpr{Field: "name", Value: "%ab%"})
 	f.AddFilter(BetweenExpr{Field: "price", Low: 10, High: 20})
 	f.AddFilter(IsNullExpr{Field: "deleted_at"})
 	f.AddFilter(NotNullExpr{Field: "kind"})
 	f.AddFilter(NotInExpr{Field: "status", Values: []any{"x", "y"}})
-	f.Build()
+	f.Build(RawAdapter{})
 
 	where, args := BuildRawWhere(f)
 	assert.Contains(t, where, "`id` IN (")
@@ -372,10 +372,10 @@ func TestGormNewOperations(t *testing.T) {
 	type M struct{ ID int }
 	_ = db.AutoMigrate(&M{})
 
-	f := New(GormAdapter{})
+	f := New()
 	// DSL exercising new ops
 	f.AddFiltersFromString(`(id<in>[1,2,3] and name.=^"%ab%") and (price<bet>(10..20) and deleted_at<null>) and kind<notnull> and status<nin>[x,y] and name=~"^ab.*"`)
-	f.Build()
+	f.Build(GormAdapter{})
 	db2 := ApplyGorm(f, db.Model(&M{}))
 	s := f.GetSqlString(db2, "SELECT", "FROM", "WHERE")
 	assert.Contains(t, s, "IN (")
@@ -387,7 +387,7 @@ func TestGormNewOperations(t *testing.T) {
 }
 
 func TestMongoNewOperations(t *testing.T) {
-	f := New(nil)
+	f := New()
 	f.AddFilter(InExpr{Field: "id", Values: []any{1, 2, 3}})
 	f.AddFilter(ILikeExpr{Field: "name", Value: "%ab%"})
 	f.AddFilter(BetweenExpr{Field: "price", Low: 10, High: 20})
@@ -443,9 +443,9 @@ func TestRegexSQLOperatorConfig(t *testing.T) {
 	type M struct{ ID int }
 	_ = db.AutoMigrate(&M{})
 
-	f := New(GormAdapter{})
+	f := New()
 	f.AddFiltersFromString(`name=~"^ab.*"`)
-	f.Build()
+	f.Build(GormAdapter{})
 	db2 := ApplyGorm(f, db.Model(&M{}))
 	s := f.GetSqlString(db2, "SELECT", "FROM", "WHERE")
 	assert.Contains(t, s, "~*")
@@ -456,9 +456,9 @@ func TestFieldNameWithUnderscoresAllAdapters(t *testing.T) {
 	dsl := `user_profile_id > 100 and account_balance < 500`
 
 	// Test GORM Adapter
-	f1 := New(GormAdapter{})
+	f1 := New()
 	f1.AddFiltersFromString(dsl)
-	f1.Build()
+	f1.Build(GormAdapter{})
 	db, _ := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	type TestModel struct {
 		UserProfileID  int `gorm:"column:user_profile_id"`
@@ -471,18 +471,18 @@ func TestFieldNameWithUnderscoresAllAdapters(t *testing.T) {
 	assert.Contains(t, sql1, "`account_balance` < 500")
 
 	// Test Raw Adapter
-	f2 := New(RawAdapter{})
+	f2 := New()
 	f2.AddFiltersFromString(dsl)
-	f2.Build()
+	f2.Build(RawAdapter{})
 	sql2, args := BuildRawSelect(f2, "test_table")
 	assert.Contains(t, sql2, "`user_profile_id` > ?")
 	assert.Contains(t, sql2, "`account_balance` < ?")
 	assert.Equal(t, []any{int64(100), int64(500)}, args)
 
 	// Test MongoDB Adapter
-	f3 := New(MongoAdapter{})
+	f3 := New()
 	f3.AddFiltersFromString(dsl)
-	f3.Build()
+	f3.Build(MongoAdapter{})
 	filter, _ := BuildMongoFilter(f3)
 	// Check that the filter contains the expected field names and operations
 	filterStr := fmt.Sprintf("%v", filter)
@@ -494,42 +494,42 @@ func TestTokenCombinationSafety(t *testing.T) {
 	// Test various edge cases to ensure token combination is safe
 
 	// Test 1: Normal field names without underscores
-	f1 := New(RawAdapter{})
+	f1 := New()
 	f1.AddFiltersFromString(`name > "test" and age < 25`)
-	f1.Build()
+	f1.Build(RawAdapter{})
 	sql1, _ := BuildRawSelect(f1, "users")
 	assert.Contains(t, sql1, "`name` > ?")
 	assert.Contains(t, sql1, "`age` < ?")
 
 	// Test 2: Field names with special characters (should not be combined)
-	f2 := New(RawAdapter{})
+	f2 := New()
 	f2.AddFiltersFromString(`field_with_underscores > 100`)
-	f2.Build()
+	f2.Build(RawAdapter{})
 	sql2, _ := BuildRawSelect(f2, "test")
 	assert.Contains(t, sql2, "`field_with_underscores` > ?")
 
 	// Test 3: Logical operators should not be combined
-	f3 := New(RawAdapter{})
+	f3 := New()
 	f3.AddFiltersFromString(`name = "test" and status = "active"`)
-	f3.Build()
+	f3.Build(RawAdapter{})
 	sql3, _ := BuildRawSelect(f3, "users")
 	assert.Contains(t, sql3, "`name` = ?")
 	assert.Contains(t, sql3, "`status` = ?")
 	assert.Contains(t, sql3, "AND")
 
 	// Test 4: Special tokens should not be combined
-	f4 := New(RawAdapter{})
+	f4 := New()
 	f4.AddFiltersFromString(`name = "test" sort=id:desc page=skip:0,take:10`)
-	f4.Build()
+	f4.Build(RawAdapter{})
 	sql4, _ := BuildRawSelect(f4, "users")
 	assert.Contains(t, sql4, "`name` = ?")
 	assert.Contains(t, sql4, "ORDER BY")
 	assert.Contains(t, sql4, "LIMIT 10")
 
 	// Test 5: Complex expressions with parentheses
-	f5 := New(RawAdapter{})
+	f5 := New()
 	f5.AddFiltersFromString(`(name > "a" and age < 30) or (status = "active" and score > 80)`)
-	f5.Build()
+	f5.Build(RawAdapter{})
 	sql5, _ := BuildRawSelect(f5, "users")
 	assert.Contains(t, sql5, "`name` > ?")
 	assert.Contains(t, sql5, "`age` < ?")
@@ -537,35 +537,35 @@ func TestTokenCombinationSafety(t *testing.T) {
 	assert.Contains(t, sql5, "`score` > ?")
 
 	// Test 6: Quoted values should not be combined
-	f6 := New(RawAdapter{})
+	f6 := New()
 	f6.AddFiltersFromString(`name = "John Doe" and city = "New York"`)
-	f6.Build()
+	f6.Build(RawAdapter{})
 	sql6, args6 := BuildRawSelect(f6, "users")
 	assert.Contains(t, sql6, "`name` = ?")
 	assert.Contains(t, sql6, "`city` = ?")
 	assert.Equal(t, []any{"John Doe", "New York"}, args6)
 
 	// Test 7: Numeric values should not be combined
-	f7 := New(RawAdapter{})
+	f7 := New()
 	f7.AddFiltersFromString(`id > 100 and price < 50.99`)
-	f7.Build()
+	f7.Build(RawAdapter{})
 	sql7, args7 := BuildRawSelect(f7, "products")
 	assert.Contains(t, sql7, "`id` > ?")
 	assert.Contains(t, sql7, "`price` < ?")
 	assert.Equal(t, []any{int64(100), 50.99}, args7)
 
 	// Test 8: Edge case - single character field names
-	f8 := New(RawAdapter{})
+	f8 := New()
 	f8.AddFiltersFromString(`x > 1 and y < 2`)
-	f8.Build()
+	f8.Build(RawAdapter{})
 	sql8, _ := BuildRawSelect(f8, "test")
 	assert.Contains(t, sql8, "`x` > ?")
 	assert.Contains(t, sql8, "`y` < ?")
 
 	// Test 9: Potential security edge cases
-	f9 := New(RawAdapter{})
+	f9 := New()
 	f9.AddFiltersFromString(`name = "'; DROP TABLE users; --"`)
-	f9.Build()
+	f9.Build(RawAdapter{})
 	sql9, args9 := BuildRawSelect(f9, "users")
 	assert.Contains(t, sql9, "`name` = ?")
 	assert.Equal(t, []any{"'; DROP TABLE users; --"}, args9)
@@ -576,9 +576,9 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	// Comprehensive tests to catch potential bugs
 
 	// Test 1: Complex nested parentheses
-	f1 := New(RawAdapter{})
+	f1 := New()
 	f1.AddFiltersFromString(`((name > "a" and age < 30) or (status = "active" and score > 80)) and (deleted_at <null> or updated_at > "2023-01-01")`)
-	f1.Build()
+	f1.Build(RawAdapter{})
 	sql1, _ := BuildRawSelect(f1, "users")
 	assert.Contains(t, sql1, "`name` > ?")
 	assert.Contains(t, sql1, "`age` < ?")
@@ -588,9 +588,9 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	assert.Contains(t, sql1, "`updated_at` > ?")
 
 	// Test 2: Mixed data types and operators
-	f2 := New(RawAdapter{})
+	f2 := New()
 	f2.AddFiltersFromString(`id > 100 and name = "test" and price < 99.99 and active = true and created_at > "2023-01-01"`)
-	f2.Build()
+	f2.Build(RawAdapter{})
 	sql2, args2 := BuildRawSelect(f2, "products")
 	assert.Contains(t, sql2, "`id` > ?")
 	assert.Contains(t, sql2, "`name` = ?")
@@ -611,9 +611,9 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	}
 
 	// Test 3: Field names with various patterns
-	f3 := New(RawAdapter{})
+	f3 := New()
 	f3.AddFiltersFromString(`user_id > 1 and user_name = "john" and user_email_address =^ "%@gmail.com" and user_created_at > "2023-01-01"`)
-	f3.Build()
+	f3.Build(RawAdapter{})
 	sql3, _ := BuildRawSelect(f3, "users")
 	assert.Contains(t, sql3, "`user_id` > ?")
 	assert.Contains(t, sql3, "`user_name` = ?")
@@ -621,9 +621,9 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	assert.Contains(t, sql3, "`user_created_at` > ?")
 
 	// Test 4: Edge cases with quotes and special characters
-	f4 := New(RawAdapter{})
+	f4 := New()
 	f4.AddFiltersFromString(`name = "O'Connor" and description =^ "%test%" and category = "electronics & gadgets"`)
-	f4.Build()
+	f4.Build(RawAdapter{})
 	sql4, args4 := BuildRawSelect(f4, "products")
 	assert.Contains(t, sql4, "`name` = ?")
 	assert.Contains(t, sql4, "`description` LIKE ?")
@@ -631,9 +631,9 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	assert.Equal(t, []any{"O'Connor", "%test%", "electronics & gadgets"}, args4)
 
 	// Test 5: Numeric edge cases
-	f5 := New(RawAdapter{})
+	f5 := New()
 	f5.AddFiltersFromString(`id = 0 and price = 0.0 and discount = -10.5 and quantity >= 1`)
-	f5.Build()
+	f5.Build(RawAdapter{})
 	sql5, args5 := BuildRawSelect(f5, "products")
 	assert.Contains(t, sql5, "`id` = ?")
 	assert.Contains(t, sql5, "`price` = ?")
@@ -642,9 +642,9 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	assert.Equal(t, []any{int64(0), int64(0), -10.5, int64(1)}, args5)
 
 	// Test 6: Complex operators with spaces
-	f6 := New(RawAdapter{})
+	f6 := New()
 	f6.AddFiltersFromString(`name =^ "%test%" and id <in> [1,2,3,4,5] and status <nin> ["inactive","deleted"] and price <bet> (10..100)`)
-	f6.Build()
+	f6.Build(RawAdapter{})
 	sql6, _ := BuildRawSelect(f6, "products")
 	assert.Contains(t, sql6, "`name` LIKE ?")
 	assert.Contains(t, sql6, "`id` IN (?,?,?,?,?)")
@@ -652,26 +652,26 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	// Note: <bet> operator is not working yet, so we'll skip that assertion for now
 
 	// Test 7: Null and not null operations
-	f7 := New(RawAdapter{})
+	f7 := New()
 	f7.AddFiltersFromString(`deleted_at <null> and updated_at <notnull> and description <null>`)
-	f7.Build()
+	f7.Build(RawAdapter{})
 	sql7, _ := BuildRawSelect(f7, "products")
 	assert.Contains(t, sql7, "`deleted_at` IS NULL")
 	assert.Contains(t, sql7, "`updated_at` IS NOT NULL")
 	assert.Contains(t, sql7, "`description` IS NULL")
 
 	// Test 8: Regex operations
-	f8 := New(RawAdapter{})
+	f8 := New()
 	f8.AddFiltersFromString(`email =~ "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$" and phone =~ "^\\+?[1-9]\\d{1,14}$"`)
-	f8.Build()
+	f8.Build(RawAdapter{})
 	sql8, _ := BuildRawSelect(f8, "users")
 	assert.Contains(t, sql8, "`email` REGEXP ?")
 	assert.Contains(t, sql8, "`phone` REGEXP ?")
 
 	// Test 9: Pagination and sorting with complex filters
-	f9 := New(RawAdapter{})
+	f9 := New()
 	f9.AddFiltersFromString(`name > "a" and age < 100 sort=name:asc,age:desc page=skip:10,take:20`)
-	f9.Build()
+	f9.Build(RawAdapter{})
 	sql9, _ := BuildRawSelect(f9, "users")
 	assert.Contains(t, sql9, "`name` > ?")
 	assert.Contains(t, sql9, "`age` < ?")
@@ -680,9 +680,9 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	assert.Contains(t, sql9, "OFFSET 10")
 
 	// Test 10: Very long field names
-	f10 := New(RawAdapter{})
+	f10 := New()
 	f10.AddFiltersFromString(`very_long_field_name_with_many_underscores_and_numbers_123 > 100`)
-	f10.Build()
+	f10.Build(RawAdapter{})
 	sql10, _ := BuildRawSelect(f10, "test")
 	assert.Contains(t, sql10, "`very_long_field_name_with_many_underscores_and_numbers_123` > ?")
 }
@@ -692,9 +692,9 @@ func TestAdapterConsistency(t *testing.T) {
 	dsl := `user_id > 100 and name = "test" and price < 50.99 and status = "active"`
 
 	// GORM Adapter
-	f1 := New(GormAdapter{})
+	f1 := New()
 	f1.AddFiltersFromString(dsl)
-	f1.Build()
+	f1.Build(GormAdapter{})
 	db, _ := gorm.Open(sqlite.Open(":memory:"), &gorm.Config{})
 	type TestModel struct {
 		UserID int     `gorm:"column:user_id"`
@@ -707,15 +707,15 @@ func TestAdapterConsistency(t *testing.T) {
 	sql1 := f1.GetSqlString(db2, "WHERE")
 
 	// Raw Adapter
-	f2 := New(RawAdapter{})
+	f2 := New()
 	f2.AddFiltersFromString(dsl)
-	f2.Build()
+	f2.Build(RawAdapter{})
 	sql2, args2 := BuildRawSelect(f2, "test_table")
 
 	// MongoDB Adapter
-	f3 := New(MongoAdapter{})
+	f3 := New()
 	f3.AddFiltersFromString(dsl)
-	f3.Build()
+	f3.Build(MongoAdapter{})
 	filter3, _ := BuildMongoFilter(f3)
 
 	// Verify all adapters handle the same fields
@@ -741,33 +741,33 @@ func TestErrorHandling(t *testing.T) {
 	// Test error handling and edge cases
 
 	// Test 1: Empty DSL
-	f1 := New(RawAdapter{})
+	f1 := New()
 	f1.AddFiltersFromString("")
-	f1.Build()
+	f1.Build(RawAdapter{})
 	sql1, args1 := BuildRawSelect(f1, "test")
 	assert.Contains(t, sql1, "SELECT * FROM `test`")
 	assert.Empty(t, args1)
 
 	// Test 2: Only whitespace
-	f2 := New(RawAdapter{})
+	f2 := New()
 	f2.AddFiltersFromString("   ")
-	f2.Build()
+	f2.Build(RawAdapter{})
 	sql2, args2 := BuildRawSelect(f2, "test")
 	assert.Contains(t, sql2, "SELECT * FROM `test`")
 	assert.Empty(t, args2)
 
 	// Test 3: Malformed expressions (should not panic)
-	f3 := New(RawAdapter{})
+	f3 := New()
 	f3.AddFiltersFromString(`name = and age > 25`) // Missing value after =
-	f3.Build()
+	f3.Build(RawAdapter{})
 	sql3, _ := BuildRawSelect(f3, "test")
 	// Should handle gracefully without panicking
 	assert.NotNil(t, sql3)
 
 	// Test 4: Unmatched parentheses
-	f4 := New(RawAdapter{})
+	f4 := New()
 	f4.AddFiltersFromString(`(name = "test" and age > 25`) // Missing closing parenthesis
-	f4.Build()
+	f4.Build(RawAdapter{})
 	sql4, _ := BuildRawSelect(f4, "test")
 	// Should handle gracefully
 	assert.NotNil(t, sql4)
@@ -781,9 +781,9 @@ func TestComplexFiltersWithParentheses(t *testing.T) {
 	fmt.Printf("Complex DSL: %s\n", dsl)
 
 	// Test with Raw Adapter
-	f1 := New(RawAdapter{})
+	f1 := New()
 	f1.AddFiltersFromString(dsl)
-	f1.Build()
+	f1.Build(RawAdapter{})
 	sql1, args1 := BuildRawSelect(f1, "users")
 
 	fmt.Printf("Raw SQL: %s\n", sql1)
@@ -820,14 +820,14 @@ func TestComplexFiltersWithParentheses(t *testing.T) {
 	assert.Contains(t, sql1, ")")
 
 	// Test with GORM Adapter
-	f2 := New(GormAdapter{})
+	f2 := New()
 	f2.AddFiltersFromString(dsl)
-	f2.Build()
+	f2.Build(GormAdapter{})
 
 	// Test with MongoDB Adapter
-	f3 := New(MongoAdapter{})
+	f3 := New()
 	f3.AddFiltersFromString(dsl)
-	f3.Build()
+	f3.Build(MongoAdapter{})
 	filter3, _ := BuildMongoFilter(f3)
 
 	fmt.Printf("MongoDB Filter: %+v\n", filter3)
@@ -920,9 +920,9 @@ func TestComplexFiltersWithAllOperators(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := New(RawAdapter{})
+			f := New()
 			f.AddFiltersFromString(tt.dsl)
-			f.Build()
+			f.Build(RawAdapter{})
 			sql, _ := BuildRawSelect(f, "test")
 
 			// Debug output for NOT operator test
@@ -955,9 +955,9 @@ func TestComplexFiltersWithAllOperators(t *testing.T) {
 
 func TestElasticsearchAdapter(t *testing.T) {
 	// Test basic operations
-	f1 := New(ElasticsearchAdapter{})
+	f1 := New()
 	f1.AddFiltersFromString(`name = "john" and age > 25`)
-	f1.Build()
+	f1.Build(ElasticsearchAdapter{})
 	query1, _ := BuildElasticsearchQuery(f1)
 
 	// Verify basic structure
@@ -965,9 +965,9 @@ func TestElasticsearchAdapter(t *testing.T) {
 	assert.Contains(t, fmt.Sprintf("%v", query1.Query), "bool")
 
 	// Test complex operations
-	f2 := New(ElasticsearchAdapter{})
+	f2 := New()
 	f2.AddFiltersFromString(`name =^ "%john%" and age <in> [25,30,35] and score <bet> (80..100) and status <notnull>`)
-	f2.Build()
+	f2.Build(ElasticsearchAdapter{})
 	query2, _ := BuildElasticsearchQuery(f2)
 
 	// Verify complex query structure
@@ -978,18 +978,18 @@ func TestElasticsearchAdapter(t *testing.T) {
 	assert.Contains(t, queryStr, "exists")
 
 	// Test pagination
-	f3 := New(ElasticsearchAdapter{})
+	f3 := New()
 	f3.AddFiltersFromString(`id > 0 page=skip:10,take:5`)
-	f3.Build()
+	f3.Build(ElasticsearchAdapter{})
 	query3, _ := BuildElasticsearchQuery(f3)
 
 	assert.Equal(t, 10, query3.From)
 	assert.Equal(t, 5, query3.Size)
 
 	// Test sorting
-	f4 := New(ElasticsearchAdapter{})
+	f4 := New()
 	f4.AddFiltersFromString(`id > 0 sort=name:asc,age:desc`)
-	f4.Build()
+	f4.Build(ElasticsearchAdapter{})
 	query4, _ := BuildElasticsearchQuery(f4)
 
 	assert.Len(t, query4.Sort, 2)
@@ -997,10 +997,10 @@ func TestElasticsearchAdapter(t *testing.T) {
 	assert.Contains(t, fmt.Sprintf("%v", query4.Sort), "age")
 
 	// Test field selection
-	f5 := New(ElasticsearchAdapter{})
+	f5 := New()
 	f5.AddSelectFields("id", "name", "email")
 	f5.AddFiltersFromString(`id > 0`)
-	f5.Build()
+	f5.Build(ElasticsearchAdapter{})
 	query5, _ := BuildElasticsearchQuery(f5)
 
 	assert.Len(t, query5.Source, 3)
@@ -1014,9 +1014,9 @@ func TestElasticsearchQueryBuilder(t *testing.T) {
 	builder := NewElasticsearchQueryBuilder()
 
 	// Test from figo
-	f := New(ElasticsearchAdapter{})
+	f := New()
 	f.AddFiltersFromString(`name = "john" and age > 25`)
-	f.Build()
+	f.Build(ElasticsearchAdapter{})
 
 	query := builder.FromFigo(f).AddSort("name", true).AddSort("age", false).SetPagination(0, 10).SetSource("id", "name").Build()
 
@@ -1086,9 +1086,9 @@ func TestElasticsearchAllOperators(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			f := New(ElasticsearchAdapter{})
+			f := New()
 			f.AddFiltersFromString(tt.dsl)
-			f.Build()
+			f.Build(ElasticsearchAdapter{})
 			query, _ := BuildElasticsearchQuery(f)
 
 			queryStr := fmt.Sprintf("%v", query.Query)
@@ -1099,9 +1099,9 @@ func TestElasticsearchAllOperators(t *testing.T) {
 
 func TestElasticsearchComplexQueries(t *testing.T) {
 	// Test complex nested queries
-	f := New(ElasticsearchAdapter{})
+	f := New()
 	f.AddFiltersFromString(`((name =^ "%john%" or email =^ "%gmail%") and (age >= 18 and age <= 65)) or (status = "active" and score > 80)`)
-	f.Build()
+	f.Build(ElasticsearchAdapter{})
 	query, _ := BuildElasticsearchQuery(f)
 
 	queryStr := fmt.Sprintf("%v", query.Query)
@@ -1110,9 +1110,9 @@ func TestElasticsearchComplexQueries(t *testing.T) {
 	assert.Contains(t, queryStr, "must")
 
 	// Test with pagination and sorting
-	f2 := New(ElasticsearchAdapter{})
+	f2 := New()
 	f2.AddFiltersFromString(`id > 0 sort=name:asc,age:desc page=skip:20,take:10`)
-	f2.Build()
+	f2.Build(ElasticsearchAdapter{})
 	query2, _ := BuildElasticsearchQuery(f2)
 
 	assert.Equal(t, 20, query2.From)
@@ -1124,25 +1124,25 @@ func TestMissingScenarios(t *testing.T) {
 	// Test scenarios that were missing from our coverage
 
 	// Test 1: BETWEEN operator comprehensive testing
-	f1 := New(RawAdapter{})
+	f1 := New()
 	f1.AddFiltersFromString(`price <bet> (10..20)`)
-	f1.Build()
+	f1.Build(RawAdapter{})
 	sql1, args1 := BuildRawSelect(f1, "products")
 	assert.Contains(t, sql1, "`price` BETWEEN ? AND ?")
 	assert.Equal(t, []any{int64(10), int64(20)}, args1)
 
 	// Test 2: Complex LOAD operations
-	f2 := New(RawAdapter{})
+	f2 := New()
 	f2.AddFiltersFromString(`id > 0 load=[User:name="john" and age>18 | Profile:bio=^"%developer%" | Posts:title=^"%golang%" and published=true]`)
-	f2.Build()
+	f2.Build(RawAdapter{})
 	sql2, _ := BuildRawSelect(f2, "users")
 	assert.Contains(t, sql2, "`id` > ?")
 	// Note: LOAD operations are handled by adapters, not in raw SQL
 
 	// Test 3: Edge cases with special characters and unicode
-	f3 := New(RawAdapter{})
+	f3 := New()
 	f3.AddFiltersFromString(`name = "José María" and description =^ "%café%" and category = "electronics & gadgets"`)
-	f3.Build()
+	f3.Build(RawAdapter{})
 	sql3, args3 := BuildRawSelect(f3, "products")
 	assert.Contains(t, sql3, "`name` = ?")
 	assert.Contains(t, sql3, "`description` LIKE ?")
@@ -1150,9 +1150,9 @@ func TestMissingScenarios(t *testing.T) {
 	assert.Equal(t, []any{"José María", "%café%", "electronics & gadgets"}, args3)
 
 	// Test 4: Empty and null value handling
-	f4 := New(RawAdapter{})
+	f4 := New()
 	f4.AddFiltersFromString(`name = "" and description <null> and status = "active"`)
-	f4.Build()
+	f4.Build(RawAdapter{})
 	sql4, args4 := BuildRawSelect(f4, "products")
 	assert.Contains(t, sql4, "`name` = ?")
 	assert.Contains(t, sql4, "`description` IS NULL")
@@ -1160,9 +1160,9 @@ func TestMissingScenarios(t *testing.T) {
 	assert.Equal(t, []any{"", "active"}, args4)
 
 	// Test 5: Type coercion edge cases
-	f5 := New(RawAdapter{})
+	f5 := New()
 	f5.AddFiltersFromString(`id = 0 and price = 0.0 and active = false and count = -1`)
-	f5.Build()
+	f5.Build(RawAdapter{})
 	sql5, args5 := BuildRawSelect(f5, "products")
 	assert.Contains(t, sql5, "`id` = ?")
 	assert.Contains(t, sql5, "`price` = ?")
@@ -1171,9 +1171,9 @@ func TestMissingScenarios(t *testing.T) {
 	assert.Equal(t, []any{int64(0), int64(0), false, int64(-1)}, args5)
 
 	// Test 6: Operator precedence and complex combinations
-	f6 := New(RawAdapter{})
+	f6 := New()
 	f6.AddFiltersFromString(`(id > 100 and name =^ "%test%") or (status = "active" and price < 50.0) and not (deleted = true)`)
-	f6.Build()
+	f6.Build(RawAdapter{})
 	sql6, _ := BuildRawSelect(f6, "products")
 
 	// For now, just check that we get some SQL output and NOT operation
@@ -1181,17 +1181,17 @@ func TestMissingScenarios(t *testing.T) {
 	assert.Contains(t, sql6, "NOT")
 
 	// Test 7: Very long field names and complex expressions
-	f7 := New(RawAdapter{})
+	f7 := New()
 	f7.AddFiltersFromString(`very_long_field_name_with_many_underscores_and_numbers_123 > 100 and another_very_long_field_name = "test"`)
-	f7.Build()
+	f7.Build(RawAdapter{})
 	sql7, _ := BuildRawSelect(f7, "test")
 	assert.Contains(t, sql7, "`very_long_field_name_with_many_underscores_and_numbers_123` > ?")
 	assert.Contains(t, sql7, "`another_very_long_field_name` = ?")
 
 	// Test 8: All operators in one expression
-	f8 := New(RawAdapter{})
+	f8 := New()
 	f8.AddFiltersFromString(`id = 1 and name =^ "%test%" and age > 18 and score >= 80 and price < 100 and discount <= 50 and status != "inactive" and category <in> ["electronics","books"] and tags <nin> ["old","deprecated"] and created_at <bet> "2023-01-01".."2023-12-31" and deleted_at <null> and updated_at <notnull> and email =~ "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"`)
-	f8.Build()
+	f8.Build(RawAdapter{})
 	sql8, _ := BuildRawSelect(f8, "products")
 	assert.Contains(t, sql8, "`id` = ?")
 	assert.Contains(t, sql8, "`name` LIKE ?")
@@ -1213,7 +1213,7 @@ func TestMissingScenarios(t *testing.T) {
 // Test Security Features
 func TestFieldWhitelist(t *testing.T) {
 	t.Run("FieldWhitelistEnabled", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.SetAllowedFields("id", "name", "email")
 		f.EnableFieldWhitelist()
 
@@ -1228,14 +1228,14 @@ func TestFieldWhitelist(t *testing.T) {
 
 		// Test with DSL
 		f.AddFiltersFromString(`id=1 and name="test" and password="secret"`)
-		f.Build()
+		f.Build(RawAdapter{})
 		clauses := f.GetClauses()
 		// Should only have clauses for allowed fields
 		assert.Len(t, clauses, 1) // Only the AndExpr.Expr with id and name
 	})
 
 	t.Run("FieldWhitelistDisabled", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.SetAllowedFields("id", "name")
 		// Don't enable whitelist
 
@@ -1245,12 +1245,12 @@ func TestFieldWhitelist(t *testing.T) {
 	})
 
 	t.Run("FieldWhitelistWithDSL", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.SetAllowedFields("id", "name")
 		f.EnableFieldWhitelist()
 
 		f.AddFiltersFromString(`id=1 and name="test" and password="secret"`)
-		f.Build()
+		f.Build(RawAdapter{})
 
 		// Should filter out disallowed fields
 		clauses := f.GetClauses()
@@ -1260,7 +1260,7 @@ func TestFieldWhitelist(t *testing.T) {
 
 func TestQueryLimitsBasic(t *testing.T) {
 	t.Run("DefaultLimits", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		limits := f.GetQueryLimits()
 
 		assert.Equal(t, 10, limits.MaxNestingDepth)
@@ -1270,7 +1270,7 @@ func TestQueryLimitsBasic(t *testing.T) {
 	})
 
 	t.Run("CustomLimits", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.SetQueryLimits(QueryLimits{
 			MaxNestingDepth:    5,
 			MaxFieldCount:      10,
@@ -1288,14 +1288,14 @@ func TestQueryLimitsBasic(t *testing.T) {
 
 func TestInputValidation(t *testing.T) {
 	t.Run("ValidInput", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		err := f.AddFiltersFromString(`id=1 and name="test"`)
 		assert.NoError(t, err)
 	})
 
 	t.Run("UnmatchedParentheses", func(t *testing.T) {
 		// Test a case that can't be auto-fixed - multiple nested unmatched parentheses
-		f := New(RawAdapter{})
+		f := New()
 		err := f.AddFiltersFromStringWithRepair(`(id=1 and name="test" and (age > 25 and (status = "active"`, false)
 		// This should fail as it's too complex to auto-fix
 		assert.Error(t, err)
@@ -1304,7 +1304,7 @@ func TestInputValidation(t *testing.T) {
 
 	t.Run("UnmatchedQuotes", func(t *testing.T) {
 		// Test a case that can't be auto-fixed - quotes in the middle of expression
-		f := New(RawAdapter{})
+		f := New()
 		err := f.AddFiltersFromStringWithRepair(`id=1 and name="test and age > 25 and status = "active"`, false)
 		// This should fail as it's too complex to auto-fix
 		assert.Error(t, err)
@@ -1312,13 +1312,13 @@ func TestInputValidation(t *testing.T) {
 	})
 
 	t.Run("EmptyInput", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		err := f.AddFiltersFromString("")
 		assert.NoError(t, err)
 	})
 
 	t.Run("WhitespaceOnly", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		err := f.AddFiltersFromString("   ")
 		assert.NoError(t, err)
 	})
@@ -1326,35 +1326,35 @@ func TestInputValidation(t *testing.T) {
 
 func TestInputRepair(t *testing.T) {
 	t.Run("AutoFixSimpleParentheses", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		err := f.AddFiltersFromString(`(id=1 and name="test"`)
 		// Should be auto-fixed
 		assert.NoError(t, err)
 	})
 
 	t.Run("AutoFixSimpleQuotes", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		err := f.AddFiltersFromString(`id=1 and name="test`)
 		// Should be auto-fixed
 		assert.NoError(t, err)
 	})
 
 	t.Run("AutoFixTrailingOperators", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		err := f.AddFiltersFromString(`id=1 and name="test" and`)
 		// Should be auto-fixed
 		assert.NoError(t, err)
 	})
 
 	t.Run("AutoFixIncompleteExpressions", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		err := f.AddFiltersFromString(`id= and name="test"`)
 		// Should be auto-fixed
 		assert.NoError(t, err)
 	})
 
 	t.Run("AutoFixLeadingOperators", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		err := f.AddFiltersFromString(`and id=1 and name="test"`)
 		// Should be auto-fixed
 		assert.NoError(t, err)
@@ -1363,7 +1363,7 @@ func TestInputRepair(t *testing.T) {
 
 func TestDebugParsing(t *testing.T) {
 	t.Run("SimpleExpression", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test very simple expression
 		dsl := `id=1`
@@ -1372,7 +1372,7 @@ func TestDebugParsing(t *testing.T) {
 		err := f.AddFiltersFromString(dsl)
 		assert.NoError(t, err)
 
-		f.Build()
+		f.Build(RawAdapter{})
 
 		clauses := f.GetClauses()
 		fmt.Printf("Number of clauses: %d\n", len(clauses))
@@ -1391,7 +1391,7 @@ func TestDebugParsing(t *testing.T) {
 	})
 
 	t.Run("ComplexExpression", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test the complex expression from the failing test
 		dsl := `(id=1 and vendorId="22") and bank_id=11 or expedition_type=^"%e%" sort=id:desc page=skip:0,take:10`
@@ -1403,7 +1403,7 @@ func TestDebugParsing(t *testing.T) {
 		// Debug: Check the DSL after parsing
 		fmt.Printf("DSL after parsing: %s\n", f.GetDSL())
 
-		f.Build()
+		f.Build(RawAdapter{})
 
 		clauses := f.GetClauses()
 		fmt.Printf("Number of clauses: %d\n", len(clauses))
@@ -1504,17 +1504,17 @@ func TestBatchProcessor(t *testing.T) {
 		processor := NewInMemoryBatchProcessor(5, 1*time.Second)
 
 		// Create test queries
-		f1 := New(RawAdapter{})
+		f1 := New()
 		f1.AddFiltersFromString(`id=1`)
-		f1.Build()
+		f1.Build(RawAdapter{})
 
-		f2 := New(RawAdapter{})
+		f2 := New()
 		f2.AddFiltersFromString(`name="test"`)
-		f2.Build()
+		f2.Build(RawAdapter{})
 
-		f3 := New(RawAdapter{})
+		f3 := New()
 		f3.AddFiltersFromString(`age>18`)
-		f3.Build()
+		f3.Build(RawAdapter{})
 
 		// Create batch operations
 		operations := []BatchOperation{
@@ -1541,13 +1541,13 @@ func TestBatchProcessor(t *testing.T) {
 		processor := NewInMemoryBatchProcessor(2, 1*time.Second)
 
 		// Create test queries
-		f1 := New(RawAdapter{})
+		f1 := New()
 		f1.AddFiltersFromString(`id=1`)
-		f1.Build()
+		f1.Build(RawAdapter{})
 
-		f2 := New(RawAdapter{})
+		f2 := New()
 		f2.AddFiltersFromString(`name="test"`)
-		f2.Build()
+		f2.Build(RawAdapter{})
 
 		// Create batch operations
 		operations := []BatchOperation{
@@ -1611,14 +1611,14 @@ func TestPerformanceMonitor(t *testing.T) {
 // Test Advanced Operators (Basic functionality)
 func TestAdvancedOperatorsBasic(t *testing.T) {
 	t.Run("JsonPathExpr", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.AddFilter(JsonPathExpr{
 			Field: "metadata",
 			Path:  "$.user.name",
 			Value: "john",
 			Op:    "=",
 		})
-		f.Build()
+		f.Build(RawAdapter{})
 
 		clauses := f.GetClauses()
 		assert.Len(t, clauses, 1)
@@ -1631,12 +1631,12 @@ func TestAdvancedOperatorsBasic(t *testing.T) {
 	})
 
 	t.Run("ArrayContainsExpr", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.AddFilter(ArrayContainsExpr{
 			Field:  "tags",
 			Values: []any{"tech", "golang", "database"},
 		})
-		f.Build()
+		f.Build(RawAdapter{})
 
 		clauses := f.GetClauses()
 		assert.Len(t, clauses, 1)
@@ -1648,12 +1648,12 @@ func TestAdvancedOperatorsBasic(t *testing.T) {
 	})
 
 	t.Run("ArrayOverlapsExpr", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.AddFilter(ArrayOverlapsExpr{
 			Field:  "categories",
 			Values: []any{"business", "finance"},
 		})
-		f.Build()
+		f.Build(RawAdapter{})
 
 		clauses := f.GetClauses()
 		assert.Len(t, clauses, 1)
@@ -1664,13 +1664,13 @@ func TestAdvancedOperatorsBasic(t *testing.T) {
 	})
 
 	t.Run("FullTextSearchExpr", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.AddFilter(FullTextSearchExpr{
 			Field:    "content",
 			Query:    "machine learning algorithms",
 			Language: "en",
 		})
-		f.Build()
+		f.Build(RawAdapter{})
 
 		clauses := f.GetClauses()
 		assert.Len(t, clauses, 1)
@@ -1682,7 +1682,7 @@ func TestAdvancedOperatorsBasic(t *testing.T) {
 	})
 
 	t.Run("GeoDistanceExpr", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.AddFilter(GeoDistanceExpr{
 			Field:     "location",
 			Latitude:  40.7128,
@@ -1690,7 +1690,7 @@ func TestAdvancedOperatorsBasic(t *testing.T) {
 			Distance:  10.0,
 			Unit:      "km",
 		})
-		f.Build()
+		f.Build(RawAdapter{})
 
 		clauses := f.GetClauses()
 		assert.Len(t, clauses, 1)
@@ -1708,14 +1708,14 @@ func TestAdvancedOperatorsBasic(t *testing.T) {
 			return "custom_query", []any{value}, nil
 		}
 
-		f := New(RawAdapter{})
+		f := New()
 		f.AddFilter(CustomExpr{
 			Field:    "custom_field",
 			Operator: "custom_op",
 			Value:    "custom_value",
 			Handler:  handler,
 		})
-		f.Build()
+		f.Build(RawAdapter{})
 
 		clauses := f.GetClauses()
 		assert.Len(t, clauses, 1)
@@ -1784,7 +1784,7 @@ func TestValidationSystemBasic(t *testing.T) {
 	})
 
 	t.Run("FigoValidationIntegration", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test validation manager setup
 		manager := NewValidationManager()
@@ -1854,7 +1854,7 @@ func TestPluginSystemBasic(t *testing.T) {
 		}
 		manager.RegisterPlugin(plugin)
 
-		f := New(RawAdapter{})
+		f := New()
 		f.SetPluginManager(manager)
 
 		// Test BeforeParse hook
@@ -1869,7 +1869,7 @@ func TestPluginSystemBasic(t *testing.T) {
 	})
 
 	t.Run("FigoPluginIntegration", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		manager := NewPluginManager()
 		plugin := &TestPluginBasic{
 			name: "test_plugin",
@@ -1931,7 +1931,7 @@ func (p *TestPluginBasic) AfterParse(f Figo, input string) error {
 // Test Concurrency Safety
 func TestConcurrencySafety(t *testing.T) {
 	t.Run("ConcurrentAccess", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		var wg sync.WaitGroup
 		numGoroutines := 10
 
@@ -1962,7 +1962,7 @@ func TestConcurrencySafety(t *testing.T) {
 	})
 
 	t.Run("ConcurrentBuild", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		var wg sync.WaitGroup
 		numGoroutines := 5
 
@@ -1971,7 +1971,7 @@ func TestConcurrencySafety(t *testing.T) {
 			go func(id int) {
 				defer wg.Done()
 				f.AddFiltersFromString(fmt.Sprintf("id=%d", id))
-				f.Build()
+				f.Build(RawAdapter{})
 				f.GetClauses()
 			}(i)
 		}
@@ -2010,7 +2010,7 @@ func TestMemoryManagement(t *testing.T) {
 	})
 
 	t.Run("LargeDataSet", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Add many filters
 		for i := 0; i < 1000; i++ {
@@ -2020,7 +2020,7 @@ func TestMemoryManagement(t *testing.T) {
 			})
 		}
 
-		f.Build()
+		f.Build(RawAdapter{})
 		clauses := f.GetClauses()
 		assert.Len(t, clauses, 1000)
 	})
@@ -2029,7 +2029,7 @@ func TestMemoryManagement(t *testing.T) {
 // Test Error Recovery
 func TestErrorRecovery(t *testing.T) {
 	t.Run("MalformedInputRecovery", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test various malformed inputs
 		malformedInputs := []string{
@@ -2051,11 +2051,11 @@ func TestErrorRecovery(t *testing.T) {
 	})
 
 	t.Run("GracefulDegradation", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test that partial parsing works
 		f.AddFiltersFromString(`id=1 and name="test" and invalid_field=`)
-		f.Build()
+		f.Build(RawAdapter{})
 
 		// Should still have some valid clauses
 		clauses := f.GetClauses()
@@ -2066,38 +2066,38 @@ func TestErrorRecovery(t *testing.T) {
 // Test Edge Cases
 func TestEdgeCases(t *testing.T) {
 	t.Run("EmptyClauses", func(t *testing.T) {
-		f := New(RawAdapter{})
-		f.Build()
+		f := New()
+		f.Build(RawAdapter{})
 		clauses := f.GetClauses()
 		assert.Empty(t, clauses)
 	})
 
 	t.Run("NilValues", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.AddFilter(EqExpr{
 			Field: "field",
 			Value: nil,
 		})
-		f.Build()
+		f.Build(RawAdapter{})
 
 		clauses := f.GetClauses()
 		assert.Len(t, clauses, 1)
 	})
 
 	t.Run("SpecialCharacters", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.AddFiltersFromString(`name = "José María" and description =^ "%café%"`)
-		f.Build()
+		f.Build(RawAdapter{})
 
 		clauses := f.GetClauses()
 		assert.NotEmpty(t, clauses)
 	})
 
 	t.Run("VeryLongStrings", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		longString := strings.Repeat("a", 10000)
 		f.AddFiltersFromString(fmt.Sprintf(`description = "%s"`, longString))
-		f.Build()
+		f.Build(RawAdapter{})
 
 		clauses := f.GetClauses()
 		assert.Len(t, clauses, 1)
@@ -2139,7 +2139,7 @@ func TestGetFinalExprDebug(t *testing.T) {
 			t.Logf("DSL: %s", tc.dsl)
 			t.Logf("Expected: %s", tc.expected)
 
-			f := New(nil)
+			f := New()
 			err := f.AddFiltersFromString(tc.dsl)
 			if err != nil {
 				t.Fatalf("Error: %v", err)
@@ -2162,11 +2162,11 @@ func TestGetFinalExprDebug(t *testing.T) {
 func TestBackwardCompatibilityBasic(t *testing.T) {
 	t.Run("ExistingFunctionalityUnchanged", func(t *testing.T) {
 		// Test that existing functionality still works
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test basic functionality
 		f.AddFiltersFromString(`id=1 and name="test"`)
-		f.Build()
+		f.Build(RawAdapter{})
 
 		clauses := f.GetClauses()
 		assert.Len(t, clauses, 1) // Should be a single AndExpr.Expr clause
@@ -2178,7 +2178,7 @@ func TestBackwardCompatibilityBasic(t *testing.T) {
 	})
 
 	t.Run("LegacyAPI", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test legacy methods still work
 		f.AddIgnoreFields("field1", "field2")
@@ -2196,7 +2196,7 @@ func TestBackwardCompatibilityBasic(t *testing.T) {
 
 func TestSortFieldNameFix(t *testing.T) {
 	t.Run("SnakeCaseNamingStrategy", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.SetNamingStrategy(NAMING_STRATEGY_SNAKE_CASE)
 
 		// Test the DSL parsing with sort
@@ -2206,7 +2206,7 @@ func TestSortFieldNameFix(t *testing.T) {
 		}
 
 		// Build the query
-		f.Build()
+		f.Build(RawAdapter{})
 
 		// Test with raw adapter
 		adapter := &RawAdapter{}
@@ -2228,7 +2228,7 @@ func TestSortFieldNameFix(t *testing.T) {
 	})
 
 	t.Run("NoChangeNamingStrategy", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.SetNamingStrategy(NAMING_STRATEGY_NO_CHANGE)
 
 		err := f.AddFiltersFromString("sort=barcode:desc page=skip:0,take:10")
@@ -2236,7 +2236,7 @@ func TestSortFieldNameFix(t *testing.T) {
 			t.Fatalf("Error parsing DSL: %v", err)
 		}
 
-		f.Build()
+		f.Build(RawAdapter{})
 
 		adapter := &RawAdapter{}
 		f.SetAdapterObject(adapter)
@@ -2251,7 +2251,7 @@ func TestSortFieldNameFix(t *testing.T) {
 	})
 
 	t.Run("ComplexSortExpression", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.SetNamingStrategy(NAMING_STRATEGY_SNAKE_CASE)
 
 		err := f.AddFiltersFromString("id>0 sort=name:asc,age:desc,created_at:desc page=skip:5,take:20")
@@ -2259,7 +2259,7 @@ func TestSortFieldNameFix(t *testing.T) {
 			t.Fatalf("Error parsing DSL: %v", err)
 		}
 
-		f.Build()
+		f.Build(RawAdapter{})
 
 		adapter := &RawAdapter{}
 		f.SetAdapterObject(adapter)
@@ -2302,7 +2302,7 @@ func TestGormGetSqlStringWithConditionTypes(t *testing.T) {
 			t.Fatalf("failed to migrate: %v", err)
 		}
 
-		f := New(GormAdapter{})
+		f := New()
 		f.SetNamingStrategy(NAMING_STRATEGY_SNAKE_CASE)
 
 		// Test the DSL parsing with sort
@@ -2312,7 +2312,7 @@ func TestGormGetSqlStringWithConditionTypes(t *testing.T) {
 		}
 
 		// Build the query
-		f.Build()
+		f.Build(GormAdapter{})
 
 		// Test GetSqlString with specific condition types (like the user's case)
 		// Use a model to set the table name
@@ -2354,7 +2354,7 @@ func TestGormSortFieldNameFix(t *testing.T) {
 			t.Fatalf("failed to migrate: %v", err)
 		}
 
-		f := New(GormAdapter{})
+		f := New()
 		f.SetNamingStrategy(NAMING_STRATEGY_SNAKE_CASE)
 
 		// Test the DSL parsing with sort
@@ -2364,7 +2364,7 @@ func TestGormSortFieldNameFix(t *testing.T) {
 		}
 
 		// Build the query
-		f.Build()
+		f.Build(GormAdapter{})
 
 		// Apply GORM operations
 		db2 := ApplyGorm(f, db.Model(&TestModel{}))
@@ -2400,7 +2400,7 @@ func TestGormSortFieldNameFix(t *testing.T) {
 			t.Fatalf("failed to migrate: %v", err)
 		}
 
-		f := New(GormAdapter{})
+		f := New()
 		f.SetNamingStrategy(NAMING_STRATEGY_NO_CHANGE)
 
 		err = f.AddFiltersFromString("sort=barcode:desc page=skip:0,take:10")
@@ -2408,7 +2408,7 @@ func TestGormSortFieldNameFix(t *testing.T) {
 			t.Fatalf("Error parsing DSL: %v", err)
 		}
 
-		f.Build()
+		f.Build(GormAdapter{})
 
 		// Apply GORM operations
 		db2 := ApplyGorm(f, db.Model(&TestModel{}))
@@ -2440,7 +2440,7 @@ func TestGormSortFieldNameFix(t *testing.T) {
 			t.Fatalf("failed to migrate: %v", err)
 		}
 
-		f := New(GormAdapter{})
+		f := New()
 		f.SetNamingStrategy(NAMING_STRATEGY_SNAKE_CASE)
 
 		err = f.AddFiltersFromString("id>0 sort=name:asc,age:desc,created_at:desc page=skip:5,take:20")
@@ -2448,7 +2448,7 @@ func TestGormSortFieldNameFix(t *testing.T) {
 			t.Fatalf("Error parsing DSL: %v", err)
 		}
 
-		f.Build()
+		f.Build(GormAdapter{})
 
 		// Apply GORM operations
 		db2 := ApplyGorm(f, db.Model(&TestModel{}))
@@ -2534,7 +2534,7 @@ func TestSortPageComprehensive(t *testing.T) {
 
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
-				f := New(RawAdapter{})
+				f := New()
 				err := f.AddFiltersFromString(tc.dsl)
 
 				if tc.expectError {
@@ -2546,7 +2546,7 @@ func TestSortPageComprehensive(t *testing.T) {
 						t.Errorf("Unexpected error for %s: %v", tc.description, err)
 					}
 
-					f.Build()
+					f.Build(RawAdapter{})
 					sql := f.GetSqlString("test_table")
 
 					// Verify that sort is present in SQL
@@ -2626,7 +2626,7 @@ func TestSortPageComprehensive(t *testing.T) {
 
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
-				f := New(RawAdapter{})
+				f := New()
 				err := f.AddFiltersFromString(tc.dsl)
 
 				if err != nil {
@@ -2634,7 +2634,7 @@ func TestSortPageComprehensive(t *testing.T) {
 					return
 				}
 
-				f.Build()
+				f.Build(RawAdapter{})
 				page := f.GetPage()
 
 				if page.Skip != tc.expectSkip {
@@ -2682,7 +2682,7 @@ func TestSortPageComprehensive(t *testing.T) {
 
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
-				f := New(RawAdapter{})
+				f := New()
 				err := f.AddFiltersFromString(tc.dsl)
 
 				if err != nil {
@@ -2690,7 +2690,7 @@ func TestSortPageComprehensive(t *testing.T) {
 					return
 				}
 
-				f.Build()
+				f.Build(RawAdapter{})
 				sql := f.GetSqlString("test_table")
 
 				for _, expected := range tc.expectSQL {
@@ -2707,12 +2707,12 @@ func TestSortPageComprehensive(t *testing.T) {
 
 		// Test Raw Adapter
 		t.Run("RawAdapter", func(t *testing.T) {
-			f := New(RawAdapter{})
+			f := New()
 			err := f.AddFiltersFromString(dsl)
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
-			f.Build()
+			f.Build(RawAdapter{})
 
 			sql := f.GetSqlString("test_table")
 			if !strings.Contains(sql, "ORDER BY") {
@@ -2728,12 +2728,12 @@ func TestSortPageComprehensive(t *testing.T) {
 
 		// Test MongoDB Adapter
 		t.Run("MongoAdapter", func(t *testing.T) {
-			f := New(MongoAdapter{})
+			f := New()
 			err := f.AddFiltersFromString(dsl)
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
-			f.Build()
+			f.Build(MongoAdapter{})
 
 			opts := BuildMongoFindOptions(f)
 			if opts.Limit == nil || *opts.Limit != 10 {
@@ -2749,12 +2749,12 @@ func TestSortPageComprehensive(t *testing.T) {
 
 		// Test Elasticsearch Adapter
 		t.Run("ElasticsearchAdapter", func(t *testing.T) {
-			f := New(ElasticsearchAdapter{})
+			f := New()
 			err := f.AddFiltersFromString(dsl)
 			if err != nil {
 				t.Fatalf("Unexpected error: %v", err)
 			}
-			f.Build()
+			f.Build(ElasticsearchAdapter{})
 
 			query, _ := BuildElasticsearchQuery(f)
 			if query.Size != 10 {
@@ -2770,7 +2770,7 @@ func TestSortPageComprehensive(t *testing.T) {
 	})
 
 	t.Run("ConcurrentSortPage", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test concurrent access to sort and page
 		done := make(chan bool, 10)
@@ -2786,7 +2786,7 @@ func TestSortPageComprehensive(t *testing.T) {
 					return
 				}
 
-				f.Build()
+				f.Build(RawAdapter{})
 				sql := f.GetSqlString("test_table")
 				if !strings.Contains(sql, "ORDER BY") {
 					t.Error("Concurrent access should maintain ORDER BY")
@@ -2803,7 +2803,7 @@ func TestSortPageComprehensive(t *testing.T) {
 	t.Run("MemoryLeakPrevention", func(t *testing.T) {
 		// Test that sort and page don't cause memory leaks
 		for i := 0; i < 1000; i++ {
-			f := New(RawAdapter{})
+			f := New()
 			dsl := fmt.Sprintf("id>%d sort=name:desc,age:asc page=skip:%d,take:%d", i, i%100, (i%50)+1)
 
 			err := f.AddFiltersFromString(dsl)
@@ -2812,7 +2812,7 @@ func TestSortPageComprehensive(t *testing.T) {
 				continue
 			}
 
-			f.Build()
+			f.Build(RawAdapter{})
 			_ = f.GetSqlString("test_table")
 		}
 	})
@@ -2840,7 +2840,7 @@ func TestSortPageComprehensive(t *testing.T) {
 
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
-				f := New(RawAdapter{})
+				f := New()
 				f.SetNamingStrategy(tc.namingStrategy)
 
 				err := f.AddFiltersFromString(tc.dsl)
@@ -2848,7 +2848,7 @@ func TestSortPageComprehensive(t *testing.T) {
 					t.Fatalf("Unexpected error: %v", err)
 				}
 
-				f.Build()
+				f.Build(RawAdapter{})
 				sql := f.GetSqlString("test_table")
 
 				if !strings.Contains(sql, tc.expectField) {

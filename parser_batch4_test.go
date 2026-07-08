@@ -35,9 +35,9 @@ func TestKeywordPrefixedFieldsAreFilters(t *testing.T) {
 	}
 
 	// Real sort=/page= directives still work and don't leak into the WHERE.
-	f := New(RawAdapter{})
+	f := New()
 	f.AddFiltersFromString(`id=1 sort=id:desc page=skip:5,take:10`)
-	f.Build()
+	f.Build(RawAdapter{})
 	where, _ := BuildRawWhere(f)
 	assert.Equal(t, "`id` = ?", where)
 	assert.NotNil(t, f.GetSort())

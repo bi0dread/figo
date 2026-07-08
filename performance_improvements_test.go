@@ -9,7 +9,7 @@ import (
 
 func TestQueryCaching(t *testing.T) {
 	t.Run("CacheConfiguration", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test default cache config
 		config := f.GetCacheConfig()
@@ -66,7 +66,7 @@ func TestQueryCaching(t *testing.T) {
 	})
 
 	t.Run("CachedQueryExecution", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.SetCacheConfig(CacheConfig{
 			Enabled: true,
 			TTL:     1 * time.Minute,
@@ -75,7 +75,7 @@ func TestQueryCaching(t *testing.T) {
 
 		// Build a query
 		f.AddFiltersFromString(`id=1 and name="test"`)
-		f.Build()
+		f.Build(RawAdapter{})
 
 		// First execution (cache miss)
 		start := time.Now()
@@ -154,17 +154,17 @@ func TestBatchOperations(t *testing.T) {
 		processor := NewInMemoryBatchProcessor(2, 5*time.Second)
 
 		// Create test queries
-		f1 := New(RawAdapter{})
+		f1 := New()
 		f1.AddFiltersFromString(`id=1`)
-		f1.Build()
+		f1.Build(RawAdapter{})
 
-		f2 := New(RawAdapter{})
+		f2 := New()
 		f2.AddFiltersFromString(`name="test"`)
-		f2.Build()
+		f2.Build(RawAdapter{})
 
-		f3 := New(RawAdapter{})
+		f3 := New()
 		f3.AddFiltersFromString(`age>18`)
-		f3.Build()
+		f3.Build(RawAdapter{})
 
 		// Create batch operations
 		operations := []BatchOperation{
@@ -191,13 +191,13 @@ func TestBatchOperations(t *testing.T) {
 		processor := NewInMemoryBatchProcessor(2, 5*time.Second)
 
 		// Create test queries
-		f1 := New(RawAdapter{})
+		f1 := New()
 		f1.AddFiltersFromString(`id=1`)
-		f1.Build()
+		f1.Build(RawAdapter{})
 
-		f2 := New(RawAdapter{})
+		f2 := New()
 		f2.AddFiltersFromString(`name="test"`)
-		f2.Build()
+		f2.Build(RawAdapter{})
 
 		// Create batch operations
 		operations := []BatchOperation{
@@ -227,9 +227,9 @@ func TestBatchOperations(t *testing.T) {
 	t.Run("BatchWithDifferentTypes", func(t *testing.T) {
 		processor := NewInMemoryBatchProcessor(2, 5*time.Second)
 
-		f := New(RawAdapter{})
+		f := New()
 		f.AddFiltersFromString(`id=1`)
-		f.Build()
+		f.Build(RawAdapter{})
 
 		// Test different operation types
 		operations := []BatchOperation{
@@ -252,9 +252,9 @@ func TestBatchOperations(t *testing.T) {
 		// Create processor with very short timeout
 		processor := NewInMemoryBatchProcessor(1, 1*time.Millisecond)
 
-		f := New(RawAdapter{})
+		f := New()
 		f.AddFiltersFromString(`id=1`)
-		f.Build()
+		f.Build(RawAdapter{})
 
 		operations := []BatchOperation{
 			{ID: "op1", Query: f, Context: nil, Type: "sql"},
@@ -324,13 +324,13 @@ func TestPerformanceMonitoring(t *testing.T) {
 	})
 
 	t.Run("FigoWithMonitoring", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		monitor := NewPerformanceMonitor(true)
 		f.SetPerformanceMonitor(monitor)
 
 		// Build and execute query
 		f.AddFiltersFromString(`id=1`)
-		f.Build()
+		f.Build(RawAdapter{})
 
 		// Execute query (this would normally record metrics)
 		_ = f.GetSqlString(nil)
@@ -349,7 +349,7 @@ func TestPerformanceMonitoring(t *testing.T) {
 func TestPerformanceImprovementsIntegration(t *testing.T) {
 	t.Run("CompletePerformanceWorkflow", func(t *testing.T) {
 		// Create figo instance with all performance features
-		f := New(RawAdapter{})
+		f := New()
 
 		// Set up caching
 		f.SetCacheConfig(CacheConfig{
@@ -365,7 +365,7 @@ func TestPerformanceImprovementsIntegration(t *testing.T) {
 
 		// Build query
 		f.AddFiltersFromString(`id=1 and name="test" and age>18`)
-		f.Build()
+		f.Build(RawAdapter{})
 
 		// Execute multiple times to test caching
 		for i := 0; i < 5; i++ {
@@ -384,23 +384,23 @@ func TestPerformanceImprovementsIntegration(t *testing.T) {
 
 	t.Run("BatchProcessingWithCaching", func(t *testing.T) {
 		// Create queries with caching enabled
-		f1 := New(RawAdapter{})
+		f1 := New()
 		f1.SetCacheConfig(CacheConfig{
 			Enabled: true,
 			TTL:     1 * time.Minute,
 			MaxSize: 100,
 		})
 		f1.AddFiltersFromString(`id=1`)
-		f1.Build()
+		f1.Build(RawAdapter{})
 
-		f2 := New(RawAdapter{})
+		f2 := New()
 		f2.SetCacheConfig(CacheConfig{
 			Enabled: true,
 			TTL:     1 * time.Minute,
 			MaxSize: 100,
 		})
 		f2.AddFiltersFromString(`name="test"`)
-		f2.Build()
+		f2.Build(RawAdapter{})
 
 		// Create batch operations
 		processor := NewInMemoryBatchProcessor(2, 5*time.Second)

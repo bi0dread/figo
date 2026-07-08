@@ -15,7 +15,7 @@ func unsupportedExpr() Expr {
 // dropped (which previously returned too many rows / the whole index).
 func TestMongoErrorsOnUnsupportedExpr(t *testing.T) {
 	t.Run("Standalone", func(t *testing.T) {
-		f := New(nil)
+		f := New()
 		f.AddFilter(unsupportedExpr())
 		f.Build()
 		_, err := BuildMongoFilter(f)
@@ -23,7 +23,7 @@ func TestMongoErrorsOnUnsupportedExpr(t *testing.T) {
 	})
 
 	t.Run("NestedInAnd", func(t *testing.T) {
-		f := New(nil)
+		f := New()
 		f.AddFilter(AndExpr{Operands: []Expr{
 			EqExpr{Field: "active", Value: true},
 			unsupportedExpr(),
@@ -34,15 +34,15 @@ func TestMongoErrorsOnUnsupportedExpr(t *testing.T) {
 	})
 
 	t.Run("AdapterGetQueryFails", func(t *testing.T) {
-		f := New(MongoAdapter{})
+		f := New()
 		f.AddFilter(unsupportedExpr())
-		f.Build()
+		f.Build(MongoAdapter{})
 		_, ok := MongoAdapter{}.GetQuery(f, nil)
 		assert.False(t, ok, "adapter must report failure rather than a partial query")
 	})
 
 	t.Run("SupportedStillWorks", func(t *testing.T) {
-		f := New(nil)
+		f := New()
 		f.AddFilter(EqExpr{Field: "id", Value: 1})
 		f.Build()
 		m, err := BuildMongoFilter(f)
@@ -53,7 +53,7 @@ func TestMongoErrorsOnUnsupportedExpr(t *testing.T) {
 
 func TestElasticsearchErrorsOnUnsupportedExpr(t *testing.T) {
 	t.Run("BuildReturnsError", func(t *testing.T) {
-		f := New(nil)
+		f := New()
 		f.AddFilter(unsupportedExpr())
 		f.Build()
 		_, err := BuildElasticsearchQuery(f)
@@ -61,7 +61,7 @@ func TestElasticsearchErrorsOnUnsupportedExpr(t *testing.T) {
 	})
 
 	t.Run("QueryStringReturnsError", func(t *testing.T) {
-		f := New(nil)
+		f := New()
 		f.AddFilter(unsupportedExpr())
 		f.Build()
 		_, err := GetElasticsearchQueryString(f)
@@ -69,7 +69,7 @@ func TestElasticsearchErrorsOnUnsupportedExpr(t *testing.T) {
 	})
 
 	t.Run("NestedInOr", func(t *testing.T) {
-		f := New(nil)
+		f := New()
 		f.AddFilter(OrExpr{Operands: []Expr{
 			EqExpr{Field: "a", Value: 1},
 			unsupportedExpr(),
@@ -80,7 +80,7 @@ func TestElasticsearchErrorsOnUnsupportedExpr(t *testing.T) {
 	})
 
 	t.Run("BuilderToJSONSurfacesError", func(t *testing.T) {
-		f := New(nil)
+		f := New()
 		f.AddFilter(unsupportedExpr())
 		f.Build()
 		_, err := NewElasticsearchQueryBuilder().FromFigo(f).ToJSON()
@@ -88,7 +88,7 @@ func TestElasticsearchErrorsOnUnsupportedExpr(t *testing.T) {
 	})
 
 	t.Run("SupportedStillWorks", func(t *testing.T) {
-		f := New(nil)
+		f := New()
 		f.AddFilter(EqExpr{Field: "id", Value: 1})
 		f.Build()
 		_, err := BuildElasticsearchQuery(f)

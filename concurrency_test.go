@@ -36,7 +36,7 @@ func TestConcurrentCacheGet(t *testing.T) {
 // #8 / #15: Build (writer) concurrent with the cached-query path and GetPreloads
 // (readers) must not race on f.clauses / f.preloads / f.dsl.
 func TestConcurrentBuildAndRead(t *testing.T) {
-	f := New(RawAdapter{})
+	f := New()
 	f.SetCacheConfig(CacheConfig{Enabled: true, MaxSize: 100, TTL: time.Minute})
 
 	var wg sync.WaitGroup
@@ -51,7 +51,7 @@ func TestConcurrentBuildAndRead(t *testing.T) {
 				return
 			default:
 				f.AddFiltersFromString(`a=1 and b=2 load=[T:id=3]`)
-				f.Build()
+				f.Build(RawAdapter{})
 			}
 		}
 	}()
@@ -104,8 +104,8 @@ func TestCacheEvictsLeastRecentlyUsed(t *testing.T) {
 	c := NewInMemoryCache(CacheConfig{Enabled: true, MaxSize: 2})
 	c.Set("a", 1, time.Minute)
 	c.Set("b", 2, time.Minute)
-	c.Get("a")                   // "a" is now more recently used than "b"
-	c.Set("c", 3, time.Minute)   // must evict "b", the least recently used
+	c.Get("a")                 // "a" is now more recently used than "b"
+	c.Set("c", 3, time.Minute) // must evict "b", the least recently used
 	_, aOK := c.Get("a")
 	_, bOK := c.Get("b")
 	_, cOK := c.Get("c")
@@ -116,10 +116,10 @@ func TestCacheEvictsLeastRecentlyUsed(t *testing.T) {
 
 // #20: SQL and Query results must not share a cache key.
 func TestCacheKeyDistinguishesSqlAndQuery(t *testing.T) {
-	f := New(RawAdapter{})
+	f := New()
 	f.SetCacheConfig(CacheConfig{Enabled: true, MaxSize: 100, TTL: time.Minute})
 	f.AddFiltersFromString(`id=1`)
-	f.Build()
+	f.Build(RawAdapter{})
 
 	sql := f.GetCachedSqlString("t")
 	q := f.GetCachedQuery("t")

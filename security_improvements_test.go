@@ -9,7 +9,7 @@ import (
 
 func TestFieldWhitelisting(t *testing.T) {
 	t.Run("FieldWhitelistDisabled", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.DisableFieldWhitelist()
 
 		// All fields should be allowed when whitelist is disabled
@@ -18,7 +18,7 @@ func TestFieldWhitelisting(t *testing.T) {
 	})
 
 	t.Run("FieldWhitelistEnabled", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.SetAllowedFields("id", "name", "email", "created_at")
 		f.EnableFieldWhitelist()
 
@@ -35,13 +35,13 @@ func TestFieldWhitelisting(t *testing.T) {
 	})
 
 	t.Run("FieldWhitelistWithDSL", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		f.SetAllowedFields("id", "name", "email")
 		f.EnableFieldWhitelist()
 
 		// Add filters with allowed and disallowed fields
 		f.AddFiltersFromString(`id=1 and name="test" and password="secret"`)
-		f.Build()
+		f.Build(RawAdapter{})
 
 		// Only allowed fields should be processed
 		clauses := f.GetClauses()
@@ -67,7 +67,7 @@ func TestFieldWhitelisting(t *testing.T) {
 
 func TestQueryLimits(t *testing.T) {
 	t.Run("DefaultLimits", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		limits := f.GetQueryLimits()
 
 		assert.Equal(t, 10, limits.MaxNestingDepth)
@@ -77,7 +77,7 @@ func TestQueryLimits(t *testing.T) {
 	})
 
 	t.Run("CustomLimits", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 		customLimits := QueryLimits{
 			MaxNestingDepth:    5,
 			MaxFieldCount:      10,
@@ -96,7 +96,7 @@ func TestQueryLimits(t *testing.T) {
 
 func TestEnhancedTypeParsing(t *testing.T) {
 	t.Run("DateParsing", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test various date formats
 		testCases := []struct {
@@ -127,7 +127,7 @@ func TestEnhancedTypeParsing(t *testing.T) {
 	})
 
 	t.Run("NullParsing", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test null values
 		assert.Nil(t, f.ParseFieldsValue("null"))
@@ -135,7 +135,7 @@ func TestEnhancedTypeParsing(t *testing.T) {
 	})
 
 	t.Run("BooleanParsing", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test boolean values
 		assert.True(t, f.ParseFieldsValue("true").(bool))
@@ -143,7 +143,7 @@ func TestEnhancedTypeParsing(t *testing.T) {
 	})
 
 	t.Run("NumericParsing", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test numeric values
 		assert.Equal(t, int64(123), f.ParseFieldsValue("123"))
@@ -151,7 +151,7 @@ func TestEnhancedTypeParsing(t *testing.T) {
 	})
 
 	t.Run("StringParsing", func(t *testing.T) {
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test string values
 		assert.Equal(t, "hello", f.ParseFieldsValue(`"hello"`))
@@ -162,7 +162,7 @@ func TestEnhancedTypeParsing(t *testing.T) {
 func TestSecurityImprovementsIntegration(t *testing.T) {
 	t.Run("CompleteSecurityWorkflow", func(t *testing.T) {
 		// Create a figo instance with security features enabled
-		f := New(RawAdapter{})
+		f := New()
 
 		// Set up field whitelist
 		f.SetAllowedFields("id", "name", "email", "age", "created_at")
@@ -179,7 +179,7 @@ func TestSecurityImprovementsIntegration(t *testing.T) {
 		// Test complex query with mixed data types
 		dsl := `id=1 and name="John" and email=^"%@gmail.com" and age>18 and created_at>"2023-01-01" and password="secret"`
 		f.AddFiltersFromString(dsl)
-		f.Build()
+		f.Build(RawAdapter{})
 
 		// Verify that only whitelisted fields are processed
 		clauses := f.GetClauses()
@@ -236,12 +236,12 @@ func TestSecurityImprovementsIntegration(t *testing.T) {
 
 		for _, adapter := range adapters {
 			t.Run("Adapter", func(t *testing.T) {
-				f := New(adapter)
+				f := New()
 				f.SetAllowedFields("id", "name")
 				f.EnableFieldWhitelist()
 
 				f.AddFiltersFromString(`id=1 and name="test" and password="secret"`)
-				f.Build()
+				f.Build(adapter)
 
 				// Should only process whitelisted fields
 				clauses := f.GetClauses()
@@ -279,11 +279,11 @@ func TestParseError(t *testing.T) {
 func TestBackwardCompatibility(t *testing.T) {
 	t.Run("ExistingFunctionalityUnchanged", func(t *testing.T) {
 		// Test that existing functionality still works
-		f := New(RawAdapter{})
+		f := New()
 
 		// Test basic functionality
 		f.AddFiltersFromString(`id=1 and name="test"`)
-		f.Build()
+		f.Build(RawAdapter{})
 
 		clauses := f.GetClauses()
 		assert.Len(t, clauses, 1) // Should be a single AndExpr clause

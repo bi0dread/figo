@@ -7,9 +7,9 @@ import (
 )
 
 func TestCloneProducesEqualQuery(t *testing.T) {
-	f := New(RawAdapter{})
+	f := New()
 	f.AddFiltersFromString(`id<in>[1,2,3] and (age>20 or active=true) sort=id:desc page=skip:5,take:10`)
-	f.Build()
+	f.Build(RawAdapter{})
 
 	c := f.Clone()
 
@@ -24,9 +24,9 @@ func TestCloneProducesEqualQuery(t *testing.T) {
 }
 
 func TestCloneIsIndependent(t *testing.T) {
-	f := New(RawAdapter{})
+	f := New()
 	f.AddFiltersFromString(`id=1`)
-	f.Build()
+	f.Build(RawAdapter{})
 	f.AddIgnoreFields("secret")
 
 	c := f.Clone()
@@ -54,9 +54,9 @@ func TestCloneIsIndependent(t *testing.T) {
 }
 
 func TestCloneDeepCopiesNestedSlices(t *testing.T) {
-	f := New(RawAdapter{})
+	f := New()
 	f.AddFilter(InExpr{Field: "id", Values: []any{1, 2, 3}})
-	f.Build()
+	f.Build(RawAdapter{})
 
 	c := f.Clone()
 
@@ -69,7 +69,7 @@ func TestCloneDeepCopiesNestedSlices(t *testing.T) {
 }
 
 func TestCloneEmptyInstance(t *testing.T) {
-	f := New(RawAdapter{})
+	f := New()
 	c := f.Clone()
 	assert.Equal(t, "(no filters)", c.Explain())
 	// Clone of an empty instance is still usable.
