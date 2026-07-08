@@ -28,6 +28,7 @@ func (f *figo) Clone() Figo {
 		cacheConfig:    f.cacheConfig,
 		dsl:            f.dsl,
 		namingStrategy: f.namingStrategy,
+		namingFunc:     f.namingFunc, // shared transformer; assumed pure
 
 		// Deep-copied reference-typed state.
 		clauses:       cloneExprs(f.clauses),

@@ -37,6 +37,12 @@ type NamingStrategy string
 const NAMING_STRATEGY_NO_CHANGE = "no_change"
 const NAMING_STRATEGY_SNAKE_CASE = "snake_case"
 
+// NamingFunc transforms a DSL field name into the column/field name used by the
+// target store. Register one with SetNamingFunc to supply custom naming logic
+// (e.g. camelCase, a fixed prefix, or a lookup table) instead of the built-in
+// NAMING_STRATEGY_* strategies.
+type NamingFunc func(field string) string
+
 type Operation string
 
 const (
@@ -940,6 +946,8 @@ type Figo interface {
 	RegisterValidator(validator Validator)
 	ValidateField(field string, value any) error
 	SetNamingStrategy(strategy NamingStrategy)
+	SetNamingFunc(fn NamingFunc)
+	GetNamingFunc() NamingFunc
 	SetPage(skip, take int)
 	SetPageString(v string)
 	SetAdapterObject(adapter Adapter)
@@ -984,6 +992,7 @@ type figo struct {
 	validationManager *ValidationManager
 	dsl               string
 	namingStrategy    NamingStrategy
+	namingFunc        NamingFunc // when non-nil, overrides namingStrategy
 	adapterObj        Adapter
 	mu                sync.RWMutex // Mutex for concurrent access protection
 }
@@ -1640,6 +1649,11 @@ outerLoop:
 }
 
 func (f *figo) parsFieldsName(str string) string {
+	// A user-supplied naming function takes precedence over the built-in
+	// strategies, letting callers plug in arbitrary field-name logic.
+	if f.namingFunc != nil {
+		return f.namingFunc(str)
+	}
 	switch f.namingStrategy {
 	case NAMING_STRATEGY_NO_CHANGE:
 		return str
@@ -1652,7 +1666,9 @@ func (f *figo) parsFieldsName(str string) string {
 		}
 		return result
 	default:
-		return ""
+		// Unknown strategy: leave the field name unchanged rather than blanking
+		// it out (the old behavior returned "" and silently dropped columns).
+		return str
 	}
 }
 
@@ -2530,6 +2546,19 @@ func (f *figo) SetNamingStrategy(strategy NamingStrategy) {
 func (f *figo) GetNamingStrategy() NamingStrategy {
 
 	return f.namingStrategy
+}
+
+// SetNamingFunc installs a custom field-name transformer. While set (non-nil),
+// it fully overrides the NAMING_STRATEGY_* strategy for every field name the DSL
+// produces. Pass nil to remove it and fall back to the configured strategy.
+// Configure this before Build()/AddFiltersFromString, like SetNamingStrategy.
+func (f *figo) SetNamingFunc(fn NamingFunc) {
+	f.namingFunc = fn
+}
+
+// GetNamingFunc returns the custom field-name transformer, or nil if none is set.
+func (f *figo) GetNamingFunc() NamingFunc {
+	return f.namingFunc
 }
 
 func (f *figo) SetAdapterObject(adapter Adapter) {
