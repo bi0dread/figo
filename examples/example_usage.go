@@ -14,9 +14,9 @@ func main() {
 
 	// Example 1: Basic term query
 	fmt.Println("\n📝 Example 1: Basic Term Query")
-	f1 := figo.New(figo.ElasticsearchAdapter{})
+	f1 := figo.New()
 	f1.AddFiltersFromString(`status = "active"`)
-	f1.Build()
+	f1.Build(figo.ElasticsearchAdapter{})
 
 	jsonStr1, _ := figo.GetElasticsearchQueryString(f1)
 	fmt.Printf("DSL: status = \"active\"\n")
@@ -24,9 +24,9 @@ func main() {
 
 	// Example 2: Range query with multiple conditions
 	fmt.Println("\n📝 Example 2: Range Query")
-	f2 := figo.New(figo.ElasticsearchAdapter{})
+	f2 := figo.New()
 	f2.AddFiltersFromString(`age > 25 and score >= 80`)
-	f2.Build()
+	f2.Build(figo.ElasticsearchAdapter{})
 
 	jsonStr2, _ := figo.GetElasticsearchQueryString(f2)
 	fmt.Printf("DSL: age > 25 and score >= 80\n")
@@ -34,9 +34,9 @@ func main() {
 
 	// Example 3: Wildcard search
 	fmt.Println("\n📝 Example 3: Wildcard Search")
-	f3 := figo.New(figo.ElasticsearchAdapter{})
+	f3 := figo.New()
 	f3.AddFiltersFromString(`email =^ "%gmail%"`)
-	f3.Build()
+	f3.Build(figo.ElasticsearchAdapter{})
 
 	jsonStr3, _ := figo.GetElasticsearchQueryString(f3)
 	fmt.Printf("DSL: email =^ \"%%gmail%%\"\n")
@@ -44,9 +44,9 @@ func main() {
 
 	// Example 4: Terms query (IN operation)
 	fmt.Println("\n📝 Example 4: Terms Query")
-	f4 := figo.New(figo.ElasticsearchAdapter{})
+	f4 := figo.New()
 	f4.AddFiltersFromString(`category <in> [tech,business,finance]`)
-	f4.Build()
+	f4.Build(figo.ElasticsearchAdapter{})
 
 	jsonStr4, _ := figo.GetElasticsearchQueryString(f4)
 	fmt.Printf("DSL: category <in> [tech,business,finance]\n")
@@ -54,9 +54,9 @@ func main() {
 
 	// Example 5: Between query
 	fmt.Println("\n📝 Example 5: Between Query")
-	f5 := figo.New(figo.ElasticsearchAdapter{})
+	f5 := figo.New()
 	f5.AddFiltersFromString(`price <bet> (100..500)`)
-	f5.Build()
+	f5.Build(figo.ElasticsearchAdapter{})
 
 	jsonStr5, _ := figo.GetElasticsearchQueryString(f5)
 	fmt.Printf("DSL: price <bet> (100..500)\n")
@@ -64,9 +64,9 @@ func main() {
 
 	// Example 6: Complex nested query
 	fmt.Println("\n📝 Example 6: Complex Nested Query")
-	f6 := figo.New(figo.ElasticsearchAdapter{})
+	f6 := figo.New()
 	f6.AddFiltersFromString(`((name =^ "%John%" or email =^ "%gmail%") and (age >= 18 and age <= 65)) or (status = "active" and score > 80)`)
-	f6.Build()
+	f6.Build(figo.ElasticsearchAdapter{})
 
 	jsonStr6, _ := figo.GetElasticsearchQueryString(f6)
 	fmt.Printf("DSL: ((name =^ \"%%John%%\" or email =^ \"%%gmail%%\") and (age >= 18 and age <= 65)) or (status = \"active\" and score > 80)\n")
@@ -74,9 +74,9 @@ func main() {
 
 	// Example 7: Pagination and sorting
 	fmt.Println("\n📝 Example 7: Pagination and Sorting")
-	f7 := figo.New(figo.ElasticsearchAdapter{})
+	f7 := figo.New()
 	f7.AddFiltersFromString(`status = "active" sort=score:desc,age:asc page=skip:0,take:5`)
-	f7.Build()
+	f7.Build(figo.ElasticsearchAdapter{})
 
 	jsonStr7, _ := figo.GetElasticsearchQueryString(f7)
 	fmt.Printf("DSL: status = \"active\" sort=score:desc,age:asc page=skip:0,take:5\n")
@@ -97,10 +97,10 @@ func main() {
 
 	// Example 9: Field selection
 	fmt.Println("\n📝 Example 9: Field Selection")
-	f9 := figo.New(figo.ElasticsearchAdapter{})
+	f9 := figo.New()
 	f9.AddSelectFields("id", "name", "email", "score")
 	f9.AddFiltersFromString(`status = "active"`)
-	f9.Build()
+	f9.Build(figo.ElasticsearchAdapter{})
 
 	jsonStr9, _ := figo.GetElasticsearchQueryString(f9)
 	fmt.Printf("DSL: status = \"active\" with field selection\n")

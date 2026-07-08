@@ -1019,11 +1019,10 @@ type figo struct {
 	mu                sync.RWMutex // Mutex for concurrent access protection
 }
 
-// New constructs a new instance. The adapter is optional: you may pass it here,
-// New(GormAdapter{}), or defer it to Build(GormAdapter{}). Both styles work; the
-// adapter passed to Build (if any) wins.
-func New(adapter ...Adapter) Figo {
-	f := &figo{page: Page{
+// New constructs a new instance. Supply the adapter when you build:
+// Build(GormAdapter{}) (or via SetAdapterObject). New itself takes no adapter.
+func New() Figo {
+	return &figo{page: Page{
 		Skip: 0,
 		Take: 20,
 	}, preloads: make(map[string][]Expr), ignoreFields: make(map[string]bool), selectFields: make(map[string]bool), allowedFields: make(map[string]bool), fieldWhitelist: false, queryLimits: QueryLimits{
@@ -1032,10 +1031,6 @@ func New(adapter ...Adapter) Figo {
 		MaxParameterCount:  100,
 		MaxExpressionCount: 200,
 	}, clauses: make([]Expr, 0), namingStrategy: NAMING_STRATEGY_SNAKE_CASE}
-	if len(adapter) > 0 {
-		f.adapterObj = adapter[0]
-	}
-	return f
 }
 
 func (p *Page) validate() {

@@ -63,9 +63,9 @@ func main() {
 }
 ```
 
-> The adapter can be supplied either to `New(figo.GormAdapter{})` or to
-> `Build(figo.GormAdapter{})` — whichever fits your flow. If given in both, the
-> one passed to `Build` wins. `New()` with no arguments is also valid.
+> `New()` takes no adapter — supply it at build time with
+> `Build(figo.GormAdapter{})` (or via `SetAdapterObject`). Calling `Build()` with
+> no adapter keeps whatever was set previously.
 
 ## Supported Operations
 

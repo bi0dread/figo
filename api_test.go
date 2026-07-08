@@ -6,9 +6,9 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// The adapter may be supplied to New(), to Build(), or deferred and set later;
-// Build's adapter (if any) takes precedence. These forms must all keep working.
-func TestAdapterCanBeSetOnNewOrBuild(t *testing.T) {
+// The adapter is supplied at Build (or via SetAdapterObject) — New() takes no
+// adapter. These forms must all keep working.
+func TestAdapterCanBeSetOnBuild(t *testing.T) {
 	t.Run("AdapterOnBuild", func(t *testing.T) {
 		f := New()
 		f.AddFiltersFromString(`id=1`)
@@ -17,16 +17,18 @@ func TestAdapterCanBeSetOnNewOrBuild(t *testing.T) {
 		assert.True(t, ok)
 	})
 
-	t.Run("AdapterOnNew", func(t *testing.T) {
-		f := New(RawAdapter{})
+	t.Run("AdapterViaSetter", func(t *testing.T) {
+		f := New()
+		f.SetAdapterObject(RawAdapter{})
 		f.AddFiltersFromString(`id=1`)
 		f.Build()
 		_, ok := f.GetAdapterObject().(RawAdapter)
 		assert.True(t, ok)
 	})
 
-	t.Run("BuildOverridesNew", func(t *testing.T) {
-		f := New(MongoAdapter{})
+	t.Run("BuildAdapterOverridesSetter", func(t *testing.T) {
+		f := New()
+		f.SetAdapterObject(MongoAdapter{})
 		f.AddFiltersFromString(`id=1`)
 		f.Build(RawAdapter{})
 		_, ok := f.GetAdapterObject().(RawAdapter)

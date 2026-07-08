@@ -45,7 +45,8 @@ func TestBuild(t *testing.T) {
 }
 
 func TestAdapterSelection(t *testing.T) {
-	f := New(GormAdapter{}) // exercises the adapter-on-New construction path
+	f := New()
+	f.Build(GormAdapter{}) // adapter is supplied at Build
 	if _, ok := f.GetAdapterObject().(GormAdapter); !ok {
 		t.Fatalf("expected GormAdapter")
 	}
@@ -296,7 +297,8 @@ func (dummyAdapter) GetQuery(f Figo, ctx any, conditionType ...string) (Query, b
 }
 
 func TestAdapterObjectDelegation(t *testing.T) {
-	f := New(dummyAdapter{})
+	f := New()
+	f.Build(dummyAdapter{}) // Build sets the adapter even with no DSL
 	out := f.GetSqlString(nil, "SELECT")
 	assert.Equal(t, "DUMMY", out)
 }
