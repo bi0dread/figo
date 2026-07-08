@@ -1,0 +1,21 @@
+# Compiled test binaries produced by `go test -c` / `go test`
+*.test
+/figo.test
+
+# Compiled command binaries (sources live under cmd/)
+/seeder
+/elasticsearch-test
+
+# Coverage output
+coverage.out
+coverage.html
+
+# Profiling output
+*.prof
+
+# Local debug/scratch programs (not part of the library)
+/test_debug/
+/test_getFinalExpr.go
+
+# IDE
+.idea/
