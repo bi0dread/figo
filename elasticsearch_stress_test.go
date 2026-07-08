@@ -23,7 +23,7 @@ func TestElasticsearchStressTest(t *testing.T) {
 		f.AddFiltersFromString(`id > 0 and id <= 1000`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
 
 		// Should find all 1000 users
@@ -39,7 +39,7 @@ func TestElasticsearchStressTest(t *testing.T) {
 		f.AddFiltersFromString(`((category = "tech" and score > 80) or (category = "business" and age > 30)) and (status = "active" or status = "pending") and price <bet> (100..1000)`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
 
 		// Verify query structure
@@ -57,7 +57,7 @@ func TestElasticsearchStressTest(t *testing.T) {
 		f.AddFiltersFromString(`id > 0 sort=id:asc page=skip:500,take:100`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
 
 		// Verify pagination
@@ -81,7 +81,7 @@ func TestElasticsearchStressTest(t *testing.T) {
 		f.AddFiltersFromString(`id > 0 sort=category:asc,score:desc,age:asc,price:desc page=skip:0,take:50`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
 
 		// Verify sorting
@@ -98,7 +98,7 @@ func TestElasticsearchStressTest(t *testing.T) {
 		f.AddFiltersFromString(`id > 0`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
 
 		// Verify field selection
@@ -114,7 +114,7 @@ func TestElasticsearchStressTest(t *testing.T) {
 		f.AddFiltersFromString(`email =~ ".*@(gmail|yahoo|outlook)\\.com$"`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
 
 		// Verify query structure
@@ -132,7 +132,7 @@ func TestElasticsearchStressTest(t *testing.T) {
 		f.AddFiltersFromString(`category <in> [tech,business,finance,health,education,entertainment,sports,travel,food,automotive]`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
 
 		// Verify query structure
@@ -149,7 +149,7 @@ func TestElasticsearchStressTest(t *testing.T) {
 		f.AddFiltersFromString(`age >= 18 and age <= 65 and score >= 50 and score <= 100 and price >= 100 and price <= 1000`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
 
 		// Verify query structure
@@ -166,7 +166,7 @@ func TestElasticsearchStressTest(t *testing.T) {
 		f.AddFiltersFromString(`status != "inactive" and category != "deprecated" and score != 0`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
 
 		// Verify query structure
@@ -183,7 +183,7 @@ func TestElasticsearchStressTest(t *testing.T) {
 		f.AddFiltersFromString(`deleted_at <null> and last_login <notnull> and phone <notnull>`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "stress_users", query)
 
 		// Verify query structure

@@ -30,7 +30,7 @@ func TestElasticsearchPerformance(t *testing.T) {
 					f.AddFiltersFromString(`status = "active" and age > 25`)
 					f.Build()
 
-					query := BuildElasticsearchQuery(f)
+					query, _ := BuildElasticsearchQuery(f)
 					results := executeElasticsearchQuery(t, "stress_users", query)
 
 					// Verify we got results
@@ -61,7 +61,7 @@ func TestElasticsearchPerformance(t *testing.T) {
 			f.AddFiltersFromString(`((name =^ "%John%" or email =^ "%gmail%") and (age >= 18 and age <= 65)) or (status = "active" and score > 80)`)
 			f.Build()
 
-			query := BuildElasticsearchQuery(f)
+			query, _ := BuildElasticsearchQuery(f)
 			jsonStr, _ := GetElasticsearchQueryString(f)
 
 			// Verify query was generated
@@ -90,7 +90,7 @@ func TestElasticsearchPerformance(t *testing.T) {
 			f.AddFiltersFromString(`((category = "tech" and score > 80) or (category = "business" and age > 30)) and (status = "active" or status = "pending") and price <bet> (100..1000) and email =^ "%gmail%" and phone =~ "^\\+1[0-9]{10}$" and last_login <notnull> and deleted_at <null>`)
 			f.Build()
 
-			query := BuildElasticsearchQuery(f)
+			query, _ := BuildElasticsearchQuery(f)
 			results := executeElasticsearchQuery(t, "stress_users", query)
 
 			// Verify query was executed
@@ -159,7 +159,7 @@ func TestElasticsearchPerformance(t *testing.T) {
 		// Generate queries from all instances
 		start = time.Now()
 		for i := 0; i < numInstances; i++ {
-			query := BuildElasticsearchQuery(instances[i])
+			query, _ := BuildElasticsearchQuery(instances[i])
 			jsonStr, _ := GetElasticsearchQueryString(instances[i])
 
 			// Verify query was generated

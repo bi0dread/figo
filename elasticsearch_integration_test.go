@@ -23,7 +23,7 @@ func TestElasticsearchIntegration(t *testing.T) {
 		f.AddFiltersFromString(`status = "active"`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
 
 		if results.Hits.Total.Value == 0 {
@@ -47,7 +47,7 @@ func TestElasticsearchIntegration(t *testing.T) {
 		f.AddFiltersFromString(`age > 25 and score >= 80`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
 
 		// Verify query structure
@@ -70,7 +70,7 @@ func TestElasticsearchIntegration(t *testing.T) {
 		f.AddFiltersFromString(`email =^ "%gmail%"`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
 
 		// Verify query structure
@@ -90,7 +90,7 @@ func TestElasticsearchIntegration(t *testing.T) {
 		f.AddFiltersFromString(`category <in> [tech,business,finance]`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
 
 		// Verify query structure
@@ -110,7 +110,7 @@ func TestElasticsearchIntegration(t *testing.T) {
 		f.AddFiltersFromString(`price <bet> (100..500)`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
 
 		// Verify query structure
@@ -133,7 +133,7 @@ func TestElasticsearchIntegration(t *testing.T) {
 		f.AddFiltersFromString(`last_login <notnull>`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
 
 		// Verify query structure
@@ -150,7 +150,7 @@ func TestElasticsearchIntegration(t *testing.T) {
 		f.AddFiltersFromString(`((name =^ "%John%" or email =^ "%gmail%") and (age >= 18 and age <= 65)) or (status = "active" and score > 80)`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
 
 		// Verify query structure
@@ -173,7 +173,7 @@ func TestElasticsearchIntegration(t *testing.T) {
 		f.AddFiltersFromString(`status = "active" sort=score:desc,age:asc page=skip:0,take:3`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
 
 		// Verify pagination
@@ -212,7 +212,7 @@ func TestElasticsearchIntegration(t *testing.T) {
 		f.AddFiltersFromString(`status = "active"`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
 
 		// Verify field selection
@@ -259,7 +259,7 @@ func TestElasticsearchIntegration(t *testing.T) {
 		f.AddFiltersFromString(`phone =~ "^\\+1[0-9]{10}$"`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
 
 		// Verify query structure
@@ -276,7 +276,7 @@ func TestElasticsearchIntegration(t *testing.T) {
 		f.AddFiltersFromString(`status != "inactive"`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
 
 		// Verify query structure
@@ -293,7 +293,7 @@ func TestElasticsearchIntegration(t *testing.T) {
 		f.AddFiltersFromString(`deleted_at <null>`)
 		f.Build()
 
-		query := BuildElasticsearchQuery(f)
+		query, _ := BuildElasticsearchQuery(f)
 		results := executeElasticsearchQuery(t, "users", query)
 
 		// Verify query structure

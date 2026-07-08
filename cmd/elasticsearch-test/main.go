@@ -55,7 +55,7 @@ func testBasicTermQuery(url string) {
 	f.AddFiltersFromString(`status = "active"`)
 	f.Build()
 
-	query := figo.BuildElasticsearchQuery(f)
+	query, _ := figo.BuildElasticsearchQuery(f)
 	jsonStr, _ := figo.GetElasticsearchQueryString(f)
 
 	log.Printf("DSL: status = \"active\"")
@@ -71,7 +71,7 @@ func testRangeQuery(url string) {
 	f.AddFiltersFromString(`age > 25 and score >= 80`)
 	f.Build()
 
-	query := figo.BuildElasticsearchQuery(f)
+	query, _ := figo.BuildElasticsearchQuery(f)
 	jsonStr, _ := figo.GetElasticsearchQueryString(f)
 
 	log.Printf("DSL: age > 25 and score >= 80")
@@ -87,7 +87,7 @@ func testWildcardQuery(url string) {
 	f.AddFiltersFromString(`name =^ "%John%"`)
 	f.Build()
 
-	query := figo.BuildElasticsearchQuery(f)
+	query, _ := figo.BuildElasticsearchQuery(f)
 	jsonStr, _ := figo.GetElasticsearchQueryString(f)
 
 	log.Printf("DSL: name =^ \"%%John%%\"")
@@ -103,7 +103,7 @@ func testTermsQuery(url string) {
 	f.AddFiltersFromString(`category <in> [tech,business,finance]`)
 	f.Build()
 
-	query := figo.BuildElasticsearchQuery(f)
+	query, _ := figo.BuildElasticsearchQuery(f)
 	jsonStr, _ := figo.GetElasticsearchQueryString(f)
 
 	log.Printf("DSL: category <in> [tech,business,finance]")
@@ -119,7 +119,7 @@ func testBetweenQuery(url string) {
 	f.AddFiltersFromString(`price <bet> (100..500)`)
 	f.Build()
 
-	query := figo.BuildElasticsearchQuery(f)
+	query, _ := figo.BuildElasticsearchQuery(f)
 	jsonStr, _ := figo.GetElasticsearchQueryString(f)
 
 	log.Printf("DSL: price <bet> (100..500)")
@@ -135,7 +135,7 @@ func testExistsQuery(url string) {
 	f.AddFiltersFromString(`last_login <notnull>`)
 	f.Build()
 
-	query := figo.BuildElasticsearchQuery(f)
+	query, _ := figo.BuildElasticsearchQuery(f)
 	jsonStr, _ := figo.GetElasticsearchQueryString(f)
 
 	log.Printf("DSL: last_login <notnull>")
@@ -151,7 +151,7 @@ func testComplexQuery(url string) {
 	f.AddFiltersFromString(`((name =^ "%John%" or email =^ "%gmail%") and (age >= 18 and age <= 65)) or (status = "active" and score > 80)`)
 	f.Build()
 
-	query := figo.BuildElasticsearchQuery(f)
+	query, _ := figo.BuildElasticsearchQuery(f)
 	jsonStr, _ := figo.GetElasticsearchQueryString(f)
 
 	log.Printf("DSL: ((name =^ \"%%John%%\" or email =^ \"%%gmail%%\") and (age >= 18 and age <= 65)) or (status = \"active\" and score > 80)")
@@ -167,7 +167,7 @@ func testPaginationAndSorting(url string) {
 	f.AddFiltersFromString(`status = "active" sort=score:desc,age:asc page=skip:0,take:5`)
 	f.Build()
 
-	query := figo.BuildElasticsearchQuery(f)
+	query, _ := figo.BuildElasticsearchQuery(f)
 	jsonStr, _ := figo.GetElasticsearchQueryString(f)
 
 	log.Printf("DSL: status = \"active\" sort=score:desc,age:asc page=skip:0,take:5")

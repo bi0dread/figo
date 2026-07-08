@@ -13,7 +13,7 @@ func TestMongoRegexSerializesCorrectly(t *testing.T) {
 	f := New(nil)
 	f.AddFilter(LikeExpr{Field: "name", Value: "%foo%"})
 	f.Build()
-	m := BuildMongoFilter(f)
+	m, _ := BuildMongoFilter(f)
 
 	re, ok := m["name"].(primitive.Regex)
 	assert.True(t, ok, "LIKE must produce a primitive.Regex, not a bson.M{$regex:...}")
@@ -55,7 +55,7 @@ func TestMongoILikeUsesOptions(t *testing.T) {
 	f := New(nil)
 	f.AddFilter(ILikeExpr{Field: "name", Value: "%bar%"})
 	f.Build()
-	m := BuildMongoFilter(f)
+	m, _ := BuildMongoFilter(f)
 	re, ok := m["name"].(primitive.Regex)
 	assert.True(t, ok)
 	assert.Equal(t, "i", re.Options)

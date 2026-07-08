@@ -146,7 +146,7 @@ func TestMongoAdapterBuild(t *testing.T) {
 	f.Build()
 
 	// Filter
-	filter := BuildMongoFilter(f)
+	filter, _ := BuildMongoFilter(f)
 
 	// With the new operator precedence: ((id=1 AND vendor_id=22) AND expedition_type LIKE %e%)
 	// This creates a top-level $and with two items:
@@ -206,7 +206,7 @@ func TestMongoAdapterBuild(t *testing.T) {
 		"TestInner1": {From: "testinner1", LocalField: "id", ForeignField: "XX", As: "TestInner1"},
 		"TestInner2": {From: "testinner2", LocalField: "id", ForeignField: "XX", As: "TestInner2"},
 	}
-	pipe := BuildMongoAggregatePipeline(f2, joins)
+	pipe, _ := BuildMongoAggregatePipeline(f2, joins)
 	// Expect at least two $lookup stages
 	lookupCount := 0
 	matchQualified := 0
@@ -396,7 +396,7 @@ func TestMongoNewOperations(t *testing.T) {
 	f.AddFilter(NotInExpr{Field: "status", Values: []any{"x", "y"}})
 	f.Build()
 
-	m := BuildMongoFilter(f)
+	m, _ := BuildMongoFilter(f)
 	// find id $in within top-level or $and aggregation
 	foundIn := false
 	if andList, ok := m["$and"].([]bson.M); ok {
@@ -483,7 +483,7 @@ func TestFieldNameWithUnderscoresAllAdapters(t *testing.T) {
 	f3 := New(MongoAdapter{})
 	f3.AddFiltersFromString(dsl)
 	f3.Build()
-	filter := BuildMongoFilter(f3)
+	filter, _ := BuildMongoFilter(f3)
 	// Check that the filter contains the expected field names and operations
 	filterStr := fmt.Sprintf("%v", filter)
 	assert.Contains(t, filterStr, "user_profile_id")
@@ -716,7 +716,7 @@ func TestAdapterConsistency(t *testing.T) {
 	f3 := New(MongoAdapter{})
 	f3.AddFiltersFromString(dsl)
 	f3.Build()
-	filter3 := BuildMongoFilter(f3)
+	filter3, _ := BuildMongoFilter(f3)
 
 	// Verify all adapters handle the same fields
 	assert.Contains(t, sql1, "user_id")
@@ -828,7 +828,7 @@ func TestComplexFiltersWithParentheses(t *testing.T) {
 	f3 := New(MongoAdapter{})
 	f3.AddFiltersFromString(dsl)
 	f3.Build()
-	filter3 := BuildMongoFilter(f3)
+	filter3, _ := BuildMongoFilter(f3)
 
 	fmt.Printf("MongoDB Filter: %+v\n", filter3)
 
@@ -958,7 +958,7 @@ func TestElasticsearchAdapter(t *testing.T) {
 	f1 := New(ElasticsearchAdapter{})
 	f1.AddFiltersFromString(`name = "john" and age > 25`)
 	f1.Build()
-	query1 := BuildElasticsearchQuery(f1)
+	query1, _ := BuildElasticsearchQuery(f1)
 
 	// Verify basic structure
 	assert.NotNil(t, query1.Query)
@@ -968,7 +968,7 @@ func TestElasticsearchAdapter(t *testing.T) {
 	f2 := New(ElasticsearchAdapter{})
 	f2.AddFiltersFromString(`name =^ "%john%" and age <in> [25,30,35] and score <bet> (80..100) and status <notnull>`)
 	f2.Build()
-	query2 := BuildElasticsearchQuery(f2)
+	query2, _ := BuildElasticsearchQuery(f2)
 
 	// Verify complex query structure
 	queryStr := fmt.Sprintf("%v", query2.Query)
@@ -981,7 +981,7 @@ func TestElasticsearchAdapter(t *testing.T) {
 	f3 := New(ElasticsearchAdapter{})
 	f3.AddFiltersFromString(`id > 0 page=skip:10,take:5`)
 	f3.Build()
-	query3 := BuildElasticsearchQuery(f3)
+	query3, _ := BuildElasticsearchQuery(f3)
 
 	assert.Equal(t, 10, query3.From)
 	assert.Equal(t, 5, query3.Size)
@@ -990,7 +990,7 @@ func TestElasticsearchAdapter(t *testing.T) {
 	f4 := New(ElasticsearchAdapter{})
 	f4.AddFiltersFromString(`id > 0 sort=name:asc,age:desc`)
 	f4.Build()
-	query4 := BuildElasticsearchQuery(f4)
+	query4, _ := BuildElasticsearchQuery(f4)
 
 	assert.Len(t, query4.Sort, 2)
 	assert.Contains(t, fmt.Sprintf("%v", query4.Sort), "name")
@@ -1001,7 +1001,7 @@ func TestElasticsearchAdapter(t *testing.T) {
 	f5.AddSelectFields("id", "name", "email")
 	f5.AddFiltersFromString(`id > 0`)
 	f5.Build()
-	query5 := BuildElasticsearchQuery(f5)
+	query5, _ := BuildElasticsearchQuery(f5)
 
 	assert.Len(t, query5.Source, 3)
 	assert.Contains(t, query5.Source, "id")
@@ -1089,7 +1089,7 @@ func TestElasticsearchAllOperators(t *testing.T) {
 			f := New(ElasticsearchAdapter{})
 			f.AddFiltersFromString(tt.dsl)
 			f.Build()
-			query := BuildElasticsearchQuery(f)
+			query, _ := BuildElasticsearchQuery(f)
 
 			queryStr := fmt.Sprintf("%v", query.Query)
 			assert.Contains(t, queryStr, tt.expected, "Should contain expected Elasticsearch query type")
@@ -1102,7 +1102,7 @@ func TestElasticsearchComplexQueries(t *testing.T) {
 	f := New(ElasticsearchAdapter{})
 	f.AddFiltersFromString(`((name =^ "%john%" or email =^ "%gmail%") and (age >= 18 and age <= 65)) or (status = "active" and score > 80)`)
 	f.Build()
-	query := BuildElasticsearchQuery(f)
+	query, _ := BuildElasticsearchQuery(f)
 
 	queryStr := fmt.Sprintf("%v", query.Query)
 	assert.Contains(t, queryStr, "bool")
@@ -1113,7 +1113,7 @@ func TestElasticsearchComplexQueries(t *testing.T) {
 	f2 := New(ElasticsearchAdapter{})
 	f2.AddFiltersFromString(`id > 0 sort=name:asc,age:desc page=skip:20,take:10`)
 	f2.Build()
-	query2 := BuildElasticsearchQuery(f2)
+	query2, _ := BuildElasticsearchQuery(f2)
 
 	assert.Equal(t, 20, query2.From)
 	assert.Equal(t, 10, query2.Size)
@@ -2756,7 +2756,7 @@ func TestSortPageComprehensive(t *testing.T) {
 			}
 			f.Build()
 
-			query := BuildElasticsearchQuery(f)
+			query, _ := BuildElasticsearchQuery(f)
 			if query.Size != 10 {
 				t.Error("Elasticsearch adapter should set size to 10")
 			}
