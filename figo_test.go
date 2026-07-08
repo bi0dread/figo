@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -175,9 +176,8 @@ func TestMongoAdapterBuild(t *testing.T) {
 
 	// Second item should be expedition_type with regex
 	secondItem := andVal[1]
-	if rv, ok := secondItem["expedition_type"].(bson.M); ok {
-		_, ok2 := rv["$regex"]
-		assert.True(t, ok2)
+	if rv, ok := secondItem["expedition_type"].(primitive.Regex); ok {
+		assert.NotEmpty(t, rv.Pattern)
 	} else {
 		t.Fatalf("expedition_type regex not found in filter")
 	}
@@ -418,21 +418,13 @@ func TestMongoNewOperations(t *testing.T) {
 	foundILike := false
 	if andList, ok := m["$and"].([]bson.M); ok {
 		for _, it := range andList {
-			if mv, ok2 := it["name"].(bson.M); ok2 {
-				if _, ok3 := mv["$regex"]; ok3 {
-					if opt, ok4 := mv["$options"]; ok4 && opt == "i" {
-						foundILike = true
-						break
-					}
-				}
-			}
-		}
-	} else if mv, ok := m["name"].(bson.M); ok {
-		if _, ok2 := mv["$regex"]; ok2 {
-			if opt, ok4 := mv["$options"]; ok4 && opt == "i" {
+			if rv, ok2 := it["name"].(primitive.Regex); ok2 && rv.Options == "i" {
 				foundILike = true
+				break
 			}
 		}
+	} else if rv, ok := m["name"].(primitive.Regex); ok && rv.Options == "i" {
+		foundILike = true
 	}
 	if !foundILike {
 		t.Fatalf("name ilike missing")

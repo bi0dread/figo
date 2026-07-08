@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"go.mongodb.org/mongo-driver/bson"
+	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
 )
@@ -149,24 +150,14 @@ func mongoExpr(e Expr) bson.M {
 	case NeqExpr:
 		return bson.M{x.Field: bson.M{"$ne": x.Value}}
 	case LikeExpr:
-		return bson.M{x.Field: bson.M{"$regex": likeToRegex(x.Value)}}
+		return bson.M{x.Field: primitive.Regex{Pattern: likeToRegexPattern(x.Value)}}
 	case RegexExpr:
-		// Accept raw regex string or *regexp.Regexp
-		switch v := x.Value.(type) {
-		case *regexp.Regexp:
-			return bson.M{x.Field: bson.M{"$regex": v}}
-		case string:
-			// do not escape: treat as raw pattern
-			if compiled, err := regexp.Compile(v); err == nil {
-				return bson.M{x.Field: bson.M{"$regex": compiled}}
-			}
-			// If regex compilation fails, return empty filter
-			return bson.M{}
-		default:
-			return bson.M{}
+		if re, ok := mongoRawRegex(x.Value); ok {
+			return bson.M{x.Field: re}
 		}
+		return bson.M{}
 	case ILikeExpr:
-		return bson.M{x.Field: bson.M{"$regex": likeToRegex(x.Value), "$options": "i"}}
+		return bson.M{x.Field: primitive.Regex{Pattern: likeToRegexPattern(x.Value), Options: "i"}}
 	case IsNullExpr:
 		return bson.M{x.Field: bson.M{"$exists": false}}
 	case NotNullExpr:
@@ -224,22 +215,14 @@ func mongoExprQualified(e Expr, qualifier string) bson.M {
 	case NeqExpr:
 		return bson.M{q(x.Field): bson.M{"$ne": x.Value}}
 	case LikeExpr:
-		return bson.M{q(x.Field): bson.M{"$regex": likeToRegex(x.Value)}}
+		return bson.M{q(x.Field): primitive.Regex{Pattern: likeToRegexPattern(x.Value)}}
 	case RegexExpr:
-		switch v := x.Value.(type) {
-		case *regexp.Regexp:
-			return bson.M{q(x.Field): bson.M{"$regex": v}}
-		case string:
-			if compiled, err := regexp.Compile(v); err == nil {
-				return bson.M{q(x.Field): bson.M{"$regex": compiled}}
-			}
-			// If regex compilation fails, return empty filter
-			return bson.M{}
-		default:
-			return bson.M{}
+		if re, ok := mongoRawRegex(x.Value); ok {
+			return bson.M{q(x.Field): re}
 		}
+		return bson.M{}
 	case ILikeExpr:
-		return bson.M{q(x.Field): bson.M{"$regex": likeToRegex(x.Value), "$options": "i"}}
+		return bson.M{q(x.Field): primitive.Regex{Pattern: likeToRegexPattern(x.Value), Options: "i"}}
 	case IsNullExpr:
 		return bson.M{q(x.Field): bson.M{"$exists": false}}
 	case NotNullExpr:
@@ -281,8 +264,12 @@ func mongoExprQualified(e Expr, qualifier string) bson.M {
 	}
 }
 
-func likeToRegex(v any) *regexp.Regexp {
-	// Convert SQL-like %pattern% into a Go regex. Non-string inputs are stringified.
+// likeToRegexPattern converts a SQL LIKE pattern into an anchored regex pattern
+// string: '%' -> '.*', '_' -> '.', every other character is regex-escaped, and
+// the result is anchored with ^...$. Anchoring matters because Mongo $regex is
+// unanchored — without it, LIKE "abc" would match "xabcx" instead of exactly
+// "abc", and the '_' single-char wildcard would not match at all.
+func likeToRegexPattern(v any) string {
 	var s string
 	switch x := v.(type) {
 	case string:
@@ -290,12 +277,39 @@ func likeToRegex(v any) *regexp.Regexp {
 	default:
 		s = fmt.Sprint(x)
 	}
-	// strip quotes if present
 	s = strings.Trim(s, "\"")
-	// escape regex meta and then convert % wildcards to .*
-	pattern := regexp.QuoteMeta(s)
-	pattern = strings.ReplaceAll(pattern, "%", ".*")
-	return regexp.MustCompile(pattern)
+	var b strings.Builder
+	b.WriteByte('^')
+	for _, r := range s {
+		switch r {
+		case '%':
+			b.WriteString(".*")
+		case '_':
+			b.WriteByte('.')
+		default:
+			b.WriteString(regexp.QuoteMeta(string(r)))
+		}
+	}
+	b.WriteByte('$')
+	return b.String()
+}
+
+// mongoRawRegex builds a BSON regex value from a RegexExpr's raw pattern. The
+// pattern MUST be handed to Mongo as a string (primitive.Regex), not a compiled
+// *regexp.Regexp — the BSON encoder serializes *regexp.Regexp (all-unexported
+// fields) as an empty document, so "$regex": {} matches nothing.
+func mongoRawRegex(v any) (primitive.Regex, bool) {
+	switch t := v.(type) {
+	case *regexp.Regexp:
+		return primitive.Regex{Pattern: t.String()}, true
+	case string:
+		if _, err := regexp.Compile(t); err != nil {
+			return primitive.Regex{}, false
+		}
+		return primitive.Regex{Pattern: t}, true
+	default:
+		return primitive.Regex{}, false
+	}
 }
 
 // AdapterMongoGetFind returns filter and find options for a simple Find operation

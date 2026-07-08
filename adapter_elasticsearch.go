@@ -184,30 +184,16 @@ func buildElasticsearchQueryFromExpr(expr Expr) map[string]interface{} {
 			},
 		}
 	case LikeExpr:
-		// Convert SQL LIKE wildcards (%) to Elasticsearch wildcards (*)
-		var wildcardValue string
-		if str, ok := x.Value.(string); ok {
-			wildcardValue = strings.ReplaceAll(str, "%", "*")
-		} else {
-			wildcardValue = fmt.Sprintf("%v", x.Value)
-		}
 		return map[string]interface{}{
 			"wildcard": map[string]interface{}{
-				x.Field: wildcardValue,
+				x.Field: sqlLikeToESWildcard(x.Value),
 			},
 		}
 	case ILikeExpr:
-		// Convert SQL LIKE wildcards (%) to Elasticsearch wildcards (*)
-		var wildcardValue string
-		if str, ok := x.Value.(string); ok {
-			wildcardValue = strings.ReplaceAll(str, "%", "*")
-		} else {
-			wildcardValue = fmt.Sprintf("%v", x.Value)
-		}
 		return map[string]interface{}{
 			"wildcard": map[string]interface{}{
 				x.Field: map[string]interface{}{
-					"value":            wildcardValue,
+					"value":            sqlLikeToESWildcard(x.Value),
 					"case_insensitive": true,
 				},
 			},
@@ -309,6 +295,18 @@ func buildElasticsearchQueryFromExpr(expr Expr) map[string]interface{} {
 			"match_all": map[string]interface{}{},
 		}
 	}
+}
+
+// sqlLikeToESWildcard translates a SQL LIKE pattern to an Elasticsearch wildcard
+// pattern: '%' -> '*' (any sequence) and '_' -> '?' (single char).
+func sqlLikeToESWildcard(v any) string {
+	str, ok := v.(string)
+	if !ok {
+		return fmt.Sprintf("%v", v)
+	}
+	str = strings.ReplaceAll(str, "%", "*")
+	str = strings.ReplaceAll(str, "_", "?")
+	return str
 }
 
 // GetElasticsearchQueryString returns the Elasticsearch query as a JSON string
