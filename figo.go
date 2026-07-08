@@ -96,10 +96,11 @@ type CacheConfig struct {
 
 // CacheEntry represents a cached query result
 type CacheEntry struct {
-	Data      interface{}
-	ExpiresAt time.Time
-	CreatedAt time.Time
-	HitCount  int64
+	Data           interface{}
+	ExpiresAt      time.Time
+	CreatedAt      time.Time
+	LastAccessedAt time.Time // updated on each Get; drives LRU eviction
+	HitCount       int64
 }
 
 // QueryCache interface for different cache implementations
@@ -363,6 +364,11 @@ func (pm *PluginManager) ExecuteAfterParse(f Figo, dsl string) error {
 
 // NewInMemoryBatchProcessor creates a new batch processor
 func NewInMemoryBatchProcessor(maxConcurrency int, timeout time.Duration) *InMemoryBatchProcessor {
+	// A non-positive concurrency would make the semaphore channel either
+	// unbuffered (deadlock) or panic on make(chan, negative); clamp to >= 1.
+	if maxConcurrency < 1 {
+		maxConcurrency = 1
+	}
 	return &InMemoryBatchProcessor{
 		maxConcurrency: maxConcurrency,
 		timeout:        timeout,
@@ -479,6 +485,7 @@ type InMemoryCache struct {
 	hits     int64
 	misses   int64
 	stopChan chan struct{}
+	stopOnce sync.Once // guards stopChan against double-close
 }
 
 // NewInMemoryCache creates a new in-memory cache instance
@@ -501,10 +508,12 @@ func (c *InMemoryCache) Close() {
 	c.Stop()
 }
 
-// Get retrieves a value from the cache
+// Get retrieves a value from the cache. It takes a full write lock because it
+// mutates hit/miss counters, HitCount, and LastAccessedAt — doing this under a
+// read lock (as before) is a data race across concurrent Get callers.
 func (c *InMemoryCache) Get(key string) (interface{}, bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
 
 	entry, exists := c.entries[key]
 	if !exists {
@@ -519,6 +528,7 @@ func (c *InMemoryCache) Get(key string) (interface{}, bool) {
 	}
 
 	entry.HitCount++
+	entry.LastAccessedAt = time.Now()
 	c.hits++
 	return entry.Data, true
 }
@@ -532,16 +542,19 @@ func (c *InMemoryCache) Set(key string, value interface{}, ttl time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	// Check size limit
-	if len(c.entries) >= c.config.MaxSize {
+	// Check size limit. MaxSize <= 0 means unlimited; without this guard a
+	// zero MaxSize would evict on every Set, pinning the cache to one entry.
+	if c.config.MaxSize > 0 && len(c.entries) >= c.config.MaxSize {
 		c.evictLRU()
 	}
 
+	now := time.Now()
 	c.entries[key] = &CacheEntry{
-		Data:      value,
-		ExpiresAt: time.Now().Add(ttl),
-		CreatedAt: time.Now(),
-		HitCount:  0,
+		Data:           value,
+		ExpiresAt:      now.Add(ttl),
+		CreatedAt:      now,
+		LastAccessedAt: now,
+		HitCount:       0,
 	}
 }
 
@@ -579,15 +592,17 @@ func (c *InMemoryCache) Stats() CacheStats {
 	}
 }
 
-// evictLRU removes the least recently used entry
+// evictLRU removes the least recently used entry (by last access time, not
+// creation time — otherwise a hot early entry would be evicted before a cold
+// later one, i.e. FIFO rather than LRU).
 func (c *InMemoryCache) evictLRU() {
 	var oldestKey string
 	var oldestTime time.Time
 
 	for key, entry := range c.entries {
-		if oldestKey == "" || entry.CreatedAt.Before(oldestTime) {
+		if oldestKey == "" || entry.LastAccessedAt.Before(oldestTime) {
 			oldestKey = key
-			oldestTime = entry.CreatedAt
+			oldestTime = entry.LastAccessedAt
 		}
 	}
 
@@ -624,9 +639,12 @@ func (c *InMemoryCache) cleanupExpired() {
 	}
 }
 
-// Stop stops the cleanup goroutine
+// Stop stops the cleanup goroutine. Safe to call multiple times (and alongside
+// Close, which delegates here) — the underlying channel is closed at most once.
 func (c *InMemoryCache) Stop() {
-	close(c.stopChan)
+	c.stopOnce.Do(func() {
+		close(c.stopChan)
+	})
 }
 
 // ParseError represents a DSL parsing error with context
@@ -2482,8 +2500,17 @@ func (f *figo) GetClauses() []Expr {
 }
 
 func (f *figo) GetPreloads() map[string][]Expr {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 
-	return f.preloads
+	// Return a copy so callers can't race with (or mutate) internal state.
+	result := make(map[string][]Expr, len(f.preloads))
+	for k, exprs := range f.preloads {
+		cp := make([]Expr, len(exprs))
+		copy(cp, exprs)
+		result[k] = cp
+	}
+	return result
 }
 
 func (f *figo) GetPage() Page {
@@ -2549,11 +2576,14 @@ func (f *figo) GetSelectFields() map[string]bool {
 }
 
 func (f *figo) SetNamingStrategy(strategy NamingStrategy) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.namingStrategy = strategy
 }
 
 func (f *figo) GetNamingStrategy() NamingStrategy {
-
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.namingStrategy
 }
 
@@ -2562,19 +2592,27 @@ func (f *figo) GetNamingStrategy() NamingStrategy {
 // produces. Pass nil to remove it and fall back to the configured strategy.
 // Configure this before Build()/AddFiltersFromString, like SetNamingStrategy.
 func (f *figo) SetNamingFunc(fn NamingFunc) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.namingFunc = fn
 }
 
 // GetNamingFunc returns the custom field-name transformer, or nil if none is set.
 func (f *figo) GetNamingFunc() NamingFunc {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.namingFunc
 }
 
 func (f *figo) SetAdapterObject(adapter Adapter) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.adapterObj = adapter
 }
 
 func (f *figo) GetAdapterObject() Adapter {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.adapterObj
 }
 
@@ -2582,33 +2620,41 @@ func (f *figo) GetAdapterObject() Adapter {
 // For AdapterGorm, ctx should be a *gorm.DB configured with Model(...).
 // For AdapterRaw, ctx can be a table name (string) or RawContext.
 func (f *figo) GetSqlString(ctx any, conditionType ...string) string {
-	if f.adapterObj != nil {
-		if sql, ok := f.adapterObj.GetSqlString(f, ctx, conditionType...); ok {
+	// Snapshot the adapter under the lock, then call it WITHOUT holding the lock
+	// (the adapter calls back into locked getters like GetClauses).
+	f.mu.RLock()
+	adapter := f.adapterObj
+	f.mu.RUnlock()
+	if adapter != nil {
+		if sql, ok := adapter.GetSqlString(f, ctx, conditionType...); ok {
 			return sql
 		}
-		return ""
 	}
 	return ""
 }
 
 // GetExplainedSqlString returns a SQL string with placeholders expanded for easier debugging
 func (f *figo) GetExplainedSqlString(ctx any, conditionType ...string) string {
-	if f.adapterObj != nil {
-		if sql, ok := f.adapterObj.GetSqlString(f, ctx, conditionType...); ok {
+	f.mu.RLock()
+	adapter := f.adapterObj
+	f.mu.RUnlock()
+	if adapter != nil {
+		if sql, ok := adapter.GetSqlString(f, ctx, conditionType...); ok {
 			return sql
 		}
-		return ""
 	}
 	return ""
 }
 
 // GetQuery delegates to the configured adapter to obtain a typed query object
 func (f *figo) GetQuery(ctx any, conditionType ...string) Query {
-	if f.adapterObj != nil {
-		if q, ok := f.adapterObj.GetQuery(f, ctx, conditionType...); ok {
+	f.mu.RLock()
+	adapter := f.adapterObj
+	f.mu.RUnlock()
+	if adapter != nil {
+		if q, ok := adapter.GetQuery(f, ctx, conditionType...); ok {
 			return q
 		}
-		return nil
 	}
 	return nil
 }
@@ -2672,11 +2718,15 @@ func (f *figo) GetAllowedFields() map[string]bool {
 
 // SetQueryLimits sets the query complexity limits
 func (f *figo) SetQueryLimits(limits QueryLimits) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.queryLimits = limits
 }
 
 // GetQueryLimits returns the current query limits
 func (f *figo) GetQueryLimits() QueryLimits {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.queryLimits
 }
 
@@ -2849,16 +2899,22 @@ func (f *figo) filterAllowedFields(expr Expr) Expr {
 
 // SetCache sets the query cache instance
 func (f *figo) SetCache(cache QueryCache) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.cache = cache
 }
 
 // GetCache returns the current cache instance
 func (f *figo) GetCache() QueryCache {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.cache
 }
 
 // SetCacheConfig sets the cache configuration
 func (f *figo) SetCacheConfig(config CacheConfig) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.cacheConfig = config
 	if f.cache == nil && config.Enabled {
 		f.cache = NewInMemoryCache(config)
@@ -2867,28 +2923,44 @@ func (f *figo) SetCacheConfig(config CacheConfig) {
 
 // GetCacheConfig returns the current cache configuration
 func (f *figo) GetCacheConfig() CacheConfig {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.cacheConfig
 }
 
 // GetCacheStats returns cache performance statistics
 func (f *figo) GetCacheStats() CacheStats {
-	if f.cache == nil {
+	f.mu.RLock()
+	cache := f.cache
+	f.mu.RUnlock()
+	if cache == nil {
 		return CacheStats{}
 	}
-	return f.cache.Stats()
+	return cache.Stats()
 }
 
 // ClearCache clears all cached entries
 func (f *figo) ClearCache() {
-	if f.cache != nil {
-		f.cache.Clear()
+	f.mu.RLock()
+	cache := f.cache
+	f.mu.RUnlock()
+	if cache != nil {
+		cache.Clear()
 	}
 }
 
-// generateCacheKey creates a unique cache key for a query
-func (f *figo) generateCacheKey(ctx any, conditionType ...string) string {
-	// Create a hash of the query components
+// generateCacheKey creates a unique cache key for a query. kind ("sql"/"query")
+// keeps the two result types in separate slots — otherwise GetCachedSqlString and
+// GetCachedQuery share a key and clobber each other's entries. The key also
+// covers everything that changes the rendered output: the adapter type, the
+// custom naming func, and the global regex SQL operator (previously omitted,
+// which returned a stale result after SetAdapterObject / a regex-operator change).
+func (f *figo) generateCacheKey(kind string, ctx any, conditionType ...string) string {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+
 	components := []string{
+		kind,
 		f.dsl,
 		fmt.Sprintf("%v", f.clauses),
 		fmt.Sprintf("%v", f.preloads),
@@ -2899,6 +2971,9 @@ func (f *figo) generateCacheKey(ctx any, conditionType ...string) string {
 		fmt.Sprintf("%v", f.allowedFields),
 		fmt.Sprintf("%v", f.fieldWhitelist),
 		fmt.Sprintf("%v", f.namingStrategy),
+		fmt.Sprintf("%p", f.namingFunc),
+		fmt.Sprintf("%T", f.adapterObj),
+		GetRegexSQLOperator(),
 		fmt.Sprintf("%v", ctx),
 		fmt.Sprintf("%v", conditionType),
 	}
@@ -2919,14 +2994,20 @@ func (f *figo) GetCachedSqlString(ctx any, conditionType ...string) string {
 		f.recordQueryExecution(latency, cacheHit, err)
 	}()
 
-	if f.cache == nil || !f.cacheConfig.Enabled {
+	f.mu.RLock()
+	cache := f.cache
+	enabled := f.cacheConfig.Enabled
+	ttl := f.cacheConfig.TTL
+	f.mu.RUnlock()
+
+	if cache == nil || !enabled {
 		return f.GetSqlString(ctx, conditionType...)
 	}
 
-	key := f.generateCacheKey(ctx, conditionType...)
+	key := f.generateCacheKey("sql", ctx, conditionType...)
 
 	// Try to get from cache
-	if cached, found := f.cache.Get(key); found {
+	if cached, found := cache.Get(key); found {
 		if sql, ok := cached.(string); ok {
 			cacheHit = true
 			return sql
@@ -2935,7 +3016,7 @@ func (f *figo) GetCachedSqlString(ctx any, conditionType ...string) string {
 
 	// Generate and cache
 	sql := f.GetSqlString(ctx, conditionType...)
-	f.cache.Set(key, sql, f.cacheConfig.TTL)
+	cache.Set(key, sql, ttl)
 	cacheHit = false
 
 	return sql
@@ -2952,14 +3033,20 @@ func (f *figo) GetCachedQuery(ctx any, conditionType ...string) Query {
 		f.recordQueryExecution(latency, cacheHit, err)
 	}()
 
-	if f.cache == nil || !f.cacheConfig.Enabled {
+	f.mu.RLock()
+	cache := f.cache
+	enabled := f.cacheConfig.Enabled
+	ttl := f.cacheConfig.TTL
+	f.mu.RUnlock()
+
+	if cache == nil || !enabled {
 		return f.GetQuery(ctx, conditionType...)
 	}
 
-	key := f.generateCacheKey(ctx, conditionType...)
+	key := f.generateCacheKey("query", ctx, conditionType...)
 
 	// Try to get from cache
-	if cached, found := f.cache.Get(key); found {
+	if cached, found := cache.Get(key); found {
 		if query, ok := cached.(Query); ok {
 			cacheHit = true
 			return query
@@ -2969,7 +3056,7 @@ func (f *figo) GetCachedQuery(ctx any, conditionType ...string) Query {
 	// Generate and cache
 	query := f.GetQuery(ctx, conditionType...)
 	if query != nil {
-		f.cache.Set(key, query, f.cacheConfig.TTL)
+		cache.Set(key, query, ttl)
 	}
 	cacheHit = false
 
@@ -2980,33 +3067,46 @@ func (f *figo) GetCachedQuery(ctx any, conditionType ...string) Query {
 
 // SetPerformanceMonitor sets the performance monitor
 func (f *figo) SetPerformanceMonitor(monitor *PerformanceMonitor) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.monitor = monitor
 }
 
 // GetPerformanceMonitor returns the current performance monitor
 func (f *figo) GetPerformanceMonitor() *PerformanceMonitor {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.monitor
 }
 
 // GetMetrics returns current performance metrics
 func (f *figo) GetMetrics() Metrics {
-	if f.monitor == nil {
+	f.mu.RLock()
+	m := f.monitor
+	f.mu.RUnlock()
+	if m == nil {
 		return Metrics{}
 	}
-	return f.monitor.GetMetrics()
+	return m.GetMetrics()
 }
 
 // ResetMetrics resets all performance metrics
 func (f *figo) ResetMetrics() {
-	if f.monitor != nil {
-		f.monitor.Reset()
+	f.mu.RLock()
+	m := f.monitor
+	f.mu.RUnlock()
+	if m != nil {
+		m.Reset()
 	}
 }
 
 // recordQueryExecution records a query execution for monitoring
 func (f *figo) recordQueryExecution(latency time.Duration, cacheHit bool, err error) {
-	if f.monitor != nil {
-		f.monitor.RecordQuery(latency, cacheHit, err)
+	f.mu.RLock()
+	m := f.monitor
+	f.mu.RUnlock()
+	if m != nil {
+		m.RecordQuery(latency, cacheHit, err)
 	}
 }
 
@@ -3014,21 +3114,31 @@ func (f *figo) recordQueryExecution(latency time.Duration, cacheHit bool, err er
 
 // SetPluginManager sets the plugin manager
 func (f *figo) SetPluginManager(manager *PluginManager) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.pluginManager = manager
 }
 
 // GetPluginManager returns the current plugin manager
 func (f *figo) GetPluginManager() *PluginManager {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	return f.pluginManager
 }
 
 // RegisterPlugin registers a plugin
 func (f *figo) RegisterPlugin(plugin Plugin) error {
+	// Lazily create the manager under the lock so two concurrent first-calls
+	// can't each construct one (with one silently lost). The manager has its own
+	// lock, so call into it without holding f.mu.
+	f.mu.Lock()
 	if f.pluginManager == nil {
 		f.pluginManager = NewPluginManager()
 	}
+	pm := f.pluginManager
+	f.mu.Unlock()
 
-	if err := f.pluginManager.RegisterPlugin(plugin); err != nil {
+	if err := pm.RegisterPlugin(plugin); err != nil {
 		return err
 	}
 
@@ -3038,44 +3148,59 @@ func (f *figo) RegisterPlugin(plugin Plugin) error {
 
 // UnregisterPlugin removes a plugin
 func (f *figo) UnregisterPlugin(name string) error {
-	if f.pluginManager == nil {
+	f.mu.RLock()
+	pm := f.pluginManager
+	f.mu.RUnlock()
+	if pm == nil {
 		return fmt.Errorf("no plugin manager available")
 	}
-	return f.pluginManager.UnregisterPlugin(name)
+	return pm.UnregisterPlugin(name)
 }
 
 // Validation Management Methods
 
 // SetValidationManager sets the validation manager
 func (f *figo) SetValidationManager(manager *ValidationManager) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.validationManager = manager
 }
 
 // GetValidationManager returns the current validation manager
 func (f *figo) GetValidationManager() *ValidationManager {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.validationManager
+}
+
+// validationMgr returns the manager, lazily creating it under the lock so
+// concurrent first-callers can't each construct one (with one lost).
+func (f *figo) validationMgr() *ValidationManager {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.validationManager == nil {
+		f.validationManager = NewValidationManager()
+	}
 	return f.validationManager
 }
 
 // AddValidationRule adds a validation rule
 func (f *figo) AddValidationRule(rule ValidationRule) {
-	if f.validationManager == nil {
-		f.validationManager = NewValidationManager()
-	}
-	f.validationManager.AddRule(rule)
+	f.validationMgr().AddRule(rule)
 }
 
 // RegisterValidator registers a custom validator
 func (f *figo) RegisterValidator(validator Validator) {
-	if f.validationManager == nil {
-		f.validationManager = NewValidationManager()
-	}
-	f.validationManager.RegisterValidator(validator)
+	f.validationMgr().RegisterValidator(validator)
 }
 
 // ValidateField validates a field value
 func (f *figo) ValidateField(field string, value any) error {
-	if f.validationManager == nil {
+	f.mu.RLock()
+	vm := f.validationManager
+	f.mu.RUnlock()
+	if vm == nil {
 		return nil // No validation if no manager
 	}
-	return f.validationManager.Validate(field, value)
+	return vm.Validate(field, value)
 }
