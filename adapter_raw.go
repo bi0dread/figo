@@ -2,11 +2,24 @@ package figo
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
 	"github.com/gobeam/stringy"
 )
+
+// sortedKeys returns the keys of a set-like map in deterministic order, so the
+// generated SQL (column lists, JOIN order) is stable across runs — important for
+// query/plan caching and golden tests.
+func sortedKeys(m map[string]bool) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
 
 // RawPreload represents a built WHERE clause and args for a preload relationship
 type RawPreload struct {
@@ -35,14 +48,10 @@ func BuildRawWhere(f Figo) (string, []any) {
 func BuildRawSelect(f Figo, table string, columns ...string) (string, []any) {
 	cols := "*"
 	// prefer selectFields if provided
-	if len(f.GetSelectFields()) > 0 {
-		fieldList := make([]string, 0, len(f.GetSelectFields()))
-		for name := range f.GetSelectFields() {
-			fieldList = append(fieldList, normalizeColumnName(f, name))
-		}
-		quoted := make([]string, 0, len(fieldList))
-		for _, c := range fieldList {
-			quoted = append(quoted, quoteIdent(c))
+	if sel := f.GetSelectFields(); len(sel) > 0 {
+		quoted := make([]string, 0, len(sel))
+		for _, name := range sortedKeys(sel) {
+			quoted = append(quoted, quoteIdent(normalizeColumnName(f, name)))
 		}
 		cols = strings.Join(quoted, ", ")
 	} else if len(columns) > 0 {
@@ -306,8 +315,9 @@ func buildLimitOffset(f Figo) string {
 	if p.Take > 0 {
 		return fmt.Sprintf("LIMIT %d", p.Take)
 	}
-	// Only offset without limit is unusual; include OFFSET if provided
-	return fmt.Sprintf("OFFSET %d", p.Skip)
+	// OFFSET without LIMIT is a syntax error on MySQL/SQLite, so pair it with the
+	// conventional "unbounded" LIMIT.
+	return fmt.Sprintf("LIMIT 18446744073709551615 OFFSET %d", p.Skip)
 }
 
 func quoteIdent(ident string) string {
@@ -365,14 +375,10 @@ func (RawAdapter) GetQuery(f Figo, ctx any, conditionType ...string) (Query, boo
 func buildByConditions(f Figo, table string, conditionType ...string) (string, []any) {
 	// Determine columns from selectFields; default to *
 	cols := "*"
-	if len(f.GetSelectFields()) > 0 {
-		fieldList := make([]string, 0, len(f.GetSelectFields()))
-		for name := range f.GetSelectFields() {
-			fieldList = append(fieldList, normalizeColumnName(f, name))
-		}
-		quoted := make([]string, 0, len(fieldList))
-		for _, c := range fieldList {
-			quoted = append(quoted, quoteIdent(c))
+	if sel := f.GetSelectFields(); len(sel) > 0 {
+		quoted := make([]string, 0, len(sel))
+		for _, name := range sortedKeys(sel) {
+			quoted = append(quoted, quoteIdent(normalizeColumnName(f, name)))
 		}
 		cols = strings.Join(quoted, ", ")
 	}
@@ -463,10 +469,16 @@ func buildJoins(f Figo) (string, []any) {
 	if len(pre) == 0 {
 		return "", nil
 	}
+	tables := make([]string, 0, len(pre))
+	for table := range pre {
+		tables = append(tables, table)
+	}
+	sort.Strings(tables) // deterministic JOIN order
+
 	parts := make([]string, 0, len(pre))
 	args := make([]any, 0)
-	for table, exprs := range pre {
-		onSQL, onArgs := buildWhereFromExprsQualified(exprs, table)
+	for _, table := range tables {
+		onSQL, onArgs := buildWhereFromExprsQualified(pre[table], table)
 		if onSQL == "" {
 			parts = append(parts, fmt.Sprintf("JOIN %s ON 1=1", quoteIdent(table)))
 			continue

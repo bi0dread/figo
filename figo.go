@@ -436,45 +436,47 @@ func (bp *InMemoryBatchProcessor) ProcessAsync(operations []BatchOperation) <-ch
 
 // executeOperation executes a single operation
 func (bp *InMemoryBatchProcessor) executeOperation(operation BatchOperation) BatchResult {
+	// run performs the actual (synchronous, non-cancellable) work.
+	run := func() BatchResult {
+		r := BatchResult{ID: operation.ID}
+		switch operation.Type {
+		case "sql":
+			r.Result = operation.Query.GetSqlString(operation.Context)
+			r.Success = true
+		case "query":
+			r.Result = operation.Query.GetQuery(operation.Context)
+			r.Success = true
+		case "cached_sql":
+			r.Result = operation.Query.GetCachedSqlString(operation.Context)
+			r.Success = true
+		case "cached_query":
+			r.Result = operation.Query.GetCachedQuery(operation.Context)
+			r.Success = true
+		default:
+			r.Error = fmt.Errorf("unknown operation type: %s", operation.Type)
+		}
+		return r
+	}
+
+	// A non-positive timeout means "no timeout". (The old code applied the timeout
+	// AFTER running the work and flipped a completed result to failed when the
+	// deadline had already passed — so timeout==0 failed every operation.)
+	if bp.timeout <= 0 {
+		return run()
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), bp.timeout)
 	defer cancel()
 
-	result := BatchResult{
-		ID:      operation.ID,
-		Success: false,
-	}
+	done := make(chan BatchResult, 1) // buffered so the goroutine can't leak-block
+	go func() { done <- run() }()
 
-	// Execute based on operation type
-	switch operation.Type {
-	case "sql":
-		sql := operation.Query.GetSqlString(operation.Context)
-		result.Result = sql
-		result.Success = true
-	case "query":
-		query := operation.Query.GetQuery(operation.Context)
-		result.Result = query
-		result.Success = true
-	case "cached_sql":
-		sql := operation.Query.GetCachedSqlString(operation.Context)
-		result.Result = sql
-		result.Success = true
-	case "cached_query":
-		query := operation.Query.GetCachedQuery(operation.Context)
-		result.Result = query
-		result.Success = true
-	default:
-		result.Error = fmt.Errorf("unknown operation type: %s", operation.Type)
-	}
-
-	// Check for timeout
 	select {
+	case r := <-done:
+		return r
 	case <-ctx.Done():
-		result.Error = ctx.Err()
-		result.Success = false
-	default:
+		return BatchResult{ID: operation.ID, Success: false, Error: ctx.Err()}
 	}
-
-	return result
 }
 
 // InMemoryCache implements QueryCache using in-memory storage
@@ -521,8 +523,10 @@ func (c *InMemoryCache) Get(key string) (interface{}, bool) {
 		return nil, false
 	}
 
-	// Check if expired
+	// Check if expired. Delete it here so expired entries don't linger (and
+	// inflate Size) when no periodic cleanup runs — e.g. CleanupInterval <= 0.
 	if time.Now().After(entry.ExpiresAt) {
+		delete(c.entries, key)
 		c.misses++
 		return nil, false
 	}

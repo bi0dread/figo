@@ -191,9 +191,11 @@ func mongoExpr(e Expr) (bson.M, error) {
 	case ILikeExpr:
 		return bson.M{x.Field: primitive.Regex{Pattern: likeToRegexPattern(x.Value), Options: "i"}}, nil
 	case IsNullExpr:
-		return bson.M{x.Field: bson.M{"$exists": false}}, nil
+		// Match both explicit null and missing (SQL IS NULL semantics), not just
+		// missing as {$exists:false} would.
+		return bson.M{x.Field: nil}, nil
 	case NotNullExpr:
-		return bson.M{x.Field: bson.M{"$exists": true}}, nil
+		return bson.M{x.Field: bson.M{"$ne": nil}}, nil
 	case InExpr:
 		return bson.M{x.Field: bson.M{"$in": x.Values}}, nil
 	case NotInExpr:
@@ -205,24 +207,33 @@ func mongoExpr(e Expr) (bson.M, error) {
 		if err != nil {
 			return nil, err
 		}
-		return bson.M{"$and": parts}, nil
+		return logicalBSON("$and", parts), nil
 	case OrExpr:
 		parts, err := mongoOperands(x.Operands, "")
 		if err != nil {
 			return nil, err
 		}
-		return bson.M{"$or": parts}, nil
+		return logicalBSON("$or", parts), nil
 	case NotExpr:
 		parts, err := mongoOperands(x.Operands, "")
 		if err != nil {
 			return nil, err
 		}
-		return bson.M{"$nor": parts}, nil
+		return logicalBSON("$nor", parts), nil
 	case OrderBy:
 		return bson.M{}, nil
 	default:
 		return nil, fmt.Errorf("figo: unsupported expression type %T for the MongoDB adapter", e)
 	}
+}
+
+// logicalBSON wraps rendered operands under a logical operator, avoiding an
+// invalid "{$and: null}" (Mongo rejects an empty/nil operand array).
+func logicalBSON(op string, parts []bson.M) bson.M {
+	if len(parts) == 0 {
+		return bson.M{}
+	}
+	return bson.M{op: parts}
 }
 
 func mongoExprQualified(e Expr, qualifier string) (bson.M, error) {
@@ -251,9 +262,9 @@ func mongoExprQualified(e Expr, qualifier string) (bson.M, error) {
 	case ILikeExpr:
 		return bson.M{q(x.Field): primitive.Regex{Pattern: likeToRegexPattern(x.Value), Options: "i"}}, nil
 	case IsNullExpr:
-		return bson.M{q(x.Field): bson.M{"$exists": false}}, nil
+		return bson.M{q(x.Field): nil}, nil
 	case NotNullExpr:
-		return bson.M{q(x.Field): bson.M{"$exists": true}}, nil
+		return bson.M{q(x.Field): bson.M{"$ne": nil}}, nil
 	case InExpr:
 		return bson.M{q(x.Field): bson.M{"$in": x.Values}}, nil
 	case NotInExpr:
@@ -265,19 +276,19 @@ func mongoExprQualified(e Expr, qualifier string) (bson.M, error) {
 		if err != nil {
 			return nil, err
 		}
-		return bson.M{"$and": parts}, nil
+		return logicalBSON("$and", parts), nil
 	case OrExpr:
 		parts, err := mongoOperands(x.Operands, qualifier)
 		if err != nil {
 			return nil, err
 		}
-		return bson.M{"$or": parts}, nil
+		return logicalBSON("$or", parts), nil
 	case NotExpr:
 		parts, err := mongoOperands(x.Operands, qualifier)
 		if err != nil {
 			return nil, err
 		}
-		return bson.M{"$nor": parts}, nil
+		return logicalBSON("$nor", parts), nil
 	case OrderBy:
 		return bson.M{}, nil
 	default:
