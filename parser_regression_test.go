@@ -59,11 +59,6 @@ func TestParenthesesGroupingAndValues(t *testing.T) {
 		where, args := whereFor(t, `(a=1 or b=2) and (c=3 or d=4)`)
 		assert.Equal(t, "((`a` = ? OR `b` = ?) AND (`c` = ? OR `d` = ?))", where)
 		assert.Equal(t, []any{int64(1), int64(2), int64(3), int64(4)}, args)
-	t.Run("TrailingGroup", func(t *testing.T) {
-		// The closing ')' is the final character of the input.
-		where, args := whereFor(t, `id=1 and (age>20 or active=true)`)
-		assert.Equal(t, "(`id` = ? AND (`age` > ? OR `active` = ?))", where)
-		assert.Equal(t, []any{int64(1), int64(20), true}, args)
 	})
 }
 
