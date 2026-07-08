@@ -990,6 +990,7 @@ type Figo interface {
 	Build(adapter ...Adapter)
 	Explain() string
 	Clone() Figo
+	Walk(visit func(Expr))
 }
 
 type Adapter interface {
