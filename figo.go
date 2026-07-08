@@ -959,6 +959,7 @@ type Figo interface {
 	GetCachedQuery(ctx any, conditionType ...string) Query
 	Build()
 	Explain() string
+	Clone() Figo
 }
 
 type Adapter interface {
