@@ -1371,7 +1371,16 @@ outerLoop:
 							i = k
 							continue
 						}
-						content := v[labelIndex+len(loadLabel) : len(v)-1]
+						// The content slice below assumes v ends with ']'. Guard the
+						// bounds so a malformed/unclosed bracket (e.g. "load=[") is
+						// skipped rather than panicking with slice-out-of-range.
+						start := labelIndex + len(loadLabel)
+						end := len(v) - 1
+						if bracketCount != 0 || !strings.HasSuffix(v, "]") || start > end {
+							i = k
+							continue
+						}
+						content := v[start:end]
 						if content == "" {
 							i = k
 							continue

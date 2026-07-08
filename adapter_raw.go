@@ -3,6 +3,7 @@ package figo
 import (
 	"fmt"
 	"strings"
+	"time"
 
 	"github.com/gobeam/stringy"
 )
@@ -127,14 +128,18 @@ func exprToSQL(e Expr) (string, []any) {
 		return fmt.Sprintf("%s IS NOT NULL", quoteIdent(x.Field)), nil
 	case InExpr:
 		if len(x.Values) == 0 {
-			return "", nil
+			// An empty IN set matches nothing. Returning "" would drop the whole
+			// predicate (WHERE disappears), turning a match-nothing filter into a
+			// match-everything one — a filter/authorization bypass.
+			return "1=0", nil
 		}
 		placeholders := strings.Repeat("?,", len(x.Values))
 		placeholders = placeholders[:len(placeholders)-1]
 		return fmt.Sprintf("%s IN (%s)", quoteIdent(x.Field), placeholders), append([]any{}, x.Values...)
 	case NotInExpr:
 		if len(x.Values) == 0 {
-			return "", nil
+			// "NOT IN (empty set)" is true for every row.
+			return "1=1", nil
 		}
 		placeholders := strings.Repeat("?,", len(x.Values))
 		placeholders = placeholders[:len(placeholders)-1]
@@ -190,14 +195,16 @@ func exprToSQLQualified(e Expr, qualifier string) (string, []any) {
 		return fmt.Sprintf("%s IS NOT NULL", qcol(x.Field)), nil
 	case InExpr:
 		if len(x.Values) == 0 {
-			return "", nil
+			// Empty IN set matches nothing; see exprToSQL for rationale.
+			return "1=0", nil
 		}
 		placeholders := strings.Repeat("?,", len(x.Values))
 		placeholders = placeholders[:len(placeholders)-1]
 		return fmt.Sprintf("%s IN (%s)", qcol(x.Field), placeholders), append([]any{}, x.Values...)
 	case NotInExpr:
 		if len(x.Values) == 0 {
-			return "", nil
+			// "NOT IN (empty set)" is true for every row.
+			return "1=1", nil
 		}
 		placeholders := strings.Repeat("?,", len(x.Values))
 		placeholders = placeholders[:len(placeholders)-1]
@@ -304,8 +311,11 @@ func buildLimitOffset(f Figo) string {
 }
 
 func quoteIdent(ident string) string {
-	// basic quoting; assumes ident does not contain backticks
-	return "`" + ident + "`"
+	// Escape embedded backticks by doubling them (MySQL/SQLite identifier rule).
+	// Without this, a crafted field/table name can break out of the quoting and
+	// inject SQL — and identifiers can't be parametrized, so this is the only
+	// defense on both the GetSqlString and GetQuery paths.
+	return "`" + strings.ReplaceAll(ident, "`", "``") + "`"
 }
 
 // AdapterRawGetSql is an internal helper to integrate with figo.GetSqlString
@@ -535,18 +545,25 @@ func toSQLLiteral(v any) string {
 			return "TRUE"
 		}
 		return "FALSE"
+	case time.Time:
+		// Render as a SQL datetime literal, not Go's "... +0000 UTC" String().
+		return "'" + x.Format("2006-01-02 15:04:05") + "'"
 	case string:
-		return fmt.Sprintf("\"%s\"", escapeSQLString(x))
+		return "'" + escapeSQLString(x) + "'"
 	default:
 		// Fallback: quote stringified value
-		return fmt.Sprintf("\"%s\"", escapeSQLString(fmt.Sprintf("%v", x)))
+		return "'" + escapeSQLString(fmt.Sprintf("%v", x)) + "'"
 	}
 }
 
+// escapeSQLString escapes a value for embedding in a single-quoted SQL string
+// literal. NOTE: this interpolated path (GetSqlString) is inherently riskier
+// than parametrized queries — prefer GetQuery. We double single quotes per ANSI
+// SQL and also escape backslashes because MySQL's default mode treats '\' as an
+// escape character (a trailing '\' could otherwise escape the closing quote).
 func escapeSQLString(s string) string {
-	// Minimal escaping: backslash and double-quote
 	s = strings.ReplaceAll(s, "\\", "\\\\")
-	s = strings.ReplaceAll(s, "\"", "\\\"")
+	s = strings.ReplaceAll(s, "'", "''")
 	return s
 }
 
