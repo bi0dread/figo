@@ -1,580 +1,709 @@
-# Go Dynamic Query Builder Library (figo) v3
+# figo — Go Dynamic Query Builder (v3)
 
-The figo package provides a robust mechanism for building dynamic filters across multiple database systems using a unified domain-specific language (DSL). It simplifies the process of defining complex filters and converting them into database-specific queries, offering a powerful tool for creating flexible and maintainable data access layers.
+figo turns a compact, database-agnostic filter DSL into concrete queries for **GORM**, **raw SQL**, **MongoDB**, and **Elasticsearch**. You parse one filter string (typically straight from an HTTP query parameter) into an internal expression AST, then let an adapter render it for whichever backend you target.
 
-### Package Name
+```
+"status=active and age<bet>(18..65) sort=created_at:desc page=skip:0,take:20"
+        │
+        ▼   parse → AST → adapter
+  GORM │ Raw SQL │ MongoDB │ Elasticsearch
+```
 
-figo
+- **Package:** `github.com/bi0dread/figo/v3`
+- **Go:** 1.23+
 
-### Installation
+## Installation
+
 ```bash
 go get github.com/bi0dread/figo/v3
 ```
 
-## Features
+## Table of contents
 
-* **DSL-Based Filter Parsing** - Easily construct complex filters using a concise DSL format
-* **Multi-Database Support** - GORM, Raw SQL, MongoDB, and Elasticsearch adapters
-* **Rich Operations** - Support for all common database operations across all adapters
-* **Type-Safe Parsing** - Automatic type detection for numbers, booleans, and strings
-* **Complex Expressions** - Nested parentheses and logical operators with full support
-* **Operator Precedence** - Correct precedence handling (NOT > AND > OR) for complex expressions
-* **Input Validation & Repair** - Automatic detection and fixing of malformed input
-* **Elasticsearch Integration** - Full Elasticsearch Query DSL support with real-time testing
-* **Performance Optimized** - High-performance query generation (970K+ queries/sec)
-* **Concurrency Safe** - Thread-safe operations with mutex protection
-* **Memory Efficient** - Optimized memory usage with minimal allocations
-* **Production Ready** - Comprehensive test coverage with 1,000+ records tested
-* **Bug-Free Implementation** - Thoroughly audited and tested across all operators
+- [Core concept: parse once, render per adapter](#core-concept-parse-once-render-per-adapter)
+- [Quick start](#quick-start)
+- [The DSL](#the-dsl)
+  - [Comparison operators](#comparison-operators)
+  - [Pattern matching (LIKE / regex)](#pattern-matching-like--regex)
+  - [Set, range, and null operators](#set-range-and-null-operators)
+  - [Logical operators and precedence](#logical-operators-and-precedence)
+  - [Directives: sort, page, load](#directives-sort-page-load)
+  - [Value typing rules](#value-typing-rules)
+- [Building filters programmatically (`AddFilter`)](#building-filters-programmatically-addfilter)
+- [Adapters](#adapters)
+  - [GORM](#gorm-adapter)
+  - [Raw SQL](#raw-sql-adapter)
+  - [MongoDB](#mongodb-adapter)
+  - [Elasticsearch](#elasticsearch-adapter)
+- [The `Figo` API](#the-figo-api)
+- [Field safety: ignore lists & whitelist](#field-safety-ignore-lists--whitelist)
+- [Naming strategies](#naming-strategies)
+- [Inspecting & transforming the AST](#inspecting--transforming-the-ast)
+- [Caching](#caching)
+- [Performance monitoring](#performance-monitoring)
+- [Plugins](#plugins)
+- [Validation](#validation)
+- [Batch processing](#batch-processing)
+- [Input validation & repair](#input-validation--repair)
+- [Concurrency](#concurrency)
+- [Testing](#testing)
+- [Status of features](#status-of-features)
+- [Contributing](#contributing)
+- [License](#license)
 
-## Quick Start
+## Core concept: parse once, render per adapter
+
+A `Figo` instance is a mutable filter builder. The lifecycle is always:
+
+1. **`figo.New()`** — construct an instance (no adapter argument).
+2. **`AddFiltersFromString(dsl)`** — hand it a DSL string. This stores the DSL; it does **not** parse yet. Calling it again **replaces** the previous DSL.
+3. **`Build(adapter)`** — parse the DSL into an AST and select the adapter. `Build` is idempotent: calling it again rebuilds cleanly (clauses, preloads, and sort are reset from the DSL each time).
+4. **`GetSqlString` / `GetQuery`** (or an adapter helper like `BuildRawSelect`) — render the query.
+
+```go
+f := figo.New()
+f.AddFiltersFromString(`status="active" and age>18`)
+f.Build(figo.RawAdapter{})
+
+where, args := figo.BuildRawWhere(f)
+// where: "(`status` = ? AND `age` > ?)"
+// args:  []any{"active", int64(18)}
+```
+
+> **Note:** `New()` takes no adapter. Supply it at `Build(adapter)` or via `SetAdapterObject(adapter)`. Calling `Build()` with no argument keeps whatever adapter was set previously.
+
+## Quick start
+
+### GORM
 
 ```go
 package main
 
 import (
-    "fmt"
-    "github.com/bi0dread/figo/v3"
-    "gorm.io/driver/sqlite"
-    "gorm.io/gorm"
+	"fmt"
+
+	"github.com/bi0dread/figo/v3"
+	"gorm.io/driver/sqlite"
+	"gorm.io/gorm"
 )
 
+type User struct {
+	ID     uint
+	Name   string
+	Age    int
+	Status string
+}
+
 func main() {
-    // Initialize GORM
-    db, err := gorm.Open(sqlite.Open("test.db"), &gorm.Config{})
-    if err != nil {
-        panic("failed to connect database")
-    }
+	db, _ := gorm.Open(sqlite.Open("test.db"), &gorm.Config{})
+	_ = db.AutoMigrate(&User{})
 
-    // Create a Figo instance
-    f := figo.New()
+	f := figo.New()
+	f.AddFiltersFromString(`status="active" and age>=18 sort=age:desc page=skip:0,take:20`)
+	f.Build(figo.GormAdapter{})
 
-    // Add filters from DSL
-    f.AddFiltersFromString(`(id=1 and vendorId=22) and bank_id>11 or expedition_type="eq" load=[TestInner1:id=3 or name=test1 | TestInner2:id=4] sort=id:desc page=skip:0,take:10`)
+	// Apply figo's filters, sort, and pagination onto a *gorm.DB and execute.
+	var users []User
+	figo.ApplyGorm(f, db.Model(&User{})).Find(&users)
 
-    // Build with the adapter, and apply
-    f.Build(figo.GormAdapter{})
-    db = figo.ApplyGorm(f, db)
-
-    // Execute query
-    var results []map[string]any
-    db.Find(&results)
-    fmt.Println("Query Results:", results)
+	fmt.Println(users)
 }
 ```
 
-> `New()` takes no adapter — supply it at build time with
-> `Build(figo.GormAdapter{})` (or via `SetAdapterObject`). Calling `Build()` with
-> no adapter keeps whatever was set previously.
+## The DSL
 
-## Supported Operations
+A filter is a sequence of space-separated tokens: `field<operator>value` terms, the bare keywords `and` / `or` / `not`, parentheses for grouping, and the `sort=` / `page=` / `load=` directives. Whitespace (spaces, tabs, newlines) separates tokens; put a value in double quotes to keep whitespace or operator characters literal.
 
-The figo package supports a comprehensive set of database operations across all adapters (GORM, Raw SQL, MongoDB, Elasticsearch). All operations are fully tested and production-ready.
-
-### Basic Comparison Operators
-
-| Operation | DSL Example | SQL Result | MongoDB Result | Elasticsearch Result | Description |
-|-----------|-------------|------------|----------------|---------------------|-------------|
-| `=` | `id=10` | `WHERE id = 10` | `{"id": 10}` | `{"term": {"id": 10}}` | Equals |
-| `>` | `age>18` | `WHERE age > 18` | `{"age": {"$gt": 18}}` | `{"range": {"age": {"gt": 18}}}` | Greater Than |
-| `>=` | `score>=80` | `WHERE score >= 80` | `{"score": {"$gte": 80}}` | `{"range": {"score": {"gte": 80}}}` | Greater Than or Equal |
-| `<` | `price<100` | `WHERE price < 100` | `{"price": {"$lt": 100}}` | `{"range": {"price": {"lt": 100}}}` | Less Than |
-| `<=` | `count<=5` | `WHERE count <= 5` | `{"count": {"$lte": 5}}` | `{"range": {"count": {"lte": 5}}}` | Less Than or Equal |
-| `!=` | `status!="deleted"` | `WHERE status != 'deleted'` | `{"status": {"$ne": "deleted"}}` | `{"bool": {"must_not": {"term": {"status": "deleted"}}}}` | Not Equal |
-
-### String Pattern Matching
-
-| Operation | DSL Example | SQL Result | MongoDB Result | Elasticsearch Result | Description |
-|-----------|-------------|------------|----------------|---------------------|-------------|
-| `=^` | `name=^"%john%"` | `WHERE name LIKE '%john%'` | `{"name": {"$regex": "john", "$options": "i"}}` | `{"wildcard": {"name": "*john*"}}` | LIKE (Case-insensitive) |
-| `!=^` | `name!=^"%admin%"` | `WHERE name NOT LIKE '%admin%'` | `{"name": {"$not": {"$regex": "admin", "$options": "i"}}}` | `{"bool": {"must_not": {"wildcard": {"name": "*admin*"}}}}` | NOT LIKE |
-| `=~` | `email=~"^[a-z]+@gmail\.com$"` | `WHERE email REGEXP '^[a-z]+@gmail\.com$'` | `{"email": {"$regex": "^[a-z]+@gmail\\.com$"}}` | `{"regexp": {"email": "^[a-z]+@gmail\\.com$"}}` | Regex Match |
-| `!=~` | `phone!=~"^\+1"` | `WHERE phone NOT REGEXP '^\+1'` | `{"phone": {"$not": {"$regex": "^\\+1"}}}` | `{"bool": {"must_not": {"regexp": {"phone": "^\\+1"}}}}` | Regex Not Match |
-
-### Set Operations
-
-| Operation | DSL Example | SQL Result | MongoDB Result | Elasticsearch Result | Description |
-|-----------|-------------|------------|----------------|---------------------|-------------|
-| `<in>` | `id<in>[1,2,3,4,5]` | `WHERE id IN (1,2,3,4,5)` | `{"id": {"$in": [1,2,3,4,5]}}` | `{"terms": {"id": [1,2,3,4,5]}}` | Value in List |
-| `<nin>` | `status<nin>["deleted","archived"]` | `WHERE status NOT IN ('deleted','archived')` | `{"status": {"$nin": ["deleted","archived"]}}` | `{"bool": {"must_not": {"terms": {"status": ["deleted","archived"]}}}}` | Value not in List |
-
-### Range Operations
-
-| Operation | DSL Example | SQL Result | MongoDB Result | Elasticsearch Result | Description |
-|-----------|-------------|------------|----------------|---------------------|-------------|
-| `<bet>` | `price<bet>(10..100)` | `WHERE price BETWEEN 10 AND 100` | `{"price": {"$gte": 10, "$lte": 100}}` | `{"range": {"price": {"gte": 10, "lte": 100}}}` | Between Range (inclusive) |
-
-### Null Operations
-
-| Operation | DSL Example | SQL Result | MongoDB Result | Elasticsearch Result | Description |
-|-----------|-------------|------------|----------------|---------------------|-------------|
-| `<null>` | `deleted_at<null>` | `WHERE deleted_at IS NULL` | `{"deleted_at": null}` | `{"bool": {"must_not": {"exists": {"field": "deleted_at"}}}}` | Is Null |
-| `<notnull>` | `updated_at<notnull>` | `WHERE updated_at IS NOT NULL` | `{"updated_at": {"$ne": null}}` | `{"exists": {"field": "updated_at"}}` | Is Not Null |
-
-### Logical Operators
-
-| Operation | DSL Example | SQL Result | MongoDB Result | Elasticsearch Result | Description |
-|-----------|-------------|------------|----------------|---------------------|-------------|
-| `and` | `id=1 and status="active"` | `WHERE id = 1 AND status = 'active'` | `{"$and": [{"id": 1}, {"status": "active"}]}` | `{"bool": {"must": [{"term": {"id": 1}}, {"term": {"status": "active"}}]}}` | Logical AND |
-| `or` | `name="john" or name="jane"` | `WHERE name = 'john' OR name = 'jane'` | `{"$or": [{"name": "john"}, {"name": "jane"}]}` | `{"bool": {"should": [{"term": {"name": "john"}}, {"term": {"name": "jane"}}]}}` | Logical OR |
-| `not` | `not (deleted=true)` | `WHERE NOT (deleted = true)` | `{"$nor": [{"deleted": true}]}` | `{"bool": {"must_not": {"term": {"deleted": true}}}}` | Logical NOT |
-
-### Operator Precedence
-
-The figo package correctly handles operator precedence in complex expressions:
-
-**Precedence Order (highest to lowest):**
-1. `NOT` - Highest precedence
-2. `AND` - Medium precedence  
-3. `OR` - Lowest precedence
-
-**Examples:**
-
-```go
-// NOT has highest precedence
-f.AddFiltersFromString(`not (id=1 and name="john") or status="active"`)
-// Parsed as: (NOT (id=1 AND name="john")) OR status="active"
-
-// AND has higher precedence than OR
-f.AddFiltersFromString(`id=1 and name="john" or age>25 and status="active"`)
-// Parsed as: (id=1 AND name="john") OR (age>25 AND status="active")
-
-// Parentheses override precedence
-f.AddFiltersFromString(`(id=1 or id=2) and (name="john" or name="jane")`)
-// Parsed as: (id=1 OR id=2) AND (name="john" OR name="jane")
+```
+name="John Doe" and (age>18 or vip=true) and status<nin>["banned","deleted"]
 ```
 
-### Special Operations
+### Comparison operators
 
-| Operation | DSL Example | SQL Result | MongoDB Result | Elasticsearch Result | Description |
-|-----------|-------------|------------|----------------|---------------------|-------------|
-| `sort=` | `sort=name:asc,age:desc` | `ORDER BY name ASC, age DESC` | `{"name": 1, "age": -1}` | `[{"name": {"order": "asc"}}, {"age": {"order": "desc"}}]` | Sorting |
-| `page=` | `page=skip:10,take:5` | `LIMIT 5 OFFSET 10` | `{"limit": 5, "skip": 10}` | `{"from": 10, "size": 5}` | Pagination |
-| `load=` | `load=[User:name="john" \| Profile:bio=^"%dev%"]` | `JOIN users ON ... JOIN profiles ON ...` | `{"$lookup": {...}}` | `{"_source": ["field1", "field2"]}` | Preloading/Joins |
+| Op | DSL | Meaning |
+|----|-----|---------|
+| `=` | `id=10` | Equals |
+| `!=` | `status!="deleted"` | Not equal |
+| `>` | `age>18` | Greater than |
+| `>=` | `score>=80` | Greater than or equal |
+| `<` | `price<100` | Less than |
+| `<=` | `count<=5` | Less than or equal |
 
-### Data Type Support
+### Pattern matching (LIKE / regex)
 
-| Type | DSL Example | Parsed Value | Description |
-|------|-------------|--------------|-------------|
-| **Integer** | `id=123` | `int64(123)` | Unquoted numbers |
-| **Float** | `price=99.99` | `float64(99.99)` | Decimal numbers |
-| **Boolean** | `active=true` | `bool(true)` | Unquoted true/false |
-| **String (Quoted)** | `name="john"` | `string("john")` | Quoted strings |
-| **String (Unquoted)** | `status=active` | `string("active")` | Unquoted strings |
-| **Null** | `deleted_at<null>` | `nil` | Null values |
-| **Array** | `id<in>[1,2,3]` | `[]any{1,2,3}` | Comma-separated lists |
+| Op | DSL | Meaning |
+|----|-----|---------|
+| `=^` | `name=^"%john%"` | LIKE (`%` = any run, `_` = one char) |
+| `!=^` | `name!=^"%admin%"` | NOT LIKE |
+| `.=^` | `name.=^"%john%"` | Case-insensitive LIKE (ILIKE) |
+| `=~` | `email=~"^[a-z]+@x\.com$"` | Regex match |
+| `!=~` | `phone!=~"^\+1"` | Regex not match |
 
-### Regex Configuration
+Per-backend translation of `=^`:
 
-The regex operators (`=~`, `!=~`) can be configured for different SQL dialects:
+| Backend | Output |
+|---------|--------|
+| Raw SQL / GORM | `col LIKE ?` (arg `%john%`) |
+| MongoDB | anchored, metachar-escaped regex `^.*john.*$` |
+| Elasticsearch | `wildcard` query `*john*` (literal `*`/`?` in the value are escaped) |
+
+### Set, range, and null operators
+
+| Op | DSL | Meaning |
+|----|-----|---------|
+| `<in>` | `id<in>[1,2,3]` | Value in list |
+| `<nin>` | `status<nin>["a","b"]` | Value not in list |
+| `<bet>` | `price<bet>(10..100)` | Inclusive range |
+| `<null>` | `deleted_at<null>` | IS NULL |
+| `<notnull>` | `updated_at<notnull>` | IS NOT NULL |
+
+`x=null` and `x!=null` are shorthand for `<null>` / `<notnull>` — an unquoted `null` value becomes IS NULL / IS NOT NULL rather than a comparison against a literal.
+
+An **empty** `<in>[]` list is safe on every adapter: it renders a match-nothing predicate (SQL `1=0`, ES `match_none`, Mongo `$in: []`) instead of dropping the condition. Empty `<nin>[]` matches everything.
+
+### Logical operators and precedence
+
+`and`, `or`, `not` combine terms. Precedence, highest to lowest:
+
+1. `not`
+2. `and`
+3. `or`
 
 ```go
-// MySQL (default)
-f.SetRegexSQLOperator("REGEXP")
+f.AddFiltersFromString(`a=1 and b=2 or c=3`)
+// (a=1 AND b=2) OR c=3
 
-// PostgreSQL
-f.SetRegexSQLOperator("~")      // Case-sensitive
-f.SetRegexSQLOperator("~*")     // Case-insensitive
+f.AddFiltersFromString(`not deleted=true and active=true`)
+// (NOT deleted=true) AND active=true
 
-// SQLite
-f.SetRegexSQLOperator("REGEXP")
+f.AddFiltersFromString(`(a=1 or a=2) and (b=3 or b=4)`)
+// parentheses override precedence
 ```
 
-## Complex Filter Examples
+**`not` semantics are uniform across adapters:** `not` over multiple operands means *none of them match* — `NOT (a OR b)` in SQL, `$nor` in MongoDB, `must_not` over all operands in Elasticsearch, `clause.Not` in GORM. The DSL only ever produces single-operand `not`; multi-operand forms come from building the AST directly with `AddFilter`.
 
-### Nested Parentheses
+A leading `not` (`not deleted=true`) is valid and preserved across all entry paths, including the repair path.
+
+### Directives: sort, page, load
+
+| Directive | DSL | Effect |
+|-----------|-----|--------|
+| `sort=` | `sort=name:asc,created_at:desc` | Ordering (multiple columns, comma-separated) |
+| `page=` | `page=skip:10,take:5` | Pagination (skip/offset + take/limit) |
+| `load=` | `load=[Orders:total>100 \| Profile:bio=^"%dev%"]` | Preloads / joins with their own filters |
+
+`load=` segments are separated by `|`; each is `Relation:filter`, where `filter` is itself a DSL expression. `take:0` and `skip:0` mean "no limit"/"no offset" consistently across adapters (GORM will **not** emit `LIMIT 0`).
+
+Field names that merely *start* with a directive keyword (`sortOrder`, `pageCount`, `loadedAt`) are treated as ordinary fields — the `=` after the keyword is required for it to be a directive.
+
+### Value typing rules
+
+figo types each literal exactly once, and **quoting is how you keep a value a string**:
+
+| DSL | Parsed value | Go type |
+|-----|--------------|---------|
+| `id=123` | `123` | `int64` |
+| `price=9.99` | `9.99` | `float64` |
+| `active=true` | `true` | `bool` |
+| `x=null` | IS NULL predicate | — |
+| `created=2023-01-02` | `2023-01-02` parsed | `time.Time` |
+| `code="0123"` | `"0123"` | `string` (quoting preserves it) |
+| `flag="true"` | `"true"` | `string` |
+| `status=active` | `"active"` | `string` (unquoted, non-numeric) |
+| `id<in>[1,"2",3]` | `[1, "2", 3]` | `[]any` (per-element typing) |
+
+Consequences worth knowing:
+
+- **Quoted numeric-looking values stay strings** — `code="0123"` is `"0123"`, not `123`. Use this for zip codes, phone numbers, and IDs with leading zeros.
+- **Unquoted dates** in common formats (`2006-01-02`, RFC3339, `01/02/2006`, …) parse to `time.Time`. Date format detection tries US (`MM/DD/YYYY`) before EU (`DD/MM/YYYY`) for ambiguous slash dates.
+- **Integers larger than int64** are kept as strings rather than silently degrading to a lossy `float64`.
+
+`ParseFieldsValue(str)` exposes this same single-value typing if you need it outside the DSL (e.g. to coerce one incoming parameter the way figo would):
 
 ```go
-// Complex nested expression
-f.AddFiltersFromString(`((name > "a" and age < 30) or (status = "active" and score > 80)) and (deleted_at <null> or updated_at > "2023-01-01")`)
-// SQL: WHERE (((name > 'a' AND age < 30) OR (status = 'active' AND score > 80)) AND (deleted_at IS NULL OR updated_at > '2023-01-01'))
+f.ParseFieldsValue("123")       // int64(123)
+f.ParseFieldsValue(`"123"`)     // "123" (quoted -> string)
+f.ParseFieldsValue("true")      // true
+f.ParseFieldsValue("2023-01-02") // time.Time
 ```
 
-### Mixed Data Types
+## Building filters programmatically (`AddFilter`)
+
+Sometimes you don't want to build a DSL string — you already have typed values (from a struct, a form, another query layer) and want to add conditions directly. `AddFilter(exp Expr)` appends a node to the AST, bypassing the parser. You can use it on its own or mix it with a DSL.
 
 ```go
-// Numbers, strings, booleans, and dates
-f.AddFiltersFromString(`id > 100 and name = "test" and price < 99.99 and active = true and created_at > "2023-01-01"`)
-// SQL: WHERE id > 100 AND name = 'test' AND price < 99.99 AND active = true AND created_at > '2023-01-01'
+f := figo.New()
+f.AddFilter(figo.EqExpr{Field: "status", Value: "active"})
+f.AddFilter(figo.BetweenExpr{Field: "age", Low: int64(18), High: int64(65)})
+f.Build(figo.RawAdapter{})
+
+where, args := figo.BuildRawWhere(f)
+// where: "`status` = ? AND `age` BETWEEN ? AND ?"
+// args:  []any{"active", int64(18), int64(65)}
 ```
 
-### Field Names with Underscores
+Multiple `AddFilter` clauses are combined with **AND** at the top level.
+
+### Expression types
+
+Every node implements the `figo.Expr` interface. Values are used as-is (no re-parsing), so pass real Go types.
+
+| Constructor | Fields | Renders as |
+|-------------|--------|------------|
+| `EqExpr` | `Field, Value any` | `field = ?` |
+| `NeqExpr` | `Field, Value any` | `field != ?` |
+| `GtExpr` / `GteExpr` | `Field, Value any` | `field > ?` / `>=` |
+| `LtExpr` / `LteExpr` | `Field, Value any` | `field < ?` / `<=` |
+| `LikeExpr` | `Field, Value any` | `field LIKE ?` |
+| `ILikeExpr` | `Field, Value any` | case-insensitive LIKE |
+| `RegexExpr` | `Field, Value any` | regex match |
+| `InExpr` | `Field string, Values []any` | `field IN (…)` |
+| `NotInExpr` | `Field string, Values []any` | `field NOT IN (…)` |
+| `BetweenExpr` | `Field string, Low, High any` | `field BETWEEN ? AND ?` |
+| `IsNullExpr` | `Field string` | `field IS NULL` |
+| `NotNullExpr` | `Field string` | `field IS NOT NULL` |
+| `AndExpr` | `Operands []Expr` | `(a AND b AND …)` |
+| `OrExpr` | `Operands []Expr` | `(a OR b OR …)` |
+| `NotExpr` | `Operands []Expr` | `NOT (a OR b …)` — none of the operands match |
+
+Nest the logical types to express any structure:
 
 ```go
-// Complex field names
-f.AddFiltersFromString(`user_id > 1 and user_name = "john" and user_email_address =^ "%@gmail.com"`)
-// SQL: WHERE user_id > 1 AND user_name = 'john' AND user_email_address LIKE '%@gmail.com'
+// (role = "admin" OR role = "mod") AND NOT (banned = true)
+f.AddFilter(figo.AndExpr{Operands: []figo.Expr{
+	figo.OrExpr{Operands: []figo.Expr{
+		figo.EqExpr{Field: "role", Value: "admin"},
+		figo.EqExpr{Field: "role", Value: "mod"},
+	}},
+	figo.NotExpr{Operands: []figo.Expr{
+		figo.EqExpr{Field: "banned", Value: true},
+	}},
+}})
 ```
 
-### Special Characters and Unicode
+### Ordering matters: call `AddFilter` *after* `Build()`
+
+`Build()` recompiles the AST from the DSL and, when a DSL is present, **resets the clause list** first. So an `AddFilter` call made *before* `Build()` is discarded if there's also a DSL. Two safe patterns:
 
 ```go
-// Unicode and special characters
-f.AddFiltersFromString(`name = "O'Connor" and description =^ "%test%"`)
-// SQL: WHERE name = 'O''Connor' AND description LIKE '%test%'
+// A) No DSL — AddFilter only. Build() with an empty DSL keeps your clauses.
+f := figo.New()
+f.AddFilter(figo.EqExpr{Field: "status", Value: "active"})
+f.Build(figo.RawAdapter{})            // clauses preserved
+
+// B) DSL + programmatic — add AFTER Build so it isn't wiped.
+f := figo.New()
+f.AddFiltersFromString(`name="x"`)
+f.Build(figo.RawAdapter{})
+f.AddFilter(figo.InExpr{Field: "role", Values: []any{"admin", "mod"}})
+where, _ := figo.BuildRawWhere(f)     // "`name` = ? AND `role` IN (?,?)"
 ```
 
-### Numeric Edge Cases
+`AddFilter` clauses are still subject to the [ignore list and whitelist](#field-safety-ignore-lists--whitelist) — a disallowed or ignored field is pruned just as it would be from DSL input.
+
+## Adapters
+
+All adapters consume the same AST. Pass one to `Build()` (or `SetAdapterObject`), then use `GetSqlString` / `GetQuery` or the adapter's package-level helpers.
+
+`GetQuery(ctx)` returns a backend-specific value (all implement the `figo.Query` interface); type-assert to the concrete type:
+
+| Adapter | `ctx` argument | `GetQuery` returns |
+|---------|----------------|--------------------|
+| `RawAdapter{}` | table name `string` or `RawContext{Table}` | `SQLQuery{SQL, Args}` |
+| `GormAdapter{}` | `*gorm.DB` | `SQLQuery{SQL, Args}` |
+| `MongoAdapter{}` | `nil`, or `"AGG"` + joins for aggregation | `MongoFindQuery{Filter, Options}` / `MongoAggregateQuery{Pipeline, Options}` |
+| `ElasticsearchAdapter{}` | `nil` | `ElasticsearchQueryWrapper{Query}` |
+
+### GORM adapter
 
 ```go
-// Zero values and negative numbers
-f.AddFiltersFromString(`id = 0 and price = 0.0 and discount = -10.5`)
-// SQL: WHERE id = 0 AND price = 0.0 AND discount = -10.5
+f := figo.New()
+f.AddFiltersFromString(`status="active" and age>=18 sort=age:desc page=skip:0,take:20`)
+f.Build(figo.GormAdapter{})
+
+// Option A: apply onto a *gorm.DB and execute yourself
+var users []User
+figo.ApplyGorm(f, db.Model(&User{})).Find(&users)
+
+// Option B: render the SQL string (DryRun) for logging/inspection
+sql := f.GetSqlString(db.Model(&User{}))           // full SELECT
+where := f.GetSqlString(db.Model(&User{}), "WHERE") // just the WHERE segment
+
+// Option C: get placeholder SQL + args
+q := f.GetQuery(db.Model(&User{})).(figo.SQLQuery)
+// q.SQL, q.Args
 ```
 
-### Complex Operators with Spaces
+`ApplyGorm` sets limit/offset, select fields, preloads, where clauses, and sort. A `*gorm.DB` that already carries a caller scope (e.g. a tenant filter `db.Where("org_id = ?", id)`) keeps that scope — figo's filters are applied **on top of** it, not instead of it.
+
+### Raw SQL adapter
+
+Targets MySQL/SQLite dialect (backtick identifiers, `?` placeholders).
 
 ```go
-// All complex operators in one expression
-f.AddFiltersFromString(`name =^ "%test%" and id <in> [1,2,3,4,5] and status <nin> ["inactive","deleted"] and price <bet> (10..100)`)
-// SQL: WHERE name LIKE '%test%' AND id IN (1,2,3,4,5) AND status NOT IN ('inactive','deleted') AND price BETWEEN 10 AND 100
-```
+f := figo.New()
+f.AddFiltersFromString(`id=1 and name="test" sort=id:desc page=skip:0,take:20`)
+f.Build(figo.RawAdapter{})
 
-### Null and Not Null Operations
-
-```go
-// Null checks
-f.AddFiltersFromString(`deleted_at <null> and updated_at <notnull>`)
-// SQL: WHERE deleted_at IS NULL AND updated_at IS NOT NULL
-```
-
-### Regex Operations
-
-```go
-// Regex patterns
-f.AddFiltersFromString(`email =~ "^[a-z]+@gmail\.com$" and phone !=~ "^\+1"`)
-// SQL: WHERE email REGEXP '^[a-z]+@gmail\.com$' AND phone NOT REGEXP '^\+1'
-```
-
-## Multiple Adapters
-
-### GORM Adapter
-```go
-f := figo.New(figo.GormAdapter{})
-f.AddFiltersFromString(`id=1 and name="test"`)
-f.Build()
-db = figo.ApplyGorm(f, db)
-```
-
-### Raw SQL Adapter
-```go
-f := figo.New(figo.RawAdapter{})
-f.AddFiltersFromString(`id=1 and name="test"`)
-f.Build()
+// Full SELECT
 sql, args := figo.BuildRawSelect(f, "users")
-// sql: "SELECT * FROM `users` WHERE `id` = ? AND `name` = ? LIMIT 20"
-// args: [1, "test"]
+// sql:  "SELECT * FROM `users` WHERE (`id` = ? AND `name` = ?) ORDER BY `id` DESC LIMIT 20"
+// args: []any{int64(1), "test"}
+
+// Just the WHERE fragment
+where, whereArgs := figo.BuildRawWhere(f)
+
+// Or via the generic API with a table name / RawContext
+sql = f.GetSqlString("users")
+sql = f.GetSqlString(figo.RawContext{Table: "users"}, "SELECT", "FROM", "WHERE", "SORT")
+q := f.GetQuery(figo.RawContext{Table: "users"}).(figo.SQLQuery) // q.SQL + q.Args
 ```
 
-### MongoDB Adapter
+Identifiers are backtick-escaped (values are always parameterized), so field/table names can't break out of quoting.
+
+`load=` preloads are exposed for the raw adapter as rendered `WHERE` fragments you can apply to your own join/second-query logic:
+
 ```go
-f := figo.New(figo.MongoAdapter{})
-f.AddFiltersFromString(`id=1 and name="test"`)
-f.Build()
-query := f.GetQuery(nil)
-// Returns MongoFindQuery or MongoAggregateQuery
+f.AddFiltersFromString(`id>0 load=[Orders:total>100]`)
+f.Build(figo.RawAdapter{})
+preloads := figo.BuildRawPreloads(f)          // map[string]RawPreload
+// preloads["Orders"] == RawPreload{Where: "`total` > ?", Args: []any{int64(100)}}
 ```
 
-### Elasticsearch Adapter
+### MongoDB adapter
+
 ```go
-f := figo.New(figo.ElasticsearchAdapter{})
-f.AddFiltersFromString(`name = "john" and age > 25`)
-f.Build()
-query := figo.BuildElasticsearchQuery(f)
-// Returns ElasticsearchQuery with JSON structure
+f := figo.New()
+f.AddFiltersFromString(`status="active" and age>=18 sort=age:desc page=skip:0,take:20`)
+f.Build(figo.MongoAdapter{})
 
-// Get as JSON string
-jsonStr, err := figo.GetElasticsearchQueryString(f)
-// Returns: {"query":{"bool":{"must":[{"term":{"name":"john"}},{"range":{"age":{"gt":25}}}]}}}
+// Filter + find options directly
+filter, err := figo.BuildMongoFilter(f)   // bson.M
+opts := figo.BuildMongoFindOptions(f)      // *options.FindOptions (sort/limit/skip)
 
-// Using fluent builder
-builder := figo.NewElasticsearchQueryBuilder()
-query := builder.FromFigo(f).AddSort("name", true).SetPagination(0, 10).Build()
+// Or via the generic API — returns MongoFindQuery
+q := f.GetQuery(nil).(figo.MongoFindQuery) // q.Filter, q.Options
 
-// Complex Elasticsearch queries
-f.AddFiltersFromString(`((name =^ "%john%" or email =^ "%gmail%") and (age >= 18 and age <= 65)) or (status = "active" and score > 80)`)
-f.AddSelectFields("id", "name", "email", "score")
-f.AddFiltersFromString(`sort=score:desc,age:asc page=skip:0,take:10`)
+// Aggregation pipeline with joins ($lookup) — pass "AGG" and a joins map
+joins := map[string]figo.MongoJoin{
+	"orders": {From: "orders", LocalField: "_id", ForeignField: "user_id", As: "orders"},
+}
+pipeline, err := figo.BuildMongoAggregatePipeline(f, joins)
 ```
 
-#### Elasticsearch Advanced Features
+`$in`/`$nin` always receive a real array (never `null`), so empty-list filters don't error at the server.
 
-**Field Selection:**
+### Elasticsearch adapter
+
 ```go
-f.AddSelectFields("id", "name", "email", "score")
-// Generates: {"_source": ["id", "name", "email", "score"]}
+f := figo.New()
+f.AddFiltersFromString(`name=^"%john%" and age>=18 sort=age:desc page=skip:0,take:20`)
+f.AddSelectFields("id", "name", "age")
+f.Build(figo.ElasticsearchAdapter{})
+
+query, err := figo.BuildElasticsearchQuery(f) // figo.ElasticsearchQuery (Query/Sort/From/Size/Source)
+
+// Or via the generic API — returns ElasticsearchQueryWrapper
+q := f.GetQuery(nil).(figo.ElasticsearchQueryWrapper) // q.Query is the ElasticsearchQuery
+
+// JSON string forms
+jsonStr, err := figo.GetElasticsearchQueryString(f)         // pretty
+compact, err := figo.GetElasticsearchQueryStringCompact(f)  // compact
+
+// Fluent builder
+q := figo.NewElasticsearchQueryBuilder().
+	FromFigo(f).
+	AddSort("name", true).
+	SetPagination(0, 10).
+	SetSource("id", "name").
+	Build()
 ```
 
-**Complex Sorting:**
+`AddSelectFields` maps to `_source`, `page=` maps to `from`/`size`, `sort=` maps to the ES sort array.
+
+## The `Figo` API
+
+`figo.New()` returns the `Figo` interface. The most commonly used methods:
+
+**Filters & building**
+
 ```go
-f.AddFiltersFromString(`sort=score:desc,age:asc,created_at:desc`)
-// Generates: [{"score": {"order": "desc"}}, {"age": {"order": "asc"}}, {"created_at": {"order": "desc"}}]
+AddFiltersFromString(dsl string) error
+AddFiltersFromStringWithRepair(dsl string, useRepair bool) error
+AddFilter(exp Expr)                 // add a programmatic AST node
+Build(adapter ...Adapter)
+GetClauses() []Expr
+GetPreloads() map[string][]Expr
+GetDSL() string
 ```
 
-**Pagination:**
+**Rendering**
+
 ```go
-f.AddFiltersFromString(`page=skip:20,take:10`)
-// Generates: {"from": 20, "size": 10}
+GetSqlString(ctx any, conditionType ...string) string
+GetQuery(ctx any, conditionType ...string) Query
+GetExplainedSqlString(ctx any, conditionType ...string) string
+GetCachedSqlString(ctx any, conditionType ...string) string
+GetCachedQuery(ctx any, conditionType ...string) Query
 ```
 
-**Regex Queries:**
+**Pagination & sorting**
+
 ```go
-f.AddFiltersFromString(`phone =~ "^\\+1[0-9]{10}$"`)
-// Generates: {"regexp": {"phone": "^\\\\+1[0-9]{10}$"}}
+SetPage(skip, take int)
+SetPageString(v string)             // "skip:10,take:5"
+GetPage() Page                      // returns a copy — use SetPage to change it
+GetSort() *OrderBy
 ```
 
-**Wildcard Queries:**
+**Adapter & inspection**
+
 ```go
-f.AddFiltersFromString(`email =^ "%gmail%"`)
-// Generates: {"wildcard": {"email": "*gmail*"}}
+SetAdapterObject(adapter Adapter)
+GetAdapterObject() Adapter
+Explain() string                    // human-readable AST tree
+Clone() Figo                        // deep copy
+Walk(visit func(Expr))              // traverse/mutate the AST
 ```
 
-**Complex Boolean Logic:**
+> `GetPage()` returns a **copy** of the page. Mutating it has no effect — call `SetPage(skip, take)` to change pagination.
+
+## Field safety: ignore lists & whitelist
+
+Because DSL usually comes from untrusted input, figo gives you two ways to constrain which fields a caller may filter on. Configure them **before** adding filters. Both prune the built AST — dropping a condition never leaves a dangling `and`/`or`/`not` behind, and both apply to DSL filters and to programmatic `AddFilter` clauses alike.
+
+**Ignore list** — silently drop specific fields:
+
 ```go
-f.AddFiltersFromString(`((category = "tech" and score > 80) or (category = "business" and age > 30)) and (status = "active" or status = "pending")`)
-// Generates complex nested bool queries with must, should, and must_not clauses
+f := figo.New()
+f.AddIgnoreFields("password", "internal_notes")
+f.AddFiltersFromString(`name="x" and password="y"`)
+f.Build(figo.RawAdapter{})
+// only name survives
 ```
 
-## Advanced Features
+Ignore names match both the raw and naming-converted spelling, so `AddIgnoreFields("user_name")` also blocks `userName` under the snake_case strategy.
 
-### Pagination
+**Whitelist** — allow *only* listed fields:
+
 ```go
-// DSL pagination
-f.AddFiltersFromString(`id>0 page=skip:10,take:5`)
-// Or programmatically
-f.GetPage().Skip = 10
-f.GetPage().Take = 5
+f := figo.New()
+f.SetAllowedFields("name", "age", "status")
+f.EnableFieldWhitelist()
+f.AddFiltersFromString(`name="x" and secret="y"`) // secret is dropped
+f.Build(figo.RawAdapter{})
+
+// Also: DisableFieldWhitelist(), IsFieldAllowed(field), IsFieldWhitelistEnabled(), GetAllowedFields()
 ```
 
-### Sorting
-```go
-// Multiple field sorting
-f.AddFiltersFromString(`id>0 sort=name:asc,created_at:desc`)
-```
+**Select fields** — restrict returned columns (SQL `SELECT`, ES `_source`):
 
-### Field Selection
 ```go
-// Select specific fields
 f.AddSelectFields("id", "name", "email")
 ```
 
-### Field Restrictions
+## Naming strategies
+
+By default figo converts DSL field names to `snake_case` (so `userName` → `user_name`). You can change the strategy or supply an arbitrary function.
+
 ```go
-// Prevent certain fields from being queried
-f.AddIgnoreFields("password", "secret_key")
+f.SetNamingStrategy(figo.NAMING_STRATEGY_NO_CHANGE) // keep names verbatim
+f.SetNamingStrategy(figo.NAMING_STRATEGY_SNAKE_CASE) // default
+
+// Custom function overrides the strategy entirely, for the DSL and every adapter's
+// column normalization (they no longer disagree):
+f.SetNamingFunc(func(field string) string {
+	return "t_" + field
+})
 ```
 
-### Input Validation & Repair
+The regex SQL operator for `=~`/`!=~` is a **package-level** setting (it affects the Raw and GORM adapters process-wide) and is safe to change concurrently:
+
 ```go
-// Automatic input repair (default)
-err := f.AddFiltersFromString(`(name = "john" and age > 25`) // Auto-fixed
+figo.SetRegexSQLOperator("REGEXP") // MySQL / SQLite (default)
+figo.SetRegexSQLOperator("~")      // PostgreSQL, case-sensitive
+figo.SetRegexSQLOperator("~*")     // PostgreSQL, case-insensitive
+op := figo.GetRegexSQLOperator()
+```
 
-// Manual control over repair behavior
-err := f.AddFiltersFromStringWithRepair(`malformed input`, true)  // Enable repair
-err := f.AddFiltersFromStringWithRepair(`malformed input`, false) // Disable repair
+## Inspecting & transforming the AST
 
-// Check if field whitelist is enabled
-if f.IsFieldWhitelistEnabled() {
-    // Field whitelist is active
+**`Explain()`** renders the parsed AST as an indented tree — handy for debugging precedence/grouping without a database:
+
+```go
+f.AddFiltersFromString(`a=1 and (b=2 or c=3)`)
+f.Build(figo.RawAdapter{})
+fmt.Println(f.Explain())
+```
+
+**`Clone()`** deep-copies an instance (clauses, preloads, and nested operand slices are independent — mutating the clone never affects the original).
+
+**`Walk(visit)`** traverses every clause and preload, letting you rewrite nodes in place. The visitor receives a pointer to each node; use `NodeField` / `SetNodeField` to read and rewrite field names generically. `Walk` rebuilds operand slices rather than mutating shared ones, and runs your visitor outside its internal lock (so a visitor may call other `Figo` methods safely).
+
+```go
+// Qualify every field with a table prefix
+f.Walk(func(n figo.Expr) {
+	if field, ok := figo.NodeField(n); ok {
+		figo.SetNodeField(n, "users."+field)
+	}
+})
+```
+
+## Caching
+
+figo can cache rendered SQL/query results keyed by the full instance state (DSL, clauses, page, sort, field sets, naming, adapter type, regex operator, context).
+
+```go
+f.SetCacheConfig(figo.CacheConfig{
+	Enabled:         true,
+	TTL:             5 * time.Minute,
+	MaxSize:         1000,          // 0 = unlimited; LRU eviction at capacity
+	CleanupInterval: time.Minute,   // background expiry sweep
+})
+
+sql := f.GetCachedSqlString(figo.RawContext{Table: "users"})
+q := f.GetCachedQuery(figo.RawContext{Table: "users"})
+
+stats := f.GetCacheStats() // hits, misses, size, hit rate
+f.ClearCache()
+
+// Or inject your own implementation of the QueryCache interface:
+f.SetCache(myCache)
+```
+
+Cache keys are type-aware — `a = int64(1)` and `a = "1"` never collide even when instances share a cache. A cache created via `SetCacheConfig` stops its background goroutine when it's replaced or when the instance is garbage-collected. `NewInMemoryCache(config)` is available if you want to manage one directly (call `Stop()` when done).
+
+## Performance monitoring
+
+```go
+mon := figo.NewPerformanceMonitor(true)
+f.SetPerformanceMonitor(mon)
+
+// ... run cached queries ...
+
+m := f.GetMetrics()
+// m.QueryCount, m.CacheHits, m.CacheMisses, m.AverageLatency, m.ErrorCount, ...
+f.ResetMetrics()
+```
+
+Metrics are recorded on the `GetCachedSqlString` / `GetCachedQuery` paths.
+
+## Plugins
+
+Register plugins to hook into the parse pipeline. Each plugin implements `Name`, `Version`, `Initialize`, `BeforeParse`, `AfterParse`, `BeforeQuery`, `AfterQuery`.
+
+```go
+f.RegisterPlugin(myPlugin)   // Initialize is called; rolled back if it errors
+f.UnregisterPlugin("my-plugin")
+```
+
+The `BeforeParse` / `AfterParse` hooks fire automatically inside `AddFiltersFromString` (`BeforeParse` can rewrite the DSL). Hooks run on a snapshot outside the manager's lock, so a hook may call back into the manager without deadlocking.
+
+> **Wiring status:** only the parse hooks (`BeforeParse` / `AfterParse`) are invoked automatically today. `BeforeQuery` / `AfterQuery` exist on the interface and can be driven manually via the plugin manager, but are not yet auto-invoked by the query path.
+
+## Validation
+
+A validation manager lets you attach rules to fields. Built-in validators include `required`, `min_length`, and `email`.
+
+```go
+vm := figo.NewValidationManager()
+vm.RegisterValidator(figo.RequiredValidator{})
+f.SetValidationManager(vm)
+
+f.AddValidationRule(figo.ValidationRule{Field: "email", Rule: "email", Message: "invalid email"})
+if err := f.ValidateField("email", "not-an-email"); err != nil {
+	// handle
 }
-
-// Enable/disable field whitelist
-f.EnableFieldWhitelist()
-f.DisableFieldWhitelist()
 ```
 
-### Preloading Relations
+Rule handlers run on a snapshot (a handler may safely call back into the manager). Validation is invoked explicitly via `ValidateField` — it is not run automatically during parse/build.
+
+## Batch processing
+
+Run many independent figo queries with bounded concurrency and an optional per-operation timeout.
+
 ```go
-// Complex preloading with filters
-f.AddFiltersFromString(`id>0 load=[User:name="john" and age>18 | Profile:bio=^"%developer%" | Posts:title=^"%golang%" and published=true]`)
+bp := figo.NewInMemoryBatchProcessor(8, 2*time.Second) // max 8 concurrent, 2s timeout
+
+ops := []figo.BatchOperation{
+	{ID: "a", Type: "sql", Query: f1, Context: figo.RawContext{Table: "users"}},
+	{ID: "b", Type: "query", Query: f2, Context: nil},
+}
+results := bp.Process(ops)          // []BatchResult (blocking)
+ch := bp.ProcessAsync(ops)          // <-chan BatchResult (streaming)
 ```
 
-### Regex Configuration
-```go
-// Configure regex operator for different SQL dialects
-f.SetRegexSQLOperator("REGEXP")  // MySQL
-f.SetRegexSQLOperator("~")       // PostgreSQL
-f.SetRegexSQLOperator("~*")      // PostgreSQL (case-insensitive)
-```
+`Type` is one of `"sql"`, `"query"`, `"cached_sql"`, `"cached_query"`. The concurrency cap is honored even when operations time out.
 
-## Type Parsing
+## Input validation & repair
 
-The package automatically detects and parses different data types:
+`AddFiltersFromString` stores input as-is. `AddFiltersFromStringWithRepair` gives you validation and optional auto-repair of common malformation:
 
 ```go
-// Numbers (unquoted)
-f.AddFiltersFromString(`id=123`)           // int64(123)
-f.AddFiltersFromString(`price=99.99`)      // float64(99.99)
+// Validate and attempt repair
+err := f.AddFiltersFromStringWithRepair(`(name="john" and age>25`, true)  // adds missing ')'
 
-// Booleans (unquoted)
-f.AddFiltersFromString(`active=true`)      // bool(true)
-f.AddFiltersFromString(`deleted=false`)    // bool(false)
+// Validate only, reject on malformation
+err = f.AddFiltersFromStringWithRepair(`name = = 5`, false)
 
-// Strings (quoted)
-f.AddFiltersFromString(`name="john"`)      // string("john")
-
-// Strings (unquoted - treated as strings)
-f.AddFiltersFromString(`status=active`)    // string("active")
-```
-
-## Error Handling
-
-### Basic Error Handling
-```go
-f := figo.New(figo.GormAdapter{})
-err := f.AddFiltersFromString(`invalid syntax`)
-if err != nil {
-    // Handle parsing errors
-    log.Printf("Filter parsing error: %v", err)
+// Structured errors
+if perr, ok := err.(*figo.ParseError); ok {
+	fmt.Printf("%s at line %d col %d\n", perr.Message, perr.Line, perr.Column)
 }
 ```
 
-### Input Validation & Repair
-The figo package includes comprehensive input validation and automatic repair capabilities:
+Repairs cover unmatched parentheses/quotes/brackets and dangling trailing/leading `and`/`or`. A leading `not` is **not** treated as malformed and is never stripped.
+
+## Concurrency
+
+A `Figo` instance is guarded by an internal `sync.RWMutex`, and the ancillary managers (cache, plugins, validation, performance monitor) each carry their own lock. Read-render methods (`GetSqlString`, `GetQuery`, `GetCached*`) are safe to call concurrently after `Build`, and the package is race-clean under `go test -race`.
+
+For concurrent **writers** — multiple goroutines calling `AddFiltersFromString`/`Build` on the *same* instance — prefer giving each goroutine its own instance (or a `Clone()`), since those mutate shared builder state. The safe, common pattern:
 
 ```go
-// Automatic input repair (default behavior)
-f := figo.New(figo.GormAdapter{})
-err := f.AddFiltersFromString(`(name = "john" and age > 25`) // Missing closing parenthesis
-// Automatically repaired to: (name = "john" and age > 25)
+base := figo.New()
+base.AddFiltersFromString(`status="active"`)
+base.Build(figo.RawAdapter{})
 
-// Manual control over repair behavior
-err := f.AddFiltersFromStringWithRepair(`malformed input`, true)  // Enable repair
-err := f.AddFiltersFromStringWithRepair(`malformed input`, false) // Disable repair, return error
-
-// Input validation with detailed error messages
-if err := f.AddFiltersFromString(`invalid syntax`); err != nil {
-    if parseErr, ok := err.(*figo.ParseError); ok {
-        fmt.Printf("Error at position %d: %s\n", parseErr.Position, parseErr.Message)
-        if parseErr.Line > 0 {
-            fmt.Printf("Line %d, Column %d\n", parseErr.Line, parseErr.Column)
-        }
-    }
-}
-```
-
-### Supported Input Repairs
-- **Unmatched Parentheses**: Automatically adds missing closing parentheses
-- **Unmatched Quotes**: Fixes incomplete string literals
-- **Unmatched Brackets**: Repairs array syntax
-- **Trailing Operators**: Removes incomplete operator expressions
-- **Leading Operators**: Fixes expressions starting with operators
-- **Incomplete Expressions**: Handles malformed filter expressions
-
-## Performance Considerations
-
-- The package is optimized for performance with minimal memory allocations
-- Token combination logic handles complex expressions efficiently
-- All operations are tested for edge cases and error conditions
-- Thread-safe operations with mutex protection for concurrent access
-- Memory efficient with optimized data structures and reduced allocations
-
-## Concurrency Safety
-
-The figo package is designed to be thread-safe and can be used safely in concurrent environments:
-
-```go
-// Safe concurrent usage
 var wg sync.WaitGroup
-f := figo.New(figo.GormAdapter{})
-
-// Multiple goroutines can safely access the same Figo instance
 for i := 0; i < 10; i++ {
-    wg.Add(1)
-    go func(id int) {
-        defer wg.Done()
-        
-        // Thread-safe operations
-        f.AddFiltersFromString(fmt.Sprintf("id=%d", id))
-        f.Build()
-        
-        // Safe to call concurrently
-        query := f.GetQuery(nil)
-        fmt.Printf("Goroutine %d: %v\n", id, query)
-    }(i)
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		// concurrent reads on the same built instance are safe
+		_ = base.GetSqlString(figo.RawContext{Table: "users"})
+	}()
 }
-
 wg.Wait()
 ```
 
-**Thread-Safe Operations:**
-- `AddFiltersFromString()` - Protected with mutex
-- `Build()` - Safe for concurrent calls
-- `GetQuery()` - Read-only operations with RWMutex
-- `GetPage()` - Thread-safe access
-- All adapter methods - Protected against race conditions
+## Testing
 
-## Comprehensive Testing
-
-The figo package includes extensive testing across all adapters and scenarios:
-
-### Test Coverage
-- **100+ test scenarios** covering all operators and edge cases
-- **Real Elasticsearch integration** with live data testing
-- **Performance benchmarks** with detailed metrics
-- **Stress testing** with 1,000+ record datasets
-- **Concurrent testing** with multiple goroutines
-- **Memory usage testing** with allocation tracking
-- **Input validation testing** with malformed input scenarios
-- **Operator precedence testing** with complex expressions
-- **Race condition testing** with concurrent access patterns
-- **Error recovery testing** with graceful degradation scenarios
-
-### Test Results
-```
-✅ Integration Tests: 13 scenarios with real Elasticsearch
-✅ Performance Tests: 1,250+ queries/sec concurrent, 970K+ queries/sec fluent builder
-✅ Stress Tests: 1,000+ records, complex nested queries, pagination
-✅ Unit Tests: All operators, edge cases, error conditions
-✅ Benchmarks: Detailed performance metrics for all operations
-✅ Input Validation: 10+ malformed input scenarios with repair
-✅ Operator Precedence: Complex expression parsing with correct precedence
-✅ Concurrency Tests: Race condition detection and prevention
-✅ Error Recovery: Graceful degradation and error handling
+```bash
+go test ./...            # unit + adapter tests
+go test -race ./...      # race detector
 ```
 
-### Elasticsearch Testing
-- **Real Elasticsearch instance** with Docker Compose setup
-- **1,005+ test records** across multiple indices
-- **All operators verified** with actual query execution
-- **Query structure validation** for JSON correctness
-- **Performance testing** with large datasets
+The MongoDB adapter tests use the BSON encoder directly (no server needed). Elasticsearch **integration** tests require a running cluster on `localhost:9200` and skip automatically when it's absent — see [ELASTICSEARCH_TESTING.md](ELASTICSEARCH_TESTING.md) for the Docker Compose setup.
 
-### Performance Optimizations
-- **Query Generation**: Optimized to 970K+ queries/sec for fluent builder
-- **Memory Usage**: Reduced allocations with efficient token combination
-- **Concurrent Safety**: Verified thread-safe operation across multiple goroutines
-- **Input Processing**: Optimized DSL parsing with three-pass precedence algorithm
+## Status of features
 
+Fully wired end-to-end: the DSL and all operators above, the four adapters, ignore/whitelist/select field controls, naming strategies, pagination/sort/preloads, caching, performance monitoring, batch processing, validation (manual), input repair, and the `Explain`/`Clone`/`Walk` AST tools.
 
-## Production Ready
+Partial / not yet wired (defined in the API but not auto-invoked or without adapter support):
 
-✅ **All 100+ tests passing**  
-✅ **No panics or crashes**  
-✅ **Comprehensive error handling**  
-✅ **Type-safe parsing**  
-✅ **Full operator coverage across all adapters**  
-✅ **Complex expression support with nested parentheses**  
-✅ **Correct operator precedence (NOT > AND > OR)**  
-✅ **Input validation and automatic repair**  
-✅ **Thread-safe concurrent operations**  
-✅ **Real Elasticsearch integration tested**  
-✅ **Performance optimized (970K+ queries/sec)**  
-✅ **Large dataset support (1,000+ records tested)**  
-✅ **Concurrent safety verified**  
-✅ **Memory efficient with low allocation rates**  
-✅ **Bug-free implementation with comprehensive operator audit**  
-✅ **Race condition free with mutex protection**  
-✅ **Enhanced error recovery and graceful degradation**  
+- Plugin `BeforeQuery` / `AfterQuery` hooks — present but not auto-called by the query path (parse hooks are).
+- `QueryLimits` (`SetQueryLimits`) — configurable but not currently enforced during parse/build.
+- Advanced expression types (`JsonPathExpr`, `ArrayContainsExpr`, `ArrayOverlapsExpr`, `FullTextSearchExpr`, `GeoDistanceExpr`, `CustomExpr`) — defined for programmatic `AddFilter`, but adapters return an "unsupported expression" error for them rather than rendering.
 
 ## Contributing
 
-Pull requests are welcome! Please:
-1. Create your pull request on a non-main branch
-2. Include tests that cover your changes
-3. Ensure all existing tests pass
-4. Update documentation as needed
+Pull requests welcome:
+
+1. Branch off `main` (don't PR against `main` directly from `main`).
+2. Include tests covering your change; keep `go test -race ./...` green.
+3. Update this README when you change behavior or the API.
 
 ## License
 
-BSD 2 clause, see LICENSE for more details.
+BSD 2-Clause. See [LICENSE](LICENSE).
