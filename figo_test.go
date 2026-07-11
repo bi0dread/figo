@@ -135,9 +135,12 @@ func TestRawAdapterBuild(t *testing.T) {
 	f.Build(RawAdapter{})
 
 	sql, args := BuildRawSelect(f, "test_models")
-	// With proper operator precedence and bank_id ignored: (id=1 AND vendor_id=22) AND expedition_type LIKE %e%
-	assert.Equal(t, "SELECT * FROM `test_models` WHERE ((`id` = ? AND `vendor_id` = ?) AND `expedition_type` LIKE ?) ORDER BY `id` DESC LIMIT 10", sql)
-	assert.Equal(t, []any{int64(1), int64(22), "%e%"}, args)
+	// Precedence gives ((id=1 AND vendor_id=22) AND bank_id=11) OR expedition_type LIKE %e%;
+	// pruning the ignored bank_id from the conjunction must keep the OR:
+	// (id=1 AND vendor_id=22) OR expedition_type LIKE %e%
+	assert.Equal(t, "SELECT * FROM `test_models` WHERE ((`id` = ? AND `vendor_id` = ?) OR `expedition_type` LIKE ?) ORDER BY `id` DESC LIMIT 10", sql)
+	// vendorId="22" is quoted, so it stays the string "22".
+	assert.Equal(t, []any{int64(1), "22", "%e%"}, args)
 }
 
 func TestMongoAdapterBuild(t *testing.T) {
@@ -149,16 +152,17 @@ func TestMongoAdapterBuild(t *testing.T) {
 	// Filter
 	filter, _ := BuildMongoFilter(f)
 
-	// With the new operator precedence: ((id=1 AND vendor_id=22) AND expedition_type LIKE %e%)
-	// This creates a top-level $and with two items:
+	// Precedence gives ((id=1 AND vendor_id=22) AND bank_id=11) OR expedition_type LIKE %e%;
+	// pruning the ignored bank_id from the conjunction must keep the OR.
+	// This creates a top-level $or with two items:
 	// 1. A nested $and with id and vendor_id
 	// 2. expedition_type with regex
-	andVal, ok := filter["$and"].([]bson.M)
+	orVal, ok := filter["$or"].([]bson.M)
 	assert.True(t, ok)
-	assert.Len(t, andVal, 2)
+	assert.Len(t, orVal, 2)
 
 	// First item should be a nested $and with id and vendor_id
-	firstItem, ok := andVal[0]["$and"].([]bson.M)
+	firstItem, ok := orVal[0]["$and"].([]bson.M)
 	assert.True(t, ok)
 	assert.Len(t, firstItem, 2)
 
@@ -168,7 +172,7 @@ func TestMongoAdapterBuild(t *testing.T) {
 		if v, ok := m["id"]; ok && v == int64(1) {
 			hasID = true
 		}
-		if v, ok := m["vendor_id"]; ok && v == int64(22) {
+		if v, ok := m["vendor_id"]; ok && v == "22" { // quoted literal stays a string
 			hasVendor = true
 		}
 	}
@@ -176,7 +180,7 @@ func TestMongoAdapterBuild(t *testing.T) {
 	assert.True(t, hasVendor)
 
 	// Second item should be expedition_type with regex
-	secondItem := andVal[1]
+	secondItem := orVal[1]
 	if rv, ok := secondItem["expedition_type"].(primitive.Regex); ok {
 		assert.NotEmpty(t, rv.Pattern)
 	} else {
@@ -641,7 +645,9 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	assert.Contains(t, sql5, "`price` = ?")
 	assert.Contains(t, sql5, "`discount` = ?")
 	assert.Contains(t, sql5, "`quantity` >= ?")
-	assert.Equal(t, []any{int64(0), int64(0), -10.5, int64(1)}, args5)
+	// 0.0 is a float literal and must stay float64 (it used to collapse to
+	// int64 through a lossy %v re-parse).
+	assert.Equal(t, []any{int64(0), float64(0), -10.5, int64(1)}, args5)
 
 	// Test 6: Complex operators with spaces
 	f6 := New()
@@ -650,7 +656,8 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	sql6, _ := BuildRawSelect(f6, "products")
 	assert.Contains(t, sql6, "`name` LIKE ?")
 	assert.Contains(t, sql6, "`id` IN (?,?,?,?,?)")
-	assert.Contains(t, sql6, "`status` NOT IN (?)")
+	// Both quoted list elements must survive (this used to collapse to one).
+	assert.Contains(t, sql6, "`status` NOT IN (?,?)")
 	// Note: <bet> operator is not working yet, so we'll skip that assertion for now
 
 	// Test 7: Null and not null operations
@@ -1170,7 +1177,8 @@ func TestMissingScenarios(t *testing.T) {
 	assert.Contains(t, sql5, "`price` = ?")
 	assert.Contains(t, sql5, "`active` = ?")
 	assert.Contains(t, sql5, "`count` = ?")
-	assert.Equal(t, []any{int64(0), int64(0), false, int64(-1)}, args5)
+	// 0.0 stays float64 (see TestComprehensiveBugPrevention).
+	assert.Equal(t, []any{int64(0), float64(0), false, int64(-1)}, args5)
 
 	// Test 6: Operator precedence and complex combinations
 	f6 := New()
@@ -1202,8 +1210,8 @@ func TestMissingScenarios(t *testing.T) {
 	assert.Contains(t, sql8, "`price` < ?")
 	assert.Contains(t, sql8, "`discount` <= ?")
 	assert.Contains(t, sql8, "`status` != ?")
-	assert.Contains(t, sql8, "`category` IN (?)")
-	assert.Contains(t, sql8, "`tags` NOT IN (?)")
+	assert.Contains(t, sql8, "`category` IN (?,?)")
+	assert.Contains(t, sql8, "`tags` NOT IN (?,?)")
 	// Note: BETWEEN operator might not be working in complex expressions yet
 	assert.Contains(t, sql8, "`deleted_at` IS NULL")
 	assert.Contains(t, sql8, "`updated_at` IS NOT NULL")

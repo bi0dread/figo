@@ -19,22 +19,19 @@ func Walk(e Expr, visit func(Expr)) Expr {
 	}
 	switch v := e.(type) {
 	// Logical nodes: recurse into operands first, then visit the node itself.
+	// Operands are rebuilt into a fresh slice — writing into v.Operands would
+	// mutate the backing array shared with the snapshots GetClauses/Explain
+	// hand out, racing with concurrent readers.
 	case AndExpr:
-		for i := range v.Operands {
-			v.Operands[i] = Walk(v.Operands[i], visit)
-		}
+		v.Operands = walkOperands(v.Operands, visit)
 		visit(&v)
 		return v
 	case OrExpr:
-		for i := range v.Operands {
-			v.Operands[i] = Walk(v.Operands[i], visit)
-		}
+		v.Operands = walkOperands(v.Operands, visit)
 		visit(&v)
 		return v
 	case NotExpr:
-		for i := range v.Operands {
-			v.Operands[i] = Walk(v.Operands[i], visit)
-		}
+		v.Operands = walkOperands(v.Operands, visit)
 		visit(&v)
 		return v
 
@@ -110,6 +107,14 @@ func Walk(e Expr, visit func(Expr)) Expr {
 	}
 }
 
+func walkOperands(operands []Expr, visit func(Expr)) []Expr {
+	rebuilt := make([]Expr, len(operands))
+	for i := range operands {
+		rebuilt[i] = Walk(operands[i], visit)
+	}
+	return rebuilt
+}
+
 // Walk traverses every clause (and preload) of this instance, invoking visit on
 // each node, and writes any mutations back into the instance. Call it after
 // Build (or after adding filters).
@@ -120,18 +125,34 @@ func Walk(e Expr, visit func(Expr)) Expr {
 //	    }
 //	})
 func (f *figo) Walk(visit func(Expr)) {
+	// Snapshot under the lock, run the user's visitor OUTSIDE it (a visitor
+	// calling back into figo methods must not deadlock), then swap the
+	// rebuilt trees in under the lock again.
 	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	for i := range f.clauses {
-		f.clauses[i] = Walk(f.clauses[i], visit)
-	}
+	clauses := make([]Expr, len(f.clauses))
+	copy(clauses, f.clauses)
+	preloads := make(map[string][]Expr, len(f.preloads))
 	for k, exprs := range f.preloads {
+		cp := make([]Expr, len(exprs))
+		copy(cp, exprs)
+		preloads[k] = cp
+	}
+	f.mu.Unlock()
+
+	for i := range clauses {
+		clauses[i] = Walk(clauses[i], visit)
+	}
+	for k, exprs := range preloads {
 		for i := range exprs {
 			exprs[i] = Walk(exprs[i], visit)
 		}
-		f.preloads[k] = exprs
+		preloads[k] = exprs
 	}
+
+	f.mu.Lock()
+	f.clauses = clauses
+	f.preloads = preloads
+	f.mu.Unlock()
 }
 
 // NodeField returns the field name a node filters on, and whether it has one.

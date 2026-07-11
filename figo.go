@@ -5,9 +5,11 @@ import (
 	"crypto/md5"
 	"fmt"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gobeam/stringy"
@@ -17,8 +19,13 @@ import (
 var (
 	// regexSQLOperator controls the SQL operator used for RegexExpr in SQL adapters.
 	// Defaults to MySQL-compatible REGEXP. For Postgres, set to "~" or "~*".
-	regexSQLOperator = "REGEXP"
+	// Atomic: it may be reconfigured while adapters render on other goroutines.
+	regexSQLOperator atomic.Value
 )
+
+func init() {
+	regexSQLOperator.Store("REGEXP")
+}
 
 // SetRegexSQLOperator sets the SQL operator used to render regex in SQL adapters (Raw/GORM)
 func SetRegexSQLOperator(op string) {
@@ -26,11 +33,11 @@ func SetRegexSQLOperator(op string) {
 	if op == "" {
 		return
 	}
-	regexSQLOperator = op
+	regexSQLOperator.Store(op)
 }
 
 // GetRegexSQLOperator returns the configured SQL regex operator
-func GetRegexSQLOperator() string { return regexSQLOperator }
+func GetRegexSQLOperator() string { return regexSQLOperator.Load().(string) }
 
 type NamingStrategy string
 
@@ -307,12 +314,13 @@ func (pm *PluginManager) ListPlugins() []Plugin {
 	return plugins
 }
 
+// Hooks run on a snapshot taken under the lock, with the lock released while
+// user plugin code executes — a hook that calls back into the manager
+// (Register/Unregister/List) must not deadlock.
+
 // ExecuteBeforeQuery executes all plugins' BeforeQuery hooks
 func (pm *PluginManager) ExecuteBeforeQuery(f Figo, ctx any) error {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
-	for _, plugin := range pm.plugins {
+	for _, plugin := range pm.ListPlugins() {
 		if err := plugin.BeforeQuery(f, ctx); err != nil {
 			return fmt.Errorf("plugin %s BeforeQuery error: %w", plugin.Name(), err)
 		}
@@ -322,10 +330,7 @@ func (pm *PluginManager) ExecuteBeforeQuery(f Figo, ctx any) error {
 
 // ExecuteAfterQuery executes all plugins' AfterQuery hooks
 func (pm *PluginManager) ExecuteAfterQuery(f Figo, ctx any, result interface{}) error {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
-	for _, plugin := range pm.plugins {
+	for _, plugin := range pm.ListPlugins() {
 		if err := plugin.AfterQuery(f, ctx, result); err != nil {
 			return fmt.Errorf("plugin %s AfterQuery error: %w", plugin.Name(), err)
 		}
@@ -335,11 +340,8 @@ func (pm *PluginManager) ExecuteAfterQuery(f Figo, ctx any, result interface{}) 
 
 // ExecuteBeforeParse executes all plugins' BeforeParse hooks
 func (pm *PluginManager) ExecuteBeforeParse(f Figo, dsl string) (string, error) {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
 	modifiedDSL := dsl
-	for _, plugin := range pm.plugins {
+	for _, plugin := range pm.ListPlugins() {
 		var err error
 		modifiedDSL, err = plugin.BeforeParse(f, modifiedDSL)
 		if err != nil {
@@ -351,10 +353,7 @@ func (pm *PluginManager) ExecuteBeforeParse(f Figo, dsl string) (string, error) 
 
 // ExecuteAfterParse executes all plugins' AfterParse hooks
 func (pm *PluginManager) ExecuteAfterParse(f Figo, dsl string) error {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
-	for _, plugin := range pm.plugins {
+	for _, plugin := range pm.ListPlugins() {
 		if err := plugin.AfterParse(f, dsl); err != nil {
 			return fmt.Errorf("plugin %s AfterParse error: %w", plugin.Name(), err)
 		}
@@ -388,13 +387,13 @@ func (bp *InMemoryBatchProcessor) Process(operations []BatchOperation) []BatchRe
 		go func(index int, operation BatchOperation) {
 			defer wg.Done()
 
-			// Acquire semaphore
+			// Acquire semaphore. Release is handed to executeOperation: on a
+			// timeout the result comes back early, but the slot stays held
+			// until the operation actually finishes — otherwise a stampede of
+			// timed-out operations would exceed maxConcurrency exactly when
+			// the backend is slow.
 			semaphore <- struct{}{}
-			defer func() { <-semaphore }()
-
-			// Execute operation with timeout
-			result := bp.executeOperation(operation)
-			results[index] = result
+			results[index] = bp.executeOperation(operation, func() { <-semaphore })
 		}(i, op)
 	}
 
@@ -418,13 +417,10 @@ func (bp *InMemoryBatchProcessor) ProcessAsync(operations []BatchOperation) <-ch
 			go func(operation BatchOperation) {
 				defer wg.Done()
 
-				// Acquire semaphore
+				// Acquire semaphore; released when the work truly finishes
+				// (see Process).
 				semaphore <- struct{}{}
-				defer func() { <-semaphore }()
-
-				// Execute operation with timeout
-				result := bp.executeOperation(operation)
-				resultChan <- result
+				resultChan <- bp.executeOperation(operation, func() { <-semaphore })
 			}(op)
 		}
 
@@ -434,8 +430,11 @@ func (bp *InMemoryBatchProcessor) ProcessAsync(operations []BatchOperation) <-ch
 	return resultChan
 }
 
-// executeOperation executes a single operation
-func (bp *InMemoryBatchProcessor) executeOperation(operation BatchOperation) BatchResult {
+// executeOperation executes a single operation. release frees the caller's
+// concurrency slot and is invoked only when the underlying work has actually
+// completed — a timed-out operation keeps its slot until it finishes, so the
+// concurrency cap holds even under timeouts.
+func (bp *InMemoryBatchProcessor) executeOperation(operation BatchOperation, release func()) BatchResult {
 	// run performs the actual (synchronous, non-cancellable) work.
 	run := func() BatchResult {
 		r := BatchResult{ID: operation.ID}
@@ -462,6 +461,7 @@ func (bp *InMemoryBatchProcessor) executeOperation(operation BatchOperation) Bat
 	// AFTER running the work and flipped a completed result to failed when the
 	// deadline had already passed — so timeout==0 failed every operation.)
 	if bp.timeout <= 0 {
+		defer release()
 		return run()
 	}
 
@@ -469,7 +469,10 @@ func (bp *InMemoryBatchProcessor) executeOperation(operation BatchOperation) Bat
 	defer cancel()
 
 	done := make(chan BatchResult, 1) // buffered so the goroutine can't leak-block
-	go func() { done <- run() }()
+	go func() {
+		done <- run()
+		release()
+	}()
 
 	select {
 	case r := <-done:
@@ -548,7 +551,9 @@ func (c *InMemoryCache) Set(key string, value interface{}, ttl time.Duration) {
 
 	// Check size limit. MaxSize <= 0 means unlimited; without this guard a
 	// zero MaxSize would evict on every Set, pinning the cache to one entry.
-	if c.config.MaxSize > 0 && len(c.entries) >= c.config.MaxSize {
+	// Overwriting an existing key doesn't grow the map, so it must never
+	// evict an unrelated entry.
+	if _, exists := c.entries[key]; !exists && c.config.MaxSize > 0 && len(c.entries) >= c.config.MaxSize {
 		c.evictLRU()
 	}
 
@@ -710,6 +715,11 @@ type RegexExpr struct {
 // Logical expressions
 type AndExpr struct{ Operands []Expr }
 type OrExpr struct{ Operands []Expr }
+
+// NotExpr matches when NONE of its operands match: NOT(a OR b). All adapters
+// implement this reading (SQL "NOT (a OR b)", Mongo $nor, GORM clause.Not,
+// Elasticsearch must_not). The DSL parser only emits single-operand NotExpr;
+// multi-operand forms come from AddFilter.
 type NotExpr struct{ Operands []Expr }
 
 // Sorting expressions
@@ -871,16 +881,25 @@ func (vm *ValidationManager) RegisterValidator(validator Validator) {
 
 // Validate validates a field value against all applicable rules
 func (vm *ValidationManager) Validate(field string, value any) error {
+	// Snapshot rules and validators under the lock, then run the user's
+	// handlers WITHOUT it — a handler calling AddRule/RegisterValidator
+	// must not deadlock.
 	vm.mu.RLock()
-	defer vm.mu.RUnlock()
+	rules := make([]ValidationRule, len(vm.rules))
+	copy(rules, vm.rules)
+	validators := make(map[string]Validator, len(vm.validators))
+	for k, v := range vm.validators {
+		validators[k] = v
+	}
+	vm.mu.RUnlock()
 
-	for _, rule := range vm.rules {
+	for _, rule := range rules {
 		if rule.Field == field || rule.Field == "*" {
 			if rule.Handler != nil {
 				if err := rule.Handler(field, rule.Rule, value); err != nil {
 					return fmt.Errorf("validation failed for field %s: %s", field, rule.Message)
 				}
-			} else if validator, exists := vm.validators[rule.Rule]; exists {
+			} else if validator, exists := validators[rule.Rule]; exists {
 				if err := validator.Validate(field, rule.Rule, value); err != nil {
 					return fmt.Errorf("validation failed for field %s: %s", field, rule.Message)
 				}
@@ -1009,6 +1028,7 @@ type figo struct {
 	fieldWhitelist    bool
 	queryLimits       QueryLimits
 	cache             QueryCache
+	ownedCache        *InMemoryCache // cache created by SetCacheConfig, stopped on replacement/GC
 	cacheConfig       CacheConfig
 	monitor           *PerformanceMonitor
 	pluginManager     *PluginManager
@@ -1250,7 +1270,8 @@ func (f *figo) validateBasicSyntax(expr string) error {
 		{`<bet>\s*$`, "incomplete BETWEEN expression", "Add value range after <bet>"},
 		{`^\s*and\b`, "expression starts with AND", "Remove AND or add field before it"},
 		{`^\s*or\b`, "expression starts with OR", "Remove OR or add field before it"},
-		{`^\s*not\b`, "expression starts with NOT", "Add expression after NOT"},
+		// A leading NOT is valid syntax ("not deleted=true") and must not be
+		// flagged or "repaired" away — stripping it would invert the filter.
 	}
 
 	for _, p := range patterns {
@@ -1269,11 +1290,40 @@ func (f *figo) validateBasicSyntax(expr string) error {
 	return nil
 }
 
+// isDSLSpace reports whether c separates tokens in the DSL. Tabs and
+// newlines count so multi-line filters parse the same as single-line ones;
+// whitespace inside quoted values never reaches these checks.
+func isDSLSpace(c byte) bool {
+	return c == ' ' || c == '\t' || c == '\n' || c == '\r'
+}
+
+// isSafeLookaheadValue reports whether the token after a spaced operator can
+// be consumed as that operator's value. A fully quoted (or bracketed/
+// parenthesized list) token is always a value — operator characters inside it
+// are literal, so `name = "a=b"` keeps its value instead of silently becoming
+// `name = ''`. An unquoted token containing operator characters or a logical
+// keyword is not consumed (it belongs to the next expression).
+func isSafeLookaheadValue(v string) bool {
+	if v == "" {
+		return false
+	}
+	if len(v) >= 2 {
+		if (v[0] == '"' && v[len(v)-1] == '"') ||
+			(v[0] == '[' && v[len(v)-1] == ']') ||
+			(v[0] == '(' && v[len(v)-1] == ')') {
+			return true
+		}
+	}
+	if strings.ContainsAny(v, "=><!") {
+		return false
+	}
+	return v != "and" && v != "or" && v != "not"
+}
+
 func (f *figo) parseDSL(expr string) *Node {
 	root := &Node{Value: "root", Expression: make([]Expr, 0)}
 	stack := []*Node{root}
 	current := root
-outerLoop:
 	for i := 0; i < len(expr); {
 		switch expr[i] {
 		case '(':
@@ -1288,7 +1338,7 @@ outerLoop:
 				current = stack[len(stack)-1]
 			}
 			i++
-		case ' ':
+		case ' ', '\t', '\n', '\r':
 			i++
 		default:
 			j := i
@@ -1321,13 +1371,13 @@ outerLoop:
 					continue
 				}
 
-				// Spaces and the closing quote only terminate the token outside a
+				// Whitespace and the closing quote only terminate the token outside a
 				// bracketed list value; inside one, "[1, 2, 3]" stays a single token.
-				if expr[j] == ' ' && ff == -1 && bracketDepth == 0 {
+				if isDSLSpace(expr[j]) && ff == -1 && bracketDepth == 0 {
 					break
 				}
 
-				if expr[j] == ' ' && ff == 0 && bracketDepth == 0 {
+				if isDSLSpace(expr[j]) && ff == 0 && bracketDepth == 0 {
 					break
 				}
 
@@ -1536,7 +1586,7 @@ outerLoop:
 					if isSimpleFieldName(token) {
 						// This looks like a field name with underscores, try to combine with next tokens
 						nextStart := j
-						for nextStart < len(expr) && expr[nextStart] == ' ' {
+						for nextStart < len(expr) && isDSLSpace(expr[nextStart]) {
 							nextStart++
 						}
 						if nextStart < len(expr) {
@@ -1557,10 +1607,10 @@ outerLoop:
 									nextEnd++
 									continue
 								}
-								if expr[nextEnd] == ' ' && nextFF == -1 {
+								if isDSLSpace(expr[nextEnd]) && nextFF == -1 {
 									break
 								}
-								if expr[nextEnd] == ' ' && nextFF == 0 {
+								if isDSLSpace(expr[nextEnd]) && nextFF == 0 {
 									break
 								}
 								nextEnd++
@@ -1574,13 +1624,14 @@ outerLoop:
 								// Try to get the value token as well
 								if nextToken == "<bet>" || nextToken == "<in>" || nextToken == "<nin>" {
 									valueStart := j
-									for valueStart < len(expr) && expr[valueStart] == ' ' {
+									for valueStart < len(expr) && isDSLSpace(expr[valueStart]) {
 										valueStart++
 									}
 									if valueStart < len(expr) {
 										valueEnd := valueStart
 										valueFF := -1
 										parenCount := 0
+										bracketCount := 0
 										for valueEnd < len(expr) {
 											if expr[valueEnd] == '"' && valueFF == -1 {
 												valueFF = 1
@@ -1590,34 +1641,52 @@ outerLoop:
 											if expr[valueEnd] == '"' && valueFF == 1 {
 												valueFF = 0
 												valueEnd++
+												// Inside a bracketed list more quoted
+												// elements may follow (<in>["a b","c"]).
+												if bracketCount > 0 {
+													valueFF = -1
+													continue
+												}
 												break
 											}
 											if expr[valueEnd] != '"' && valueFF == 1 {
 												valueEnd++
 												continue
 											}
+											// Track list brackets so "[1, 2]" (spaces
+											// inside) stays one value token.
+											if expr[valueEnd] == '[' && valueFF == -1 {
+												bracketCount++
+											}
+											if expr[valueEnd] == ']' && valueFF == -1 {
+												bracketCount--
+												if bracketCount == 0 {
+													valueEnd++
+													break
+												}
+											}
 											// Handle parentheses for BETWEEN operations
 											if expr[valueEnd] == '(' && valueFF == -1 {
 												parenCount++
 											}
-											if expr[valueEnd] == ')' && valueFF == -1 {
+											if expr[valueEnd] == ')' && valueFF == -1 && bracketCount == 0 {
 												parenCount--
 												if parenCount == 0 {
 													valueEnd++
 													break
 												}
 											}
-											// Stop at spaces, parentheses, or logical operators (but not inside parentheses)
-											if (expr[valueEnd] == ' ' || expr[valueEnd] == ')' || expr[valueEnd] == '(') && valueFF == -1 && parenCount == 0 {
+											// Stop at whitespace, parentheses, or logical operators (but not inside parentheses/brackets)
+											if (isDSLSpace(expr[valueEnd]) || expr[valueEnd] == ')' || expr[valueEnd] == '(') && valueFF == -1 && parenCount == 0 && bracketCount == 0 {
 												break
 											}
-											if expr[valueEnd] == ' ' && valueFF == 0 && parenCount == 0 {
+											if isDSLSpace(expr[valueEnd]) && valueFF == 0 && parenCount == 0 && bracketCount == 0 {
 												break
 											}
 											valueEnd++
 										}
 										valueToken := strings.TrimSpace(expr[valueStart:valueEnd])
-										if valueToken != "" && !strings.Contains(valueToken, "=") && !strings.Contains(valueToken, ">") && !strings.Contains(valueToken, "<") && !strings.Contains(valueToken, "!") && valueToken != "and" && valueToken != "or" && valueToken != "not" && !strings.Contains(valueToken, "page=") && !strings.Contains(valueToken, "sort=") && !strings.Contains(valueToken, "load=") {
+										if isSafeLookaheadValue(valueToken) {
 											combinedToken = combinedToken + " " + valueToken
 											j = valueEnd
 										}
@@ -1625,7 +1694,7 @@ outerLoop:
 								} else {
 									// For simple operators, use simpler value extraction
 									valueStart := j
-									for valueStart < len(expr) && expr[valueStart] == ' ' {
+									for valueStart < len(expr) && isDSLSpace(expr[valueStart]) {
 										valueStart++
 									}
 									if valueStart < len(expr) {
@@ -1646,17 +1715,17 @@ outerLoop:
 												valueEnd++
 												continue
 											}
-											// Stop at spaces, parentheses, or logical operators
-											if (expr[valueEnd] == ' ' || expr[valueEnd] == ')' || expr[valueEnd] == '(') && valueFF == -1 {
+											// Stop at whitespace, parentheses, or logical operators
+											if (isDSLSpace(expr[valueEnd]) || expr[valueEnd] == ')' || expr[valueEnd] == '(') && valueFF == -1 {
 												break
 											}
-											if expr[valueEnd] == ' ' && valueFF == 0 {
+											if isDSLSpace(expr[valueEnd]) && valueFF == 0 {
 												break
 											}
 											valueEnd++
 										}
 										valueToken := strings.TrimSpace(expr[valueStart:valueEnd])
-										if valueToken != "" && !strings.Contains(valueToken, "=") && !strings.Contains(valueToken, ">") && !strings.Contains(valueToken, "<") && !strings.Contains(valueToken, "!") && valueToken != "and" && valueToken != "or" && valueToken != "not" && !strings.Contains(valueToken, "page=") && !strings.Contains(valueToken, "sort=") && !strings.Contains(valueToken, "load=") {
+										if isSafeLookaheadValue(valueToken) {
 											combinedToken = combinedToken + " " + valueToken
 											j = valueEnd
 										}
@@ -1667,36 +1736,28 @@ outerLoop:
 					}
 
 					operator, valueStr, field := parseToken(combinedToken)
-					value := f.parsFieldsValue(valueStr)
 
-					// Check if this is a logical operator
-					valueStrForOp := fmt.Sprintf("%v", value)
-					if operator == "" && Operation(valueStrForOp) != OperationAnd && Operation(valueStrForOp) != OperationOr && Operation(valueStrForOp) != OperationNot {
+					// Bare and/or/not tokens were consumed above, so a token
+					// without a recognizable operator can never be a logical
+					// node here. In particular a *value* equal to "and"/"or"/
+					// "not" (e.g. name="and") must stay an ordinary value and
+					// must never overwrite the node's operator.
+					if operator == "" {
 						i = j
 						continue
-					} else {
-
-						// Check ignore fields
-						for ignoreField := range f.ignoreFields {
-							if field == ignoreField {
-								i = j
-								continue outerLoop
-							}
-						}
-
-						// Field whitelist check will be done during expression building
-
 					}
 
-					// Convert field name after whitelist check
+					// Ignore-field filtering happens on the built expression
+					// tree in Build (pruning a condition there cannot leave an
+					// orphaned and/or/not behind, unlike skipping the node here).
+
+					// Pass the raw literal (quotes intact): getClausesFromOperation
+					// types each literal exactly once. Parsing here and re-parsing
+					// there through a %v round-trip destroyed quoted-string typing
+					// ("0123" became int64 123), nulls and dates.
 					convertedField := f.parsFieldsName(field)
-					newNode := &Node{Operator: operator, Value: valueStrForOp, Field: convertedField, Parent: current, Expression: make([]Expr, 0)}
-					if Operation(valueStrForOp) == OperationAnd || Operation(valueStrForOp) == OperationOr || Operation(valueStrForOp) == OperationNot {
-						newNode.Operator = Operation(valueStrForOp)
-					} else {
-
-						newNode.Expression = append(newNode.Expression, getClausesFromOperation(operator, convertedField, value))
-					}
+					newNode := &Node{Operator: operator, Value: valueStr, Field: convertedField, Parent: current, Expression: make([]Expr, 0)}
+					newNode.Expression = append(newNode.Expression, getClausesFromOperation(operator, convertedField, valueStr))
 					current.Children = append(current.Children, newNode)
 					i = j
 				}
@@ -1734,52 +1795,7 @@ func (f *figo) parsFieldsName(str string) string {
 }
 
 func (f *figo) parsFieldsValue(str string) any {
-	s := strings.TrimSpace(str)
-
-	// Handle quoted strings - remove quotes but keep as string
-	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
-		quotedStr := s[1 : len(s)-1] // Remove quotes
-
-		// Try to parse quoted string as date
-		if dateVal, err := parseDate(quotedStr); err == nil {
-			return dateVal
-		}
-
-		return quotedStr
-	}
-
-	// Parse boolean values (only for unquoted values)
-	if s == "true" {
-		return true
-	}
-	if s == "false" {
-		return false
-	}
-
-	// Parse null values
-	if s == "null" || s == "NULL" {
-		return nil
-	}
-
-	// Parse numeric values (only for unquoted values)
-	if s != "" {
-		// Try to parse as integer
-		if intVal, err := strconv.ParseInt(s, 10, 64); err == nil {
-			return intVal
-		}
-		// Try to parse as float
-		if floatVal, err := strconv.ParseFloat(s, 64); err == nil {
-			return floatVal
-		}
-
-		// Try to parse as date (unquoted)
-		if dateVal, err := parseDate(s); err == nil {
-			return dateVal
-		}
-	}
-
-	// Return as string
-	return s
+	return parseScalarLiteral(str)
 }
 
 // parseDate attempts to parse a string as a date using common formats
@@ -1913,90 +1929,149 @@ func splitOutsideQuotes(s string, sep byte) []string {
 	return parts
 }
 
-func getClausesFromOperation(o Operation, field string, value any) Expr {
-	// helper to parse a single scalar literal: preserve quoted strings, parse unquoted numerics
-	parseScalarValue := func(raw string) any {
-		s := strings.TrimSpace(raw)
-		if len(s) >= 2 && strings.HasPrefix(s, "\"") && strings.HasSuffix(s, "\"") {
-			return strings.Trim(s, "\"")
-		}
-		// Type detection for unquoted values, kept consistent with parsFieldsValue
-		// (and the documented "automatic type detection for booleans"). Without
-		// this, active=true parsed to the string "true" rather than a boolean,
-		// producing `active = 'true'` instead of `active = true`.
-		if s == "true" {
-			return true
-		}
-		if s == "false" {
-			return false
-		}
-		if s == "null" || s == "NULL" {
-			return nil
-		}
+// unquoteLiteral strips one balanced pair of surrounding double quotes.
+func unquoteLiteral(raw string) (string, bool) {
+	s := strings.TrimSpace(raw)
+	if len(s) >= 2 && s[0] == '"' && s[len(s)-1] == '"' {
+		return s[1 : len(s)-1], true
+	}
+	return s, false
+}
+
+// parseScalarLiteral types a single DSL literal. A quoted literal is always
+// the enclosed string, verbatim — quoting is the caller's way of saying
+// "do not re-type this" ("0123" stays "0123", "true" stays a string).
+// Unquoted literals get bool/null/int64/float64/date detection.
+func parseScalarLiteral(raw string) any {
+	s, quoted := unquoteLiteral(raw)
+	if quoted {
+		return s
+	}
+	if s == "true" {
+		return true
+	}
+	if s == "false" {
+		return false
+	}
+	if s == "null" || s == "NULL" {
+		return nil
+	}
+	if s != "" {
 		if i, err := strconv.ParseInt(s, 10, 64); err == nil {
 			return i
+		}
+		// An integer too large for int64 must not silently degrade to a
+		// lossy float64; leave it as a string for the database to coerce.
+		if isAllDigits(s) {
+			return s
 		}
 		if f64, err := strconv.ParseFloat(s, 64); err == nil {
 			return f64
 		}
-		return s
+		if dateVal, err := parseDate(s); err == nil {
+			return dateVal
+		}
 	}
+	return s
+}
 
-	// helper to parse a list literal like [1,2,"x"] or ["a,b","c"]
-	parseListValue := func(raw string) []any {
-		s := strings.TrimSpace(raw)
-		if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
-			s = strings.TrimPrefix(s, "[")
-			s = strings.TrimSuffix(s, "]")
-		}
-		if s == "" {
-			return nil
-		}
-		// Split on commas OUTSIDE quotes so quoted elements can contain commas.
-		parts := splitOutsideQuotes(s, ',')
-		vals := make([]any, 0, len(parts))
-		for _, p := range parts {
-			vals = append(vals, parseScalarValue(p))
-		}
-		return vals
+func isAllDigits(s string) bool {
+	t := strings.TrimPrefix(strings.TrimPrefix(s, "-"), "+")
+	if t == "" {
+		return false
 	}
-
-	// helper to parse a string literal for LIKE operations (always string)
-	parseLikeValue := func(raw string) string {
-		s := strings.TrimSpace(raw)
-		if len(s) >= 2 && strings.HasPrefix(s, "\"") && strings.HasSuffix(s, "\"") {
-			return strings.Trim(s, "\"")
+	for _, c := range t {
+		if c < '0' || c > '9' {
+			return false
 		}
-		return s
+	}
+	return true
+}
+
+// parseListLiteral parses a list literal like [1,2,"x"] or ["a,b","c"].
+func parseListLiteral(raw string) []any {
+	s := strings.TrimSpace(raw)
+	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
+		s = strings.TrimPrefix(s, "[")
+		s = strings.TrimSuffix(s, "]")
+	}
+	if s == "" {
+		return nil
+	}
+	// Split on commas OUTSIDE quotes so quoted elements can contain commas.
+	parts := splitOutsideQuotes(s, ',')
+	vals := make([]any, 0, len(parts))
+	for _, p := range parts {
+		vals = append(vals, parseScalarLiteral(p))
+	}
+	return vals
+}
+
+func getClausesFromOperation(o Operation, field string, value any) Expr {
+	// The DSL parser passes the raw literal (quotes intact) so each literal
+	// is typed exactly once, here. Programmatic callers may pass an already
+	// typed value, which is used as-is.
+	rawStr, isRaw := value.(string)
+
+	scalar := func() any {
+		if isRaw {
+			return parseScalarLiteral(rawStr)
+		}
+		return value
+	}
+	str := func() string {
+		if isRaw {
+			s, _ := unquoteLiteral(rawStr)
+			return s
+		}
+		return fmt.Sprintf("%v", value)
+	}
+	list := func() []any {
+		if isRaw {
+			return parseListLiteral(rawStr)
+		}
+		if vals, ok := value.([]any); ok {
+			return vals
+		}
+		return parseListLiteral(fmt.Sprintf("%v", value))
 	}
 
 	switch o {
 	case OperationEq:
-		return EqExpr{Field: field, Value: parseScalarValue(fmt.Sprintf("%v", value))}
+		v := scalar()
+		if v == nil {
+			// x=null means "x IS NULL", not a comparison against the
+			// literal string "<nil>".
+			return IsNullExpr{Field: field}
+		}
+		return EqExpr{Field: field, Value: v}
 	case OperationGte:
-		return GteExpr{Field: field, Value: parseScalarValue(fmt.Sprintf("%v", value))}
+		return GteExpr{Field: field, Value: scalar()}
 	case OperationGt:
-		return GtExpr{Field: field, Value: parseScalarValue(fmt.Sprintf("%v", value))}
+		return GtExpr{Field: field, Value: scalar()}
 	case OperationLt:
-		return LtExpr{Field: field, Value: parseScalarValue(fmt.Sprintf("%v", value))}
+		return LtExpr{Field: field, Value: scalar()}
 	case OperationLte:
-		return LteExpr{Field: field, Value: parseScalarValue(fmt.Sprintf("%v", value))}
+		return LteExpr{Field: field, Value: scalar()}
 	case OperationNeq:
-		return NeqExpr{Field: field, Value: parseScalarValue(fmt.Sprintf("%v", value))}
+		v := scalar()
+		if v == nil {
+			// x!=null means "x IS NOT NULL".
+			return NotNullExpr{Field: field}
+		}
+		return NeqExpr{Field: field, Value: v}
 	case OperationLike:
-		return LikeExpr{Field: field, Value: parseLikeValue(fmt.Sprintf("%v", value))}
+		return LikeExpr{Field: field, Value: str()}
 	case OperationNotLike:
-		return NotExpr{Operands: []Expr{LikeExpr{Field: field, Value: parseLikeValue(fmt.Sprintf("%v", value))}}}
+		return NotExpr{Operands: []Expr{LikeExpr{Field: field, Value: str()}}}
 	case OperationRegex:
-		return RegexExpr{Field: field, Value: parseLikeValue(fmt.Sprintf("%v", value))}
+		return RegexExpr{Field: field, Value: str()}
 	case OperationNotRegex:
-		return NotExpr{Operands: []Expr{RegexExpr{Field: field, Value: parseLikeValue(fmt.Sprintf("%v", value))}}}
+		return NotExpr{Operands: []Expr{RegexExpr{Field: field, Value: str()}}}
 	case OperationIn:
-		vals := parseListValue(fmt.Sprintf("%v", value))
-		return InExpr{Field: field, Values: vals}
+		return InExpr{Field: field, Values: list()}
 	case OperationNotIn:
-		vals := parseListValue(fmt.Sprintf("%v", value))
-		return NotInExpr{Field: field, Values: vals}
+		return NotInExpr{Field: field, Values: list()}
 	case OperationBetween:
 		s := strings.TrimSpace(fmt.Sprintf("%v", value))
 		// strip optional parentheses
@@ -2007,11 +2082,11 @@ func getClausesFromOperation(o Operation, field string, value any) Expr {
 		if idx := strings.Index(s, ".."); idx > 0 {
 			low := strings.TrimSpace(s[:idx])
 			high := strings.TrimSpace(s[idx+2:])
-			return BetweenExpr{Field: field, Low: parseScalarValue(low), High: parseScalarValue(high)}
+			return BetweenExpr{Field: field, Low: parseScalarLiteral(low), High: parseScalarLiteral(high)}
 		}
 		return nil
 	case OperationILike:
-		return ILikeExpr{Field: field, Value: parseLikeValue(fmt.Sprintf("%v", value))}
+		return ILikeExpr{Field: field, Value: str()}
 	case OperationIsNull:
 		return IsNullExpr{Field: field}
 	case OperationNotNull:
@@ -2323,7 +2398,7 @@ func (f *figo) attemptInputRepair(input string) (string, error) {
 		{regexp.MustCompile(`\s+not\s*$`), "", "Remove trailing NOT"},
 		{regexp.MustCompile(`^\s*and\b`), "", "Remove leading AND"},
 		{regexp.MustCompile(`^\s*or\b`), "", "Remove leading OR"},
-		{regexp.MustCompile(`^\s*not\b`), "", "Remove leading NOT"},
+		// A leading NOT is valid and must never be stripped (filter inversion).
 	}
 
 	// Apply repairs
@@ -2455,10 +2530,16 @@ func (f *figo) AddFiltersFromString(input string) error {
 		return nil
 	}
 
+	// Snapshot the plugin manager under the lock; it may be swapped
+	// concurrently by SetPluginManager/RegisterPlugin.
+	f.mu.RLock()
+	pm := f.pluginManager
+	f.mu.RUnlock()
+
 	// Execute BeforeParse plugin hooks
-	if f.pluginManager != nil {
+	if pm != nil {
 		var err error
-		input, err = f.pluginManager.ExecuteBeforeParse(f, input)
+		input, err = pm.ExecuteBeforeParse(f, input)
 		if err != nil {
 			return fmt.Errorf("plugin BeforeParse error: %w", err)
 		}
@@ -2470,8 +2551,8 @@ func (f *figo) AddFiltersFromString(input string) error {
 	f.mu.Unlock()
 
 	// Execute AfterParse plugin hooks
-	if f.pluginManager != nil {
-		err := f.pluginManager.ExecuteAfterParse(f, input)
+	if pm != nil {
+		err := pm.ExecuteAfterParse(f, input)
 		if err != nil {
 			return fmt.Errorf("plugin AfterParse error: %w", err)
 		}
@@ -2508,10 +2589,15 @@ func (f *figo) AddFiltersFromStringWithRepair(input string, useRepair bool) erro
 		fixedInput = input
 	}
 
+	// Snapshot the plugin manager under the lock (see AddFiltersFromString).
+	f.mu.RLock()
+	pm := f.pluginManager
+	f.mu.RUnlock()
+
 	// Execute BeforeParse plugin hooks
-	if f.pluginManager != nil {
+	if pm != nil {
 		var err error
-		fixedInput, err = f.pluginManager.ExecuteBeforeParse(f, fixedInput)
+		fixedInput, err = pm.ExecuteBeforeParse(f, fixedInput)
 		if err != nil {
 			return fmt.Errorf("plugin BeforeParse error: %w", err)
 		}
@@ -2523,8 +2609,8 @@ func (f *figo) AddFiltersFromStringWithRepair(input string, useRepair bool) erro
 	f.mu.Unlock()
 
 	// Execute AfterParse plugin hooks
-	if f.pluginManager != nil {
-		err := f.pluginManager.ExecuteAfterParse(f, fixedInput)
+	if pm != nil {
+		err := pm.ExecuteAfterParse(f, fixedInput)
 		if err != nil {
 			return fmt.Errorf("plugin AfterParse error: %w", err)
 		}
@@ -2533,11 +2619,20 @@ func (f *figo) AddFiltersFromStringWithRepair(input string, useRepair bool) erro
 	return nil
 }
 
+// AddFilter appends a programmatic expression. The ignore-field list and the
+// field whitelist (when enabled) apply here exactly as they do to DSL input —
+// configure them BEFORE adding filters.
 func (f *figo) AddFilter(exp Expr) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	f.clauses = append(f.clauses, exp)
+	exp = f.filterIgnoredFields(exp)
+	if exp != nil && f.fieldWhitelist {
+		exp = f.filterAllowedFields(exp)
+	}
+	if exp != nil {
+		f.clauses = append(f.clauses, exp)
+	}
 }
 
 func (f *figo) AddIgnoreFields(fields ...string) {
@@ -2714,7 +2809,10 @@ func (f *figo) GetSqlString(ctx any, conditionType ...string) string {
 	return ""
 }
 
-// GetExplainedSqlString returns a SQL string with placeholders expanded for easier debugging
+// GetExplainedSqlString delegates to the adapter's GetSqlString. Whether
+// placeholders appear expanded depends on the adapter (RawAdapter and
+// GormAdapter interpolate literals on this path; others render as-is) —
+// this method performs no expansion of its own. For the AST, use Explain.
 func (f *figo) GetExplainedSqlString(ctx any, conditionType ...string) string {
 	f.mu.RLock()
 	adapter := f.adapterObj
@@ -2845,8 +2943,13 @@ func (f *figo) Build(adapter ...Adapter) {
 		return
 	}
 
-	// Clear existing clauses before rebuilding
+	// Clear all DSL-derived state before rebuilding so Build is idempotent:
+	// preloads used to accumulate (Build();Build() duplicated every load=
+	// condition) and a previous DSL's sort survived a rebuild. Page is kept —
+	// it has public setters (SetPage) whose effect must outlive Build.
 	f.clauses = []Expr{}
+	f.preloads = make(map[string][]Expr)
+	f.sort = nil
 
 	root := f.parseDSL(f.dsl)
 	expressionParser(root)
@@ -2854,133 +2957,149 @@ func (f *figo) Build(adapter ...Adapter) {
 	finalExpr := getFinalExpr(*root)
 
 	if finalExpr != nil {
-		// Apply field whitelist filtering if enabled
-		if f.fieldWhitelist {
-			filteredExpr := f.filterAllowedFields(finalExpr)
-			if filteredExpr != nil {
-				f.clauses = append(f.clauses, filteredExpr)
+		finalExpr = f.filterIgnoredFields(finalExpr)
+	}
+	if finalExpr != nil && f.fieldWhitelist {
+		finalExpr = f.filterAllowedFields(finalExpr)
+	}
+	if finalExpr != nil {
+		f.clauses = append(f.clauses, finalExpr)
+	}
+
+	// Preload conditions parse through the same DSL, so ignored fields must
+	// be pruned from them as well.
+	for table, exprs := range f.preloads {
+		kept := exprs[:0]
+		for _, e := range exprs {
+			if pruned := f.filterIgnoredFields(e); pruned != nil {
+				kept = append(kept, pruned)
 			}
+		}
+		if len(kept) == 0 {
+			delete(f.preloads, table)
 		} else {
-			f.clauses = append(f.clauses, finalExpr)
+			f.preloads[table] = kept
 		}
 	}
 }
 
-// filterAllowedFields recursively filters out disallowed fields from expressions
-func (f *figo) filterAllowedFields(expr Expr) Expr {
+// exprField returns the field a leaf expression filters on, or "" for
+// expressions without one (OrderBy, unknown types).
+func exprField(expr Expr) string {
 	switch e := expr.(type) {
 	case EqExpr:
-		if f.isFieldAllowedUnsafe(e.Field) {
-			return e
-		}
-		return nil
+		return e.Field
 	case GteExpr:
-		if f.isFieldAllowedUnsafe(e.Field) {
-			return e
-		}
-		return nil
+		return e.Field
 	case GtExpr:
-		if f.isFieldAllowedUnsafe(e.Field) {
-			return e
-		}
-		return nil
+		return e.Field
 	case LtExpr:
-		if f.isFieldAllowedUnsafe(e.Field) {
-			return e
-		}
-		return nil
+		return e.Field
 	case LteExpr:
-		if f.isFieldAllowedUnsafe(e.Field) {
-			return e
-		}
-		return nil
+		return e.Field
 	case NeqExpr:
-		if f.isFieldAllowedUnsafe(e.Field) {
-			return e
-		}
-		return nil
+		return e.Field
 	case LikeExpr:
-		if f.isFieldAllowedUnsafe(e.Field) {
-			return e
-		}
-		return nil
+		return e.Field
 	case ILikeExpr:
-		if f.isFieldAllowedUnsafe(e.Field) {
-			return e
-		}
-		return nil
+		return e.Field
 	case RegexExpr:
-		if f.isFieldAllowedUnsafe(e.Field) {
-			return e
-		}
-		return nil
+		return e.Field
 	case InExpr:
-		if f.isFieldAllowedUnsafe(e.Field) {
-			return e
-		}
-		return nil
+		return e.Field
 	case NotInExpr:
-		if f.isFieldAllowedUnsafe(e.Field) {
-			return e
-		}
-		return nil
+		return e.Field
 	case BetweenExpr:
-		if f.isFieldAllowedUnsafe(e.Field) {
-			return e
-		}
-		return nil
+		return e.Field
 	case IsNullExpr:
-		if f.isFieldAllowedUnsafe(e.Field) {
-			return e
-		}
-		return nil
+		return e.Field
 	case NotNullExpr:
-		if f.isFieldAllowedUnsafe(e.Field) {
-			return e
-		}
-		return nil
-	case AndExpr:
-		var filteredOperands []Expr
-		for _, operand := range e.Operands {
-			if filtered := f.filterAllowedFields(operand); filtered != nil {
-				filteredOperands = append(filteredOperands, filtered)
-			}
-		}
-		if len(filteredOperands) == 0 {
-			return nil
-		}
-		if len(filteredOperands) == 1 {
-			return filteredOperands[0]
-		}
-		return AndExpr{Operands: filteredOperands}
-	case OrExpr:
-		var filteredOperands []Expr
-		for _, operand := range e.Operands {
-			if filtered := f.filterAllowedFields(operand); filtered != nil {
-				filteredOperands = append(filteredOperands, filtered)
-			}
-		}
-		if len(filteredOperands) == 0 {
-			return nil
-		}
-		if len(filteredOperands) == 1 {
-			return filteredOperands[0]
-		}
-		return OrExpr{Operands: filteredOperands}
-	case NotExpr:
-		var filteredOperands []Expr
-		for _, operand := range e.Operands {
-			if filtered := f.filterAllowedFields(operand); filtered != nil {
-				filteredOperands = append(filteredOperands, filtered)
-			}
-		}
-		if len(filteredOperands) == 0 {
-			return nil
-		}
-		return NotExpr{Operands: filteredOperands}
+		return e.Field
+	case JsonPathExpr:
+		return e.Field
+	case ArrayContainsExpr:
+		return e.Field
+	case ArrayOverlapsExpr:
+		return e.Field
+	case FullTextSearchExpr:
+		return e.Field
+	case GeoDistanceExpr:
+		return e.Field
+	case CustomExpr:
+		return e.Field
 	default:
+		return ""
+	}
+}
+
+// pruneExprFields removes every leaf whose field fails keep, rebuilding the
+// logical structure around the survivors. Dropping a leaf drops it from its
+// parent's operand list, so no dangling AND/OR/NOT is left behind.
+func pruneExprFields(expr Expr, keep func(field string) bool) Expr {
+	switch e := expr.(type) {
+	case AndExpr:
+		operands := pruneOperands(e.Operands, keep)
+		if len(operands) == 0 {
+			return nil
+		}
+		if len(operands) == 1 {
+			return operands[0]
+		}
+		return AndExpr{Operands: operands}
+	case OrExpr:
+		operands := pruneOperands(e.Operands, keep)
+		if len(operands) == 0 {
+			return nil
+		}
+		if len(operands) == 1 {
+			return operands[0]
+		}
+		return OrExpr{Operands: operands}
+	case NotExpr:
+		operands := pruneOperands(e.Operands, keep)
+		if len(operands) == 0 {
+			return nil
+		}
+		return NotExpr{Operands: operands}
+	default:
+		if field := exprField(e); field != "" && !keep(field) {
+			return nil
+		}
 		return e
 	}
+}
+
+func pruneOperands(operands []Expr, keep func(field string) bool) []Expr {
+	var kept []Expr
+	for _, operand := range operands {
+		if pruned := pruneExprFields(operand, keep); pruned != nil {
+			kept = append(kept, pruned)
+		}
+	}
+	return kept
+}
+
+// filterAllowedFields recursively filters out disallowed fields from expressions
+func (f *figo) filterAllowedFields(expr Expr) Expr {
+	return pruneExprFields(expr, f.isFieldAllowedUnsafe)
+}
+
+// filterIgnoredFields prunes conditions on ignored fields. Expression fields
+// have already been through the naming strategy, so each registered ignore
+// name is matched both verbatim and in its converted form — callers may
+// register either spelling.
+func (f *figo) filterIgnoredFields(expr Expr) Expr {
+	if len(f.ignoreFields) == 0 {
+		return expr
+	}
+	ignored := make(map[string]bool, len(f.ignoreFields)*2)
+	for name := range f.ignoreFields {
+		ignored[name] = true
+		ignored[f.parsFieldsName(name)] = true
+	}
+	return pruneExprFields(expr, func(field string) bool {
+		return !ignored[field]
+	})
 }
 
 // Cache Management Methods
@@ -2989,7 +3108,18 @@ func (f *figo) filterAllowedFields(expr Expr) Expr {
 func (f *figo) SetCache(cache QueryCache) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.stopOwnedCacheLocked()
 	f.cache = cache
+}
+
+// stopOwnedCacheLocked stops the cleanup goroutine of a cache this instance
+// created itself (via SetCacheConfig) when that cache is being replaced.
+// Caller must hold f.mu.
+func (f *figo) stopOwnedCacheLocked() {
+	if f.ownedCache != nil && QueryCache(f.ownedCache) == f.cache {
+		f.ownedCache.Stop()
+	}
+	f.ownedCache = nil
 }
 
 // GetCache returns the current cache instance
@@ -3005,7 +3135,17 @@ func (f *figo) SetCacheConfig(config CacheConfig) {
 	defer f.mu.Unlock()
 	f.cacheConfig = config
 	if f.cache == nil && config.Enabled {
-		f.cache = NewInMemoryCache(config)
+		owned := NewInMemoryCache(config)
+		f.cache = owned
+		f.ownedCache = owned
+		// The cleanup goroutine keeps the cache alive forever; stop it when
+		// this figo instance is garbage-collected so instances created per
+		// request don't accumulate goroutines.
+		runtime.SetFinalizer(f, func(ff *figo) {
+			if ff.ownedCache != nil {
+				ff.ownedCache.Stop()
+			}
+		})
 	}
 }
 
@@ -3050,8 +3190,11 @@ func (f *figo) generateCacheKey(kind string, ctx any, conditionType ...string) s
 	components := []string{
 		kind,
 		f.dsl,
-		fmt.Sprintf("%v", f.clauses),
-		fmt.Sprintf("%v", f.preloads),
+		// %#v keeps value types in the key: a = int64(1) and a = "1" render
+		// different SQL and must not share a cache slot (%v printed both as
+		// "1", colliding when instances share one cache).
+		fmt.Sprintf("%#v", f.clauses),
+		fmt.Sprintf("%#v", f.preloads),
 		fmt.Sprintf("%v", f.page),
 		fmt.Sprintf("%v", f.sort),
 		fmt.Sprintf("%v", f.ignoreFields),
@@ -3102,9 +3245,14 @@ func (f *figo) GetCachedSqlString(ctx any, conditionType ...string) string {
 		}
 	}
 
-	// Generate and cache
+	// Generate and cache. The key was computed from a snapshot taken before
+	// rendering; if a concurrent Build/AddFiltersFromString changed the state
+	// in between, the rendered SQL belongs to the NEW state and storing it
+	// under the OLD key would poison the cache — verify and skip caching.
 	sql := f.GetSqlString(ctx, conditionType...)
-	cache.Set(key, sql, ttl)
+	if f.generateCacheKey("sql", ctx, conditionType...) == key {
+		cache.Set(key, sql, ttl)
+	}
 	cacheHit = false
 
 	return sql
@@ -3141,9 +3289,9 @@ func (f *figo) GetCachedQuery(ctx any, conditionType ...string) Query {
 		}
 	}
 
-	// Generate and cache
+	// Generate and cache (see GetCachedSqlString for the key re-check).
 	query := f.GetQuery(ctx, conditionType...)
-	if query != nil {
+	if query != nil && f.generateCacheKey("query", ctx, conditionType...) == key {
 		cache.Set(key, query, ttl)
 	}
 	cacheHit = false
@@ -3230,8 +3378,13 @@ func (f *figo) RegisterPlugin(plugin Plugin) error {
 		return err
 	}
 
-	// Initialize the plugin
-	return plugin.Initialize(f)
+	// Initialize the plugin; roll back the registration on failure so a
+	// broken plugin's hooks never run and a fixed one can re-register.
+	if err := plugin.Initialize(f); err != nil {
+		_ = pm.UnregisterPlugin(plugin.Name())
+		return err
+	}
+	return nil
 }
 
 // UnregisterPlugin removes a plugin

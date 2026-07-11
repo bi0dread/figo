@@ -216,10 +216,23 @@ func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) 
 			"exists": map[string]interface{}{"field": x.Field},
 		}, nil
 	case InExpr:
+		if len(x.Values) == 0 {
+			// A nil values slice marshals to "terms": {field: null}, which
+			// Elasticsearch rejects. An empty IN set matches nothing.
+			return map[string]interface{}{
+				"match_none": map[string]interface{}{},
+			}, nil
+		}
 		return map[string]interface{}{
 			"terms": map[string]interface{}{x.Field: x.Values},
 		}, nil
 	case NotInExpr:
+		if len(x.Values) == 0 {
+			// "NOT IN (empty set)" is true for every document.
+			return map[string]interface{}{
+				"match_all": map[string]interface{}{},
+			}, nil
+		}
 		return map[string]interface{}{
 			"bool": map[string]interface{}{
 				"must_not": map[string]interface{}{
@@ -267,17 +280,26 @@ func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) 
 			},
 		}, nil
 	case NotExpr:
-		if len(x.Operands) > 0 && x.Operands[0] != nil {
-			inner, err := buildElasticsearchQueryFromExpr(x.Operands[0])
+		// NotExpr means "none of the operands match" — must_not takes every
+		// operand, not just the first (dropping operands widened the match).
+		musts := []map[string]interface{}{}
+		for _, op := range x.Operands {
+			if op == nil {
+				continue
+			}
+			inner, err := buildElasticsearchQueryFromExpr(op)
 			if err != nil {
 				return nil, err
 			}
+			musts = append(musts, inner)
+		}
+		if len(musts) == 0 {
 			return map[string]interface{}{
-				"bool": map[string]interface{}{"must_not": inner},
+				"match_all": map[string]interface{}{},
 			}, nil
 		}
 		return map[string]interface{}{
-			"match_all": map[string]interface{}{},
+			"bool": map[string]interface{}{"must_not": musts},
 		}, nil
 	default:
 		return nil, fmt.Errorf("figo: unsupported expression type %T for the Elasticsearch adapter", expr)
@@ -285,12 +307,18 @@ func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) 
 }
 
 // sqlLikeToESWildcard translates a SQL LIKE pattern to an Elasticsearch wildcard
-// pattern: '%' -> '*' (any sequence) and '_' -> '?' (single char).
+// pattern: '%' -> '*' (any sequence) and '_' -> '?' (single char). Literal
+// '*', '?' and '\' in the value are escaped first — otherwise a user value
+// containing '*' becomes a wildcard on ES only (the Mongo adapter escapes
+// regex metachars, SQL treats it literally).
 func sqlLikeToESWildcard(v any) string {
 	str, ok := v.(string)
 	if !ok {
 		return fmt.Sprintf("%v", v)
 	}
+	str = strings.ReplaceAll(str, `\`, `\\`)
+	str = strings.ReplaceAll(str, "*", `\*`)
+	str = strings.ReplaceAll(str, "?", `\?`)
 	str = strings.ReplaceAll(str, "%", "*")
 	str = strings.ReplaceAll(str, "_", "?")
 	return str

@@ -98,15 +98,16 @@ func TestEnhancedTypeParsing(t *testing.T) {
 	t.Run("DateParsing", func(t *testing.T) {
 		f := New()
 
-		// Test various date formats
+		// Unquoted date literals get date detection; quoted literals stay
+		// strings (quoting is the "do not re-type this" escape hatch).
 		testCases := []struct {
 			input    string
 			expected time.Time
 		}{
-			{`"2023-01-15T10:30:00Z"`, time.Date(2023, 1, 15, 10, 30, 0, 0, time.UTC)},
-			{`"2023-01-15"`, time.Date(2023, 1, 15, 0, 0, 0, 0, time.UTC)},
-			{`"2023/01/15"`, time.Date(2023, 1, 15, 0, 0, 0, 0, time.UTC)},
-			{`"Jan 15, 2023"`, time.Date(2023, 1, 15, 0, 0, 0, 0, time.UTC)},
+			{`2023-01-15T10:30:00Z`, time.Date(2023, 1, 15, 10, 30, 0, 0, time.UTC)},
+			{`2023-01-15`, time.Date(2023, 1, 15, 0, 0, 0, 0, time.UTC)},
+			{`2023/01/15`, time.Date(2023, 1, 15, 0, 0, 0, 0, time.UTC)},
+			{`Jan 15, 2023`, time.Date(2023, 1, 15, 0, 0, 0, 0, time.UTC)},
 		}
 
 		for _, tc := range testCases {

@@ -197,9 +197,9 @@ func mongoExpr(e Expr) (bson.M, error) {
 	case NotNullExpr:
 		return bson.M{x.Field: bson.M{"$ne": nil}}, nil
 	case InExpr:
-		return bson.M{x.Field: bson.M{"$in": x.Values}}, nil
+		return bson.M{x.Field: bson.M{"$in": nonNilValues(x.Values)}}, nil
 	case NotInExpr:
-		return bson.M{x.Field: bson.M{"$nin": x.Values}}, nil
+		return bson.M{x.Field: bson.M{"$nin": nonNilValues(x.Values)}}, nil
 	case BetweenExpr:
 		return bson.M{x.Field: bson.M{"$gte": x.Low, "$lte": x.High}}, nil
 	case AndExpr:
@@ -229,6 +229,17 @@ func mongoExpr(e Expr) (bson.M, error) {
 
 // logicalBSON wraps rendered operands under a logical operator, avoiding an
 // invalid "{$and: null}" (Mongo rejects an empty/nil operand array).
+// nonNilValues guarantees $in/$nin receive a real (possibly empty) array. A
+// nil slice marshals to BSON null and MongoDB rejects the query at runtime
+// ("$in needs an array"); an empty array is valid and matches nothing
+// ($in) / everything ($nin).
+func nonNilValues(values []any) []any {
+	if values == nil {
+		return []any{}
+	}
+	return values
+}
+
 func logicalBSON(op string, parts []bson.M) bson.M {
 	if len(parts) == 0 {
 		return bson.M{}
@@ -266,9 +277,9 @@ func mongoExprQualified(e Expr, qualifier string) (bson.M, error) {
 	case NotNullExpr:
 		return bson.M{q(x.Field): bson.M{"$ne": nil}}, nil
 	case InExpr:
-		return bson.M{q(x.Field): bson.M{"$in": x.Values}}, nil
+		return bson.M{q(x.Field): bson.M{"$in": nonNilValues(x.Values)}}, nil
 	case NotInExpr:
-		return bson.M{q(x.Field): bson.M{"$nin": x.Values}}, nil
+		return bson.M{q(x.Field): bson.M{"$nin": nonNilValues(x.Values)}}, nil
 	case BetweenExpr:
 		return bson.M{q(x.Field): bson.M{"$gte": x.Low, "$lte": x.High}}, nil
 	case AndExpr:
@@ -309,7 +320,6 @@ func likeToRegexPattern(v any) string {
 	default:
 		s = fmt.Sprint(x)
 	}
-	s = strings.Trim(s, "\"")
 	var b strings.Builder
 	b.WriteByte('^')
 	for _, r := range s {

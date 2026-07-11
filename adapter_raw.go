@@ -163,7 +163,10 @@ func exprToSQL(e Expr) (string, []any) {
 		if len(x.Operands) == 0 {
 			return "", nil
 		}
-		inner, args := joinGroup("AND", x.Operands)
+		// NotExpr means "none of the operands match": NOT(a OR b), matching
+		// Mongo's $nor and GORM's clause.Not. Joining with AND here rendered
+		// NOT(a AND b), which matches rows the other adapters exclude.
+		inner, args := joinGroup("OR", x.Operands)
 		if inner == "" {
 			return "", nil
 		}
@@ -228,7 +231,8 @@ func exprToSQLQualified(e Expr, qualifier string) (string, []any) {
 		if len(x.Operands) == 0 {
 			return "", nil
 		}
-		inner, args := joinGroupQualified("AND", x.Operands, qualifier)
+		// See exprToSQL: NotExpr is NOT(a OR b) across all adapters.
+		inner, args := joinGroupQualified("OR", x.Operands, qualifier)
 		if inner == "" {
 			return "", nil
 		}
@@ -414,19 +418,18 @@ func buildByConditions(f Figo, table string, conditionType ...string) (string, [
 				parts = append(parts, orderBy)
 			}
 		case "LIMIT":
-			if limitOffset != "" {
-				if strings.HasPrefix(limitOffset, "LIMIT ") {
+			// Emit only the LIMIT part: "LIMIT" alone must not leak the
+			// OFFSET, and "LIMIT","OFFSET" must not duplicate it.
+			if strings.HasPrefix(limitOffset, "LIMIT ") {
+				if idx := strings.Index(limitOffset, " OFFSET "); idx >= 0 {
+					parts = append(parts, limitOffset[:idx])
+				} else {
 					parts = append(parts, limitOffset)
 				}
 			}
 		case "OFFSET":
-			if limitOffset != "" {
-				if strings.HasPrefix(limitOffset, "OFFSET ") {
-					parts = append(parts, limitOffset)
-				} else if strings.Contains(limitOffset, " OFFSET ") {
-					idx := strings.Index(limitOffset, " OFFSET ")
-					parts = append(parts, limitOffset[idx+1:])
-				}
+			if idx := strings.Index(limitOffset, "OFFSET "); idx >= 0 {
+				parts = append(parts, limitOffset[idx:])
 			}
 		case "PAGE":
 			if limitOffset != "" {
@@ -580,6 +583,13 @@ func escapeSQLString(s string) string {
 }
 
 func normalizeColumnName(f Figo, name string) string {
+	// A custom naming func overrides the strategy, exactly as it does at
+	// parse time — re-normalizing with the strategy here would undo the
+	// custom func's output (e.g. re-snake_casing a deliberately preserved
+	// camelCase name).
+	if fn := f.GetNamingFunc(); fn != nil {
+		return fn(name)
+	}
 	switch f.GetNamingStrategy() {
 	case NAMING_STRATEGY_SNAKE_CASE:
 		result := stringy.New(name).SnakeCase("?", "").ToLower()

@@ -93,10 +93,22 @@ func toGormClauseWithFigo(e Expr, f Figo) clause.Expression {
 	}
 }
 
+// gormAppliedSetting marks a *gorm.DB that already went through ApplyGorm so
+// the adapter never double-applies. A caller-scoped DB (tenant filters etc.)
+// does not carry the marker, so figo's filters are applied on top of it.
+const gormAppliedSetting = "figo:applied"
+
 // ApplyGorm applies pagination, preloads, where clauses, and sorting to a GORM DB instance.
 func ApplyGorm(f Figo, trx *gorm.DB) *gorm.DB {
-	trx = trx.Limit(f.GetPage().Take)
-	trx = trx.Offset(f.GetPage().Skip)
+	trx = trx.Set(gormAppliedSetting, true)
+	// Take/Skip <= 0 mean "no limit"/"no offset" in every other adapter;
+	// passing 0 to GORM's Limit would return zero rows instead.
+	if take := f.GetPage().Take; take > 0 {
+		trx = trx.Limit(take)
+	}
+	if skip := f.GetPage().Skip; skip > 0 {
+		trx = trx.Offset(skip)
+	}
 
 	// select fields
 	if len(f.GetSelectFields()) > 0 {
@@ -138,9 +150,27 @@ func ApplyGorm(f Figo, trx *gorm.DB) *gorm.DB {
 	return trx
 }
 
-// GetGormSqlString renders the SQL string from a configured GORM DB instance using DryRun.
-func getGormSqlString(trx *gorm.DB, conditionType ...string) string {
-	// Create a new session with DryRun mode without starting a transaction
+// gormDryRunSQL renders the statement for a configured GORM DB via DryRun and
+// returns the placeholder SQL plus its bind variables. With no conditionType
+// it renders the complete SELECT the way GORM itself would execute it; with
+// segment names ("WHERE", "SORT", ...) it builds only those clauses.
+func gormDryRunSQL(trx *gorm.DB, conditionType ...string) (string, []any) {
+	if len(conditionType) == 0 {
+		// A chained call (Find) resets a NewDB session's statement, so keep
+		// the statement and let GORM's own query path build the full SELECT.
+		tr := trx.Session(&gorm.Session{DryRun: true})
+		tr.Logger = logger.Default.LogMode(logger.Silent)
+		dest := tr.Statement.Dest
+		if dest == nil {
+			if tr.Statement.Model != nil {
+				dest = tr.Statement.Model
+			} else {
+				dest = &[]map[string]any{}
+			}
+		}
+		tr = tr.Find(dest)
+		return tr.Statement.SQL.String(), tr.Statement.Vars
+	}
 
 	tr := trx.Session(&gorm.Session{DryRun: true, NewDB: true})
 	tr.Logger = logger.Default.LogMode(logger.Silent)
@@ -149,12 +179,23 @@ func getGormSqlString(trx *gorm.DB, conditionType ...string) string {
 
 	tr.Callback().Query().Execute(tr)
 	stmt.Build(conditionType...)
-	sqlWithPlaceholders := stmt.SQL.String()
-	params := stmt.Vars
+	return stmt.SQL.String(), stmt.Vars
+}
 
-	fullSQL := tr.Dialector.Explain(sqlWithPlaceholders, params...)
+// getGormSqlString renders the SQL string from a configured GORM DB instance
+// using DryRun, with placeholders interpolated for display.
+func getGormSqlString(trx *gorm.DB, conditionType ...string) string {
+	sqlWithPlaceholders, params := gormDryRunSQL(trx, conditionType...)
+	return trx.Dialector.Explain(sqlWithPlaceholders, params...)
+}
 
-	return fullSQL
+// applyGormOnce applies figo's state to the DB unless it already went through
+// ApplyGorm (the caller may pre-apply and pass the result back in).
+func applyGormOnce(f Figo, db *gorm.DB) *gorm.DB {
+	if _, applied := db.Get(gormAppliedSetting); applied {
+		return db
+	}
+	return ApplyGorm(f, db)
 }
 
 // AdapterGormGetSql is an internal helper to integrate with figo.GetSqlString
@@ -163,19 +204,10 @@ func AdapterGormGetSql(f Figo, ctx any, conditionType ...string) (string, bool) 
 	if !ok || db == nil {
 		return "", false
 	}
-	// Check if the DB already has clauses applied (to avoid double-applying)
-	// If it has clauses, use it directly; otherwise apply Figo filters
-	if len(db.Statement.Clauses) > 0 {
-		// DB already has clauses applied, use it directly
-		return getGormSqlString(db, conditionType...), true
-	} else {
-		// Apply Figo filters and sort to the GORM DB instance first
-		appliedDB := ApplyGorm(f, db)
-		return getGormSqlString(appliedDB, conditionType...), true
-	}
+	return getGormSqlString(applyGormOnce(f, db), conditionType...), true
 }
 
-// GormAdapter is an Adapter object you can pass to NewWithAdapterObject
+// GormAdapter is an Adapter object you can pass to Build
 type GormAdapter struct{}
 
 func (GormAdapter) GetSqlString(f Figo, ctx any, conditionType ...string) (string, bool) {
@@ -193,6 +225,6 @@ func (GormAdapter) GetQuery(f Figo, ctx any, conditionType ...string) (Query, bo
 	if !ok || db == nil {
 		return nil, false
 	}
-	sql := getGormSqlString(db, conditionType...)
-	return SQLQuery{SQL: sql, Args: nil}, true
+	sql, args := gormDryRunSQL(applyGormOnce(f, db), conditionType...)
+	return SQLQuery{SQL: sql, Args: args}, true
 }
