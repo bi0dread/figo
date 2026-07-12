@@ -200,7 +200,7 @@ func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) 
 	case RegexExpr:
 		return map[string]interface{}{
 			"regexp": map[string]interface{}{
-				x.Field: x.Value,
+				x.Field: esRegexpContains(x.Value),
 			},
 		}, nil
 	case IsNullExpr:
@@ -301,6 +301,14 @@ func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) 
 		return map[string]interface{}{
 			"bool": map[string]interface{}{"must_not": musts},
 		}, nil
+	case OrderBy:
+		// A stray OrderBy in the clause list is a no-op predicate (ordering is
+		// applied via query.Sort, not the query body). Match everything so it
+		// composes harmlessly inside a bool/must — mirroring the Mongo adapter,
+		// which returns an empty predicate rather than failing the whole query.
+		return map[string]interface{}{
+			"match_all": map[string]interface{}{},
+		}, nil
 	default:
 		return nil, fmt.Errorf("figo: unsupported expression type %T for the Elasticsearch adapter", expr)
 	}
@@ -311,6 +319,22 @@ func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) 
 // '*', '?' and '\' in the value are escaped first — otherwise a user value
 // containing '*' becomes a wildcard on ES only (the Mongo adapter escapes
 // regex metachars, SQL treats it literally).
+// esRegexpContains adapts a `=~` pattern for Elasticsearch's regexp query.
+// Lucene's regexp is implicitly anchored to the whole field value, whereas the
+// DSL's `=~` (like Mongo's $regex and SQL REGEXP) is an unanchored *contains*
+// match. Wrapping the user pattern as `.*(<pattern>).*` restores contains
+// semantics, and the parentheses keep top-level alternations (`a|b`) grouped so
+// the leading/trailing `.*` don't bind to only one branch. Note: Lucene regexp
+// syntax still differs from PCRE (e.g. `\d`, `^`, `$` are not supported), which
+// is a backend limitation this cannot paper over.
+func esRegexpContains(v any) string {
+	str, ok := v.(string)
+	if !ok {
+		str = fmt.Sprintf("%v", v)
+	}
+	return ".*(" + str + ").*"
+}
+
 func sqlLikeToESWildcard(v any) string {
 	str, ok := v.(string)
 	if !ok {

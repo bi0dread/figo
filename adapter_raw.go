@@ -401,6 +401,8 @@ func buildByConditions(f Figo, table string, conditionType ...string) (string, [
 	parts := make([]string, 0, len(conditionType)*2)
 	args := make([]any, 0)
 	joinAdded := false
+	whereAdded := false
+	orderAdded := false
 	for _, ct := range conditionType {
 		norm := normalizeConditionType(ct)
 		switch norm {
@@ -409,13 +411,19 @@ func buildByConditions(f Figo, table string, conditionType ...string) (string, [
 		case "FROM":
 			parts = append(parts, fmt.Sprintf("FROM %s", quoteIdent(table)))
 		case "WHERE", "LIKE":
-			if where != "" {
+			// "WHERE" and "LIKE" are aliases for the same clause; guard against
+			// emitting it (and its args) twice when both are requested, which
+			// would also misalign every later placeholder.
+			if where != "" && !whereAdded {
 				parts = append(parts, "WHERE "+where)
 				args = append(args, whereArgs...)
+				whereAdded = true
 			}
 		case "ORDER BY", "SORT":
-			if orderBy != "" {
+			// "ORDER BY" and "SORT" are aliases; emit the clause at most once.
+			if orderBy != "" && !orderAdded {
 				parts = append(parts, orderBy)
+				orderAdded = true
 			}
 		case "LIMIT":
 			// Emit only the LIMIT part: "LIMIT" alone must not leak the
@@ -523,19 +531,29 @@ func expandPlaceholders(sql string, args []any) string {
 	idx := 0
 	inSingle := false
 	inDouble := false
+	inBacktick := false
 	for i := 0; i < len(sql); i++ {
 		ch := sql[i]
-		if ch == '\'' && !inDouble {
+		if ch == '\'' && !inDouble && !inBacktick {
 			inSingle = !inSingle
 			b.WriteByte(ch)
 			continue
 		}
-		if ch == '"' && !inSingle {
+		if ch == '"' && !inSingle && !inBacktick {
 			inDouble = !inDouble
 			b.WriteByte(ch)
 			continue
 		}
-		if ch == '?' && !inSingle && !inDouble && idx < len(args) {
+		// Track backtick-quoted identifiers too: a '?' inside `a?b` is part of
+		// the column name, not a bind placeholder. Without this the value was
+		// spliced into the identifier and every later placeholder bound to the
+		// wrong arg.
+		if ch == '`' && !inSingle && !inDouble {
+			inBacktick = !inBacktick
+			b.WriteByte(ch)
+			continue
+		}
+		if ch == '?' && !inSingle && !inDouble && !inBacktick && idx < len(args) {
 			b.WriteString(toSQLLiteral(args[idx]))
 			idx++
 			continue

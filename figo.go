@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"regexp"
 	"runtime"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -1848,10 +1849,15 @@ func isSimpleFieldName(token string) bool {
 		return false
 	}
 
-	// Must contain only alphanumeric characters and underscores
+	// Must contain only field-name characters. Besides [A-Za-z0-9_] this allows
+	// '.', '-' and '$' so qualified/kebab/Mongo-style names (user.age, user-name,
+	// price$) are recognized as fields — without this, such a name followed by a
+	// *spaced* operator ("user.age > 5") failed to combine and emitted a predicate
+	// on an empty column. Operator characters (= > < ! ^ ~) are already rejected
+	// by the guard above, so widening here can't swallow an operator token.
 	for _, char := range token {
 		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
-			(char >= '0' && char <= '9') || char == '_') {
+			(char >= '0' && char <= '9') || char == '_' || char == '.' || char == '-' || char == '$') {
 			return false
 		}
 	}
@@ -3186,6 +3192,90 @@ func (f *figo) ClearCache() {
 // covers everything that changes the rendered output: the adapter type, the
 // custom naming func, and the global regex SQL operator (previously omitted,
 // which returned a stale result after SetAdapterObject / a regex-operator change).
+// valueTypeSignature renders the Go type of every value carried by the given
+// expression trees, in order. It exists because the cache key's %#v encoding
+// collapses int(1)/int64(1)/float64(1) to the same text; appending this makes
+// two clauses that differ only in a value's numeric type produce distinct keys.
+func valueTypeSignature(exprs []Expr) string {
+	var b strings.Builder
+	for _, e := range exprs {
+		appendValueTypes(&b, e)
+		b.WriteByte('|')
+	}
+	return b.String()
+}
+
+// preloadValueTypeSignature does the same across all preload expression lists,
+// keyed by relation name so two preloads can't swap type signatures unnoticed.
+func preloadValueTypeSignature(preloads map[string][]Expr) string {
+	var b strings.Builder
+	for _, name := range sortedKeys2(preloads) {
+		b.WriteString(name)
+		b.WriteByte(':')
+		b.WriteString(valueTypeSignature(preloads[name]))
+	}
+	return b.String()
+}
+
+// sortedKeys2 returns the map keys in deterministic order (the key must be
+// stable regardless of Go's random map iteration).
+func sortedKeys2(m map[string][]Expr) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func appendValueTypes(b *strings.Builder, e Expr) {
+	writeT := func(v any) { b.WriteString(fmt.Sprintf("%T,", v)) }
+	writeList := func(vs []any) {
+		for _, v := range vs {
+			writeT(v)
+		}
+	}
+	switch x := e.(type) {
+	case EqExpr:
+		writeT(x.Value)
+	case NeqExpr:
+		writeT(x.Value)
+	case GtExpr:
+		writeT(x.Value)
+	case GteExpr:
+		writeT(x.Value)
+	case LtExpr:
+		writeT(x.Value)
+	case LteExpr:
+		writeT(x.Value)
+	case LikeExpr:
+		writeT(x.Value)
+	case ILikeExpr:
+		writeT(x.Value)
+	case RegexExpr:
+		writeT(x.Value)
+	case InExpr:
+		writeList(x.Values)
+	case NotInExpr:
+		writeList(x.Values)
+	case BetweenExpr:
+		writeT(x.Low)
+		writeT(x.High)
+	case AndExpr:
+		for _, op := range x.Operands {
+			appendValueTypes(b, op)
+		}
+	case OrExpr:
+		for _, op := range x.Operands {
+			appendValueTypes(b, op)
+		}
+	case NotExpr:
+		for _, op := range x.Operands {
+			appendValueTypes(b, op)
+		}
+	}
+}
+
 func (f *figo) generateCacheKey(kind string, ctx any, conditionType ...string) string {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -3195,9 +3285,14 @@ func (f *figo) generateCacheKey(kind string, ctx any, conditionType ...string) s
 		f.dsl,
 		// %#v keeps value types in the key: a = int64(1) and a = "1" render
 		// different SQL and must not share a cache slot (%v printed both as
-		// "1", colliding when instances share one cache).
+		// "1", colliding when instances share one cache). %#v alone is not
+		// enough for numeric types — it renders int(1), int64(1) and float64(1)
+		// identically as "1" — so append an explicit type signature of every
+		// clause/preload value to keep those from colliding.
 		fmt.Sprintf("%#v", f.clauses),
+		valueTypeSignature(f.clauses),
 		fmt.Sprintf("%#v", f.preloads),
+		preloadValueTypeSignature(f.preloads),
 		fmt.Sprintf("%v", f.page),
 		fmt.Sprintf("%v", f.sort),
 		fmt.Sprintf("%v", f.ignoreFields),

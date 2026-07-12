@@ -54,6 +54,15 @@ func BuildMongoFindOptions(f Figo) *options.FindOptions {
 			opts.SetSort(sd)
 		}
 	}
+	// projection: honor AddSelectFields the way GORM (Select) and Elasticsearch
+	// (_source) do, instead of silently returning full documents.
+	if sel := f.GetSelectFields(); len(sel) > 0 {
+		proj := bson.M{}
+		for name := range sel {
+			proj[normalizeColumnName(f, name)] = 1
+		}
+		opts.SetProjection(proj)
+	}
 	return opts
 }
 
@@ -242,6 +251,14 @@ func nonNilValues(values []any) []any {
 
 func logicalBSON(op string, parts []bson.M) bson.M {
 	if len(parts) == 0 {
+		// Empty $or is a false disjunction and must match NOTHING; returning {}
+		// (match everything) over-exposes the whole collection. $nor:[{}] negates
+		// a match-all, so it reliably matches nothing without an empty $or array
+		// (which Mongo rejects). Empty $and (true) and empty $nor (¬false = true)
+		// correctly stay match-all as {}.
+		if op == "$or" {
+			return bson.M{"$nor": []bson.M{{}}}
+		}
 		return bson.M{}
 	}
 	return bson.M{op: parts}

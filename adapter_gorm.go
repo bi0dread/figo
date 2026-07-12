@@ -49,8 +49,19 @@ func toGormClauseWithFigo(e Expr, f Figo) clause.Expression {
 	case NotNullExpr:
 		return clause.Neq{Column: getFieldName(x.Field), Value: nil}
 	case InExpr:
+		if len(x.Values) == 0 {
+			// Empty IN matches nothing. Mirror the raw adapter's 1=0 rather than
+			// relying on GORM's clause.IN, which for zero values emits "IN (NULL)".
+			return clause.Expr{SQL: "1=0"}
+		}
 		return clause.IN{Column: getFieldName(x.Field), Values: x.Values}
 	case NotInExpr:
+		if len(x.Values) == 0 {
+			// "NOT IN (empty set)" is true for every row. GORM's
+			// clause.Not(clause.IN{}) instead emits "col IS NOT NULL", which
+			// wrongly excludes NULL rows and diverges from the raw adapter's 1=1.
+			return clause.Expr{SQL: "1=1"}
+		}
 		return clause.Not(clause.IN{Column: getFieldName(x.Field), Values: x.Values})
 	case BetweenExpr:
 		return clause.Expr{SQL: "? BETWEEN ? AND ?", Vars: []any{clause.Column{Name: getFieldName(x.Field)}, x.Low, x.High}}
