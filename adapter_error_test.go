@@ -17,7 +17,7 @@ func TestMongoErrorsOnUnsupportedExpr(t *testing.T) {
 	t.Run("Standalone", func(t *testing.T) {
 		f := New()
 		f.AddFilter(unsupportedExpr())
-		f.Build()
+		f.Build(nil)
 		_, err := BuildMongoFilter(f)
 		assert.Error(t, err, "unsupported expr must produce an error, not a dropped condition")
 	})
@@ -28,7 +28,7 @@ func TestMongoErrorsOnUnsupportedExpr(t *testing.T) {
 			EqExpr{Field: "active", Value: true},
 			unsupportedExpr(),
 		}})
-		f.Build()
+		f.Build(nil)
 		_, err := BuildMongoFilter(f)
 		assert.Error(t, err, "error must propagate out of nested operators")
 	})
@@ -44,7 +44,7 @@ func TestMongoErrorsOnUnsupportedExpr(t *testing.T) {
 	t.Run("SupportedStillWorks", func(t *testing.T) {
 		f := New()
 		f.AddFilter(EqExpr{Field: "id", Value: 1})
-		f.Build()
+		f.Build(nil)
 		m, err := BuildMongoFilter(f)
 		assert.NoError(t, err)
 		assert.Equal(t, 1, m["id"])
@@ -55,7 +55,7 @@ func TestElasticsearchErrorsOnUnsupportedExpr(t *testing.T) {
 	t.Run("BuildReturnsError", func(t *testing.T) {
 		f := New()
 		f.AddFilter(unsupportedExpr())
-		f.Build()
+		f.Build(nil)
 		_, err := BuildElasticsearchQuery(f)
 		assert.Error(t, err)
 	})
@@ -63,7 +63,7 @@ func TestElasticsearchErrorsOnUnsupportedExpr(t *testing.T) {
 	t.Run("QueryStringReturnsError", func(t *testing.T) {
 		f := New()
 		f.AddFilter(unsupportedExpr())
-		f.Build()
+		f.Build(nil)
 		_, err := GetElasticsearchQueryString(f)
 		assert.Error(t, err)
 	})
@@ -74,7 +74,7 @@ func TestElasticsearchErrorsOnUnsupportedExpr(t *testing.T) {
 			EqExpr{Field: "a", Value: 1},
 			unsupportedExpr(),
 		}})
-		f.Build()
+		f.Build(nil)
 		_, err := BuildElasticsearchQuery(f)
 		assert.Error(t, err, "error must propagate; must not degrade to match_all")
 	})
@@ -82,7 +82,7 @@ func TestElasticsearchErrorsOnUnsupportedExpr(t *testing.T) {
 	t.Run("BuilderToJSONSurfacesError", func(t *testing.T) {
 		f := New()
 		f.AddFilter(unsupportedExpr())
-		f.Build()
+		f.Build(nil)
 		_, err := NewElasticsearchQueryBuilder().FromFigo(f).ToJSON()
 		assert.Error(t, err)
 	})
@@ -90,7 +90,7 @@ func TestElasticsearchErrorsOnUnsupportedExpr(t *testing.T) {
 	t.Run("SupportedStillWorks", func(t *testing.T) {
 		f := New()
 		f.AddFilter(EqExpr{Field: "id", Value: 1})
-		f.Build()
+		f.Build(nil)
 		_, err := BuildElasticsearchQuery(f)
 		assert.NoError(t, err)
 	})

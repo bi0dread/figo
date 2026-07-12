@@ -14,16 +14,16 @@ func TestBuildIsIdempotent(t *testing.T) {
 	f := New()
 	require.NoError(t, f.AddFiltersFromString(`id=1 load=[Orders:price>10]`))
 	f.Build(RawAdapter{})
-	f.Build()
-	f.Build()
+	f.Build(nil)
+	f.Build(nil)
 	assert.Len(t, f.GetPreloads()["Orders"], 1, "preloads must not accumulate across Build calls")
 
 	require.NoError(t, f.AddFiltersFromString(`id=2 sort=name:desc`))
-	f.Build()
+	f.Build(nil)
 	require.NotNil(t, f.GetSort())
 
 	require.NoError(t, f.AddFiltersFromString(`id=3`))
-	f.Build()
+	f.Build(nil)
 	assert.Nil(t, f.GetSort(), "stale sort from a previous DSL must not survive rebuild")
 }
 

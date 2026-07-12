@@ -21,7 +21,7 @@ func TestAdapterCanBeSetOnBuild(t *testing.T) {
 		f := New()
 		f.SetAdapterObject(RawAdapter{})
 		f.AddFiltersFromString(`id=1`)
-		f.Build()
+		f.Build(nil)
 		_, ok := f.GetAdapterObject().(RawAdapter)
 		assert.True(t, ok)
 	})
@@ -38,7 +38,7 @@ func TestAdapterCanBeSetOnBuild(t *testing.T) {
 	t.Run("NoAdapter", func(t *testing.T) {
 		f := New()
 		f.AddFiltersFromString(`id=1`)
-		f.Build()
+		f.Build(nil)
 		assert.Nil(t, f.GetAdapterObject())
 		// Still parses clauses fine without an adapter.
 		assert.Len(t, f.GetClauses(), 1)

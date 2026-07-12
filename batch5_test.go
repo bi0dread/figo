@@ -29,14 +29,14 @@ func TestBatchZeroTimeoutSucceeds(t *testing.T) {
 func TestMongoNullSemantics(t *testing.T) {
 	f := New()
 	f.AddFilter(IsNullExpr{Field: "deleted_at"})
-	f.Build()
+	f.Build(nil)
 	m := BuildMongoFilterMust(t, f)
 	assert.Contains(t, m, "deleted_at")
 	assert.Nil(t, m["deleted_at"], "IS NULL should be {field: nil}")
 
 	f2 := New()
 	f2.AddFilter(NotNullExpr{Field: "deleted_at"})
-	f2.Build()
+	f2.Build(nil)
 	m2 := BuildMongoFilterMust(t, f2)
 	sub, ok := m2["deleted_at"].(bson.M)
 	assert.True(t, ok)
@@ -47,7 +47,7 @@ func TestMongoNullSemantics(t *testing.T) {
 func TestMongoEmptyLogicalNotNull(t *testing.T) {
 	f := New()
 	f.AddFilter(AndExpr{Operands: nil})
-	f.Build()
+	f.Build(nil)
 	m := BuildMongoFilterMust(t, f)
 	_, has := m["$and"]
 	assert.False(t, has, "empty AND must not produce {$and: null}")

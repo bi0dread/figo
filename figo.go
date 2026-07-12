@@ -1006,7 +1006,7 @@ type Figo interface {
 	GetQuery(ctx any, conditionType ...string) Query
 	GetCachedSqlString(ctx any, conditionType ...string) string
 	GetCachedQuery(ctx any, conditionType ...string) Query
-	Build(adapter ...Adapter)
+	Build(adapter Adapter)
 	Explain() string
 	Clone() Figo
 	Walk(visit func(Expr))
@@ -2931,12 +2931,15 @@ func (f *figo) GetDSL() string {
 // Build parses the DSL into the internal clause tree. The adapter is optional
 // here: pass it to Build(GormAdapter{}) to set (or override) the adapter that
 // GetSqlString/GetQuery will use, or set it earlier via New / SetAdapterObject.
-func (f *figo) Build(adapter ...Adapter) {
+func (f *figo) Build(adapter Adapter) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	if len(adapter) > 0 {
-		f.adapterObj = adapter[0]
+	// A non-nil adapter selects/replaces the adapter; passing nil rebuilds
+	// against whatever adapter was set previously (via an earlier Build or
+	// SetAdapterObject).
+	if adapter != nil {
+		f.adapterObj = adapter
 	}
 
 	if f.dsl == "" {

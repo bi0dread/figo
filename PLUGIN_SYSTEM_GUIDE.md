@@ -205,7 +205,7 @@ func (p *IdToIddPlugin) IsEnabled() bool { return p.enabled }
 
 ```go
 // Create Figo instance
-f := figo.New(figo.RawAdapter{})
+f := figo.New()
 
 // Create and register plugin
 plugin := NewIdToIddPlugin()
@@ -340,7 +340,7 @@ func TestMyPlugin(t *testing.T) {
     plugin := NewMyPlugin()
     
     // Test initialization
-    f := figo.New(figo.RawAdapter{})
+    f := figo.New()
     err := plugin.Initialize(f)
     assert.NoError(t, err)
     
@@ -356,13 +356,13 @@ func TestMyPlugin(t *testing.T) {
 ### Integration Testing
 ```go
 func TestPluginIntegration(t *testing.T) {
-    f := figo.New(figo.RawAdapter{})
+    f := figo.New()
     plugin := NewMyPlugin()
     f.RegisterPlugin(plugin)
     
     // Test with real queries
     f.AddFiltersFromString("id=1")
-    f.Build()
+    f.Build(figo.RawAdapter{})
     
     // Verify plugin effects
     sql := f.GetSqlString(nil)

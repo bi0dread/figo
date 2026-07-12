@@ -36,6 +36,16 @@ One breaking change and a batch of correctness work:
   f.Build(figo.GormAdapter{})
   ```
 
+- **Breaking: `Build` takes exactly one adapter, not a variadic.** The signature is now `Build(adapter Adapter)`. Passing a non-nil adapter selects it; pass `Build(nil)` to rebuild while keeping the adapter set by an earlier `Build`/`SetAdapterObject` (this replaces the old no-argument `Build()`).
+
+  ```go
+  // v3 / early v4: variadic, no-arg rebuild kept the previous adapter
+  f.Build()
+
+  // v4: single adapter; use nil to rebuild in place
+  f.Build(nil)
+  ```
+
 - **New: `Walk`** — traverse and rewrite the built AST (see [Inspecting & transforming the AST](#inspecting--transforming-the-ast)).
 - **30+ bug fixes** from a deep audit: quote-aware parser tokenizing, exact keyword matching, LIKE/regex translation on Mongo/ES, empty-`<in>` filter-bypass, SQL-injection hardening on identifiers, cache races/LRU/expiry, batch timeout semantics, deterministic SQL output, and Mongo/ES now **error** on unsupported expressions instead of silently dropping them.
 
@@ -94,7 +104,7 @@ where, args := figo.BuildRawWhere(f)
 // args:  []any{"active", int64(18)}
 ```
 
-> **Note:** `New()` takes no adapter. Supply it at `Build(adapter)` or via `SetAdapterObject(adapter)`. Calling `Build()` with no argument keeps whatever adapter was set previously.
+> **Note:** `New()` takes no adapter. Supply it at `Build(adapter)` or via `SetAdapterObject(adapter)`. `Build` takes exactly one adapter; pass `Build(nil)` to rebuild against whatever adapter was set previously (by an earlier `Build` or `SetAdapterObject`).
 
 **Defaults set by `New()`:** pagination starts at `skip:0, take:20` — a query with no `page=` directive is limited to 20 rows. Use `page=` in the DSL or `SetPage(skip, take)` to change it (`take:0` = no limit). The naming strategy defaults to snake_case.
 
@@ -481,7 +491,7 @@ Walk `f.GetClauses()` / `f.GetPreloads()` (the `Expr` AST), honor `f.GetPage()`,
 AddFiltersFromString(dsl string) error
 AddFiltersFromStringWithRepair(dsl string, useRepair bool) error
 AddFilter(exp Expr)                 // add a programmatic AST node
-Build(adapter ...Adapter)
+Build(adapter Adapter)              // pass nil to rebuild with the current adapter
 GetClauses() []Expr
 GetPreloads() map[string][]Expr
 GetDSL() string

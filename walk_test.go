@@ -10,7 +10,7 @@ import (
 func TestWalkMutatesFieldInPlace(t *testing.T) {
 	f := New()
 	f.AddFiltersFromString(`first_name="ali" and age>20`)
-	f.Build()
+	f.Build(nil)
 
 	f.Walk(func(n Expr) {
 		if c, ok := n.(*EqExpr); ok && c.Field == "first_name" {
@@ -30,7 +30,7 @@ func TestWalkNodeFieldHelpers(t *testing.T) {
 	f := New()
 	// first_name appears under =, LIKE, IN and inside a nested OR/BETWEEN group.
 	f.AddFiltersFromString(`first_name="ali" or (first_name.=^"%a%" and first_name<in>[x,y]) or first_name<bet>(1..2)`)
-	f.Build()
+	f.Build(nil)
 
 	renamed := 0
 	f.Walk(func(n Expr) {
@@ -50,7 +50,7 @@ func TestWalkNodeFieldHelpers(t *testing.T) {
 func TestWalkReachesNestedAndPreloads(t *testing.T) {
 	f := New()
 	f.AddFiltersFromString(`load=[orders:first_name="x"] and first_name="y"`)
-	f.Build()
+	f.Build(nil)
 
 	f.Walk(func(n Expr) {
 		if field, ok := NodeField(n); ok && field == "first_name" {
@@ -85,7 +85,7 @@ func TestWalkPackageLevelReturnsRoot(t *testing.T) {
 func TestWalkLogicalNodesHaveNoField(t *testing.T) {
 	f := New()
 	f.AddFiltersFromString(`a=1 and b=2`)
-	f.Build()
+	f.Build(nil)
 	sawAnd := false
 	f.Walk(func(n Expr) {
 		if _, ok := n.(*AndExpr); ok {

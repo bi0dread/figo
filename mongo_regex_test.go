@@ -12,7 +12,7 @@ import (
 func TestMongoRegexSerializesCorrectly(t *testing.T) {
 	f := New()
 	f.AddFilter(LikeExpr{Field: "name", Value: "%foo%"})
-	f.Build()
+	f.Build(nil)
 	m, _ := BuildMongoFilter(f)
 
 	re, ok := m["name"].(primitive.Regex)
@@ -54,7 +54,7 @@ func TestMongoLikeEscapesMeta(t *testing.T) {
 func TestMongoILikeUsesOptions(t *testing.T) {
 	f := New()
 	f.AddFilter(ILikeExpr{Field: "name", Value: "%bar%"})
-	f.Build()
+	f.Build(nil)
 	m, _ := BuildMongoFilter(f)
 	re, ok := m["name"].(primitive.Regex)
 	assert.True(t, ok)

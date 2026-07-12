@@ -111,13 +111,13 @@ import (
 
 func main() {
     // Create figo instance with Elasticsearch adapter
-    f := figo.New(figo.ElasticsearchAdapter{})
+    f := figo.New()
     
     // Add your DSL filters
     f.AddFiltersFromString(`name = "John" and age > 25`)
     
     // Build the query
-    f.Build()
+    f.Build(figo.ElasticsearchAdapter{})
     
     // Get the Elasticsearch query
     query := figo.BuildElasticsearchQuery(f)

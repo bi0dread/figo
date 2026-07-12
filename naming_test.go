@@ -58,7 +58,7 @@ func TestCloneCarriesNamingFunc(t *testing.T) {
 	c := f.Clone()
 	c.AddFilter(EqExpr{Field: c.GetNamingFunc()("added"), Value: int64(2)})
 	c.AddFiltersFromString(`name="x"`)
-	c.Build()
+	c.Build(nil)
 
 	where, _ := BuildRawWhere(c)
 	assert.Contains(t, where, "`c_name`", "clone should apply the inherited naming func")

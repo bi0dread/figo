@@ -40,7 +40,7 @@ func TestBuild(t *testing.T) {
 
 	err := f.AddFiltersFromString(`(id=1 or id=2) or id>=2 or id<=3 or id!=0 and vendor=vendor1 or name=ali and (place=tehran or place=shiraz or (v1=2 and v2=1 and (g1=0 or g1=2))) or GG=9 or GG=8 sort=id:desc,name:ace page=skip:10,take:10 load=[inner1:id=1 or name=ali | inner2:id=2 or name=ali]`)
 	assert.Nil(t, err)
-	f.Build()
+	f.Build(nil)
 	assert.NotEmpty(t, f.GetClauses())
 }
 
@@ -147,7 +147,7 @@ func TestMongoAdapterBuild(t *testing.T) {
 	f := New()
 	f.AddFiltersFromString(`(id=1 and vendorId="22") and bank_id=11 or expedition_type=^"%e%" sort=id:desc page=skip:0,take:10`)
 	f.AddIgnoreFields("bank_id")
-	f.Build()
+	f.Build(nil)
 
 	// Filter
 	filter, _ := BuildMongoFilter(f)
@@ -206,7 +206,7 @@ func TestMongoAdapterBuild(t *testing.T) {
 	// Preloads to joins
 	f2 := New()
 	f2.AddFiltersFromString(`load=[TestInner1:id="3" or name="test1" | TestInner2:id=4]`)
-	f2.Build()
+	f2.Build(nil)
 	joins := map[string]MongoJoin{
 		"TestInner1": {From: "testinner1", LocalField: "id", ForeignField: "XX", As: "TestInner1"},
 		"TestInner2": {From: "testinner2", LocalField: "id", ForeignField: "XX", As: "TestInner2"},
@@ -400,7 +400,7 @@ func TestMongoNewOperations(t *testing.T) {
 	f.AddFilter(IsNullExpr{Field: "deleted_at"})
 	f.AddFilter(NotNullExpr{Field: "kind"})
 	f.AddFilter(NotInExpr{Field: "status", Values: []any{"x", "y"}})
-	f.Build()
+	f.Build(nil)
 
 	m, _ := BuildMongoFilter(f)
 	// find id $in within top-level or $and aggregation
@@ -858,9 +858,9 @@ func TestComplexFiltersWithParentheses(t *testing.T) {
 
 	// Test that all adapters can handle the complex expression without panics
 	assert.NotPanics(t, func() {
-		f1.Build()
-		f2.Build()
-		f3.Build()
+		f1.Build(nil)
+		f2.Build(nil)
+		f3.Build(nil)
 	})
 
 	// Verify argument types are correct
@@ -957,7 +957,7 @@ func TestComplexFiltersWithAllOperators(t *testing.T) {
 			}
 
 			assert.Contains(t, sql, tt.expected, "Should contain expected operator")
-			assert.NotPanics(t, func() { f.Build() }, "Should not panic")
+			assert.NotPanics(t, func() { f.Build(nil) }, "Should not panic")
 		})
 	}
 }
@@ -2158,7 +2158,7 @@ func TestGetFinalExprDebug(t *testing.T) {
 			// Debug: Check the parsed DSL
 			t.Logf("Parsed DSL: %s", f.GetDSL())
 
-			f.Build()
+			f.Build(nil)
 			clauses := f.GetClauses()
 			t.Logf("Result: %d clauses", len(clauses))
 
