@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/bi0dread/figo/v3"
+	"github.com/bi0dread/figo/v4"
 )
 
 func main() {

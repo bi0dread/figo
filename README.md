@@ -1,4 +1,4 @@
-# figo — Go Dynamic Query Builder (v3)
+# figo — Go Dynamic Query Builder (v4)
 
 figo turns a compact, database-agnostic filter DSL into concrete queries for **GORM**, **raw SQL**, **MongoDB**, and **Elasticsearch**. You parse one filter string (typically straight from an HTTP query parameter) into an internal expression AST, then let an adapter render it for whichever backend you target.
 
@@ -9,14 +9,37 @@ figo turns a compact, database-agnostic filter DSL into concrete queries for **G
   GORM │ Raw SQL │ MongoDB │ Elasticsearch
 ```
 
-- **Package:** `github.com/bi0dread/figo/v3`
+- **Package:** `github.com/bi0dread/figo/v4`
 - **Go:** 1.23+
 
 ## Installation
 
 ```bash
-go get github.com/bi0dread/figo/v3
+go get github.com/bi0dread/figo/v4
 ```
+
+## What's new in v4 (migrating from v3)
+
+One breaking change and a batch of correctness work:
+
+- **Breaking: `New()` no longer takes an adapter.** The adapter now belongs to the render step, not construction — pass it to `Build(adapter)` (or set it with `SetAdapterObject`). This lets one parsed instance be rebuilt against different backends.
+
+  ```go
+  // v3
+  f := figo.New(figo.GormAdapter{})
+  f.AddFiltersFromString(`status="active"`)
+  f.Build()
+
+  // v4
+  f := figo.New()
+  f.AddFiltersFromString(`status="active"`)
+  f.Build(figo.GormAdapter{})
+  ```
+
+- **New: `Walk`** — traverse and rewrite the built AST (see [Inspecting & transforming the AST](#inspecting--transforming-the-ast)).
+- **30+ bug fixes** from a deep audit: quote-aware parser tokenizing, exact keyword matching, LIKE/regex translation on Mongo/ES, empty-`<in>` filter-bypass, SQL-injection hardening on identifiers, cache races/LRU/expiry, batch timeout semantics, deterministic SQL output, and Mongo/ES now **error** on unsupported expressions instead of silently dropping them.
+
+Import path changes to `github.com/bi0dread/figo/v4`; everything else in the API is source-compatible with late v3.
 
 ## Table of contents
 
@@ -35,6 +58,7 @@ go get github.com/bi0dread/figo/v3
   - [Raw SQL](#raw-sql-adapter)
   - [MongoDB](#mongodb-adapter)
   - [Elasticsearch](#elasticsearch-adapter)
+  - [Writing your own adapter](#writing-your-own-adapter)
 - [The `Figo` API](#the-figo-api)
 - [Field safety: ignore lists & whitelist](#field-safety-ignore-lists--whitelist)
 - [Naming strategies](#naming-strategies)
@@ -72,6 +96,8 @@ where, args := figo.BuildRawWhere(f)
 
 > **Note:** `New()` takes no adapter. Supply it at `Build(adapter)` or via `SetAdapterObject(adapter)`. Calling `Build()` with no argument keeps whatever adapter was set previously.
 
+**Defaults set by `New()`:** pagination starts at `skip:0, take:20` — a query with no `page=` directive is limited to 20 rows. Use `page=` in the DSL or `SetPage(skip, take)` to change it (`take:0` = no limit). The naming strategy defaults to snake_case.
+
 ## Quick start
 
 ### GORM
@@ -82,7 +108,7 @@ package main
 import (
 	"fmt"
 
-	"github.com/bi0dread/figo/v3"
+	"github.com/bi0dread/figo/v4"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -307,12 +333,14 @@ All adapters consume the same AST. Pass one to `Build()` (or `SetAdapterObject`)
 
 `GetQuery(ctx)` returns a backend-specific value (all implement the `figo.Query` interface); type-assert to the concrete type:
 
-| Adapter | `ctx` argument | `GetQuery` returns |
-|---------|----------------|--------------------|
-| `RawAdapter{}` | table name `string` or `RawContext{Table}` | `SQLQuery{SQL, Args}` |
-| `GormAdapter{}` | `*gorm.DB` | `SQLQuery{SQL, Args}` |
-| `MongoAdapter{}` | `nil`, or `"AGG"` + joins for aggregation | `MongoFindQuery{Filter, Options}` / `MongoAggregateQuery{Pipeline, Options}` |
-| `ElasticsearchAdapter{}` | `nil` | `ElasticsearchQueryWrapper{Query}` |
+| Adapter | `ctx` argument | `GetQuery` returns | `GetSqlString` returns |
+|---------|----------------|--------------------|------------------------|
+| `RawAdapter{}` | table name `string` or `RawContext{Table}` | `SQLQuery{SQL, Args}` | SQL with literals interpolated (for display) |
+| `GormAdapter{}` | `*gorm.DB` | `SQLQuery{SQL, Args}` | SQL via GORM DryRun, literals interpolated |
+| `MongoAdapter{}` | `nil`, or `"AGG"` + joins for aggregation | `MongoFindQuery{Filter, Options}` / `MongoAggregateQuery{Pipeline, Options}` | `""` (no SQL form — use `GetQuery` or the `BuildMongo*` helpers) |
+| `ElasticsearchAdapter{}` | `nil` | `ElasticsearchQueryWrapper{Query}` | the query as compact JSON |
+
+Each adapter also has package-level helpers that skip the generic API: `AdapterRawGetSql`, `AdapterGormGetSql`, `AdapterMongoGetFind` / `AdapterMongoGetAggregate`, plus the `Build*` functions shown per adapter below.
 
 ### GORM adapter
 
@@ -350,6 +378,9 @@ sql, args := figo.BuildRawSelect(f, "users")
 // sql:  "SELECT * FROM `users` WHERE (`id` = ? AND `name` = ?) ORDER BY `id` DESC LIMIT 20"
 // args: []any{int64(1), "test"}
 
+// Explicit column list (used when no AddSelectFields were set)
+sql, args = figo.BuildRawSelect(f, "users", "id", "name")
+
 // Just the WHERE fragment
 where, whereArgs := figo.BuildRawWhere(f)
 
@@ -359,9 +390,11 @@ sql = f.GetSqlString(figo.RawContext{Table: "users"}, "SELECT", "FROM", "WHERE",
 q := f.GetQuery(figo.RawContext{Table: "users"}).(figo.SQLQuery) // q.SQL + q.Args
 ```
 
+With no `conditionType` arguments you get the full SELECT; otherwise only the named segments are emitted, in the order you list them. Recognized segment keywords (case-insensitive): `SELECT`, `FROM`, `JOIN`, `WHERE`, `ORDER BY` / `SORT`, `LIMIT`, `OFFSET`, `PAGE` (LIMIT + OFFSET together).
+
 Identifiers are backtick-escaped (values are always parameterized), so field/table names can't break out of quoting.
 
-`load=` preloads are exposed for the raw adapter as rendered `WHERE` fragments you can apply to your own join/second-query logic:
+`load=` preloads render into the full SELECT as `JOIN <table> ON <filter>` clauses (deterministic table order). If you'd rather run your own join/second-query logic, the same preload filters are exposed as rendered `WHERE` fragments:
 
 ```go
 f.AddFiltersFromString(`id>0 load=[Orders:total>100]`)
@@ -405,21 +438,38 @@ query, err := figo.BuildElasticsearchQuery(f) // figo.ElasticsearchQuery (Query/
 
 // Or via the generic API — returns ElasticsearchQueryWrapper
 q := f.GetQuery(nil).(figo.ElasticsearchQueryWrapper) // q.Query is the ElasticsearchQuery
+_ = q.GetSQL()  // the query as compact JSON (GetArgs() is nil — ES has no bind params)
 
 // JSON string forms
 jsonStr, err := figo.GetElasticsearchQueryString(f)         // pretty
 compact, err := figo.GetElasticsearchQueryStringCompact(f)  // compact
 
 // Fluent builder
-q := figo.NewElasticsearchQueryBuilder().
+esq := figo.NewElasticsearchQueryBuilder().
 	FromFigo(f).
 	AddSort("name", true).
 	SetPagination(0, 10).
 	SetSource("id", "name").
 	Build()
+
+// The builder can also emit JSON directly
+jsonStr, err = figo.NewElasticsearchQueryBuilder().FromFigo(f).ToJSON()  // or ToJSONCompact()
 ```
 
-`AddSelectFields` maps to `_source`, `page=` maps to `from`/`size`, `sort=` maps to the ES sort array.
+`AddSelectFields` maps to `_source`, `page=` maps to `from`/`size`, `sort=` maps to the ES sort array. `ElasticsearchQuery` is JSON-ready (`Query`, `Sort`, `From`, `Size`, `Source` fields with the right tags), so you can marshal it straight into a search request body. If the built AST contains an expression the ES adapter can't render, `BuildElasticsearchQuery` returns the error; the fluent builder's `FromFigo` (which has no error return) defers it until `ToJSON`/`ToJSONCompact`.
+
+### Writing your own adapter
+
+An adapter is anything implementing the two-method `figo.Adapter` interface, so you can target another backend (or another SQL dialect) yourself:
+
+```go
+type Adapter interface {
+	GetSqlString(f Figo, ctx any, conditionType ...string) (string, bool)
+	GetQuery(f Figo, ctx any, conditionType ...string) (Query, bool)
+}
+```
+
+Walk `f.GetClauses()` / `f.GetPreloads()` (the `Expr` AST), honor `f.GetPage()`, `f.GetSort()`, and `f.GetSelectFields()`, and return a query value. Note that `figo.Query` is a sealed marker interface (unexported method), so `GetQuery` from a custom adapter must reuse one of the built-in query types — `SQLQuery` fits most custom SQL dialects; for anything else, expose your own typed helper alongside the adapter. Pass an instance to `Build(myAdapter)` and the generic `GetSqlString` / `GetQuery` API routes through it.
 
 ## The `Figo` API
 
@@ -442,10 +492,12 @@ GetDSL() string
 ```go
 GetSqlString(ctx any, conditionType ...string) string
 GetQuery(ctx any, conditionType ...string) Query
-GetExplainedSqlString(ctx any, conditionType ...string) string
+GetExplainedSqlString(ctx any, conditionType ...string) string // same as GetSqlString (adapter decides literal interpolation)
 GetCachedSqlString(ctx any, conditionType ...string) string
 GetCachedQuery(ctx any, conditionType ...string) Query
 ```
+
+`GetQuery` gives placeholder SQL + args for execution; `GetSqlString` on the SQL adapters interpolates literals, making it the display/logging form. `GetExplainedSqlString` delegates to the same adapter path — for a view of the parsed AST itself, use `Explain()`.
 
 **Pagination & sorting**
 
@@ -465,6 +517,8 @@ Explain() string                    // human-readable AST tree
 Clone() Figo                        // deep copy
 Walk(visit func(Expr))              // traverse/mutate the AST
 ```
+
+**Field-control getters** — every setter has a reader: `GetIgnoreFields()`, `GetSelectFields()`, `GetAllowedFields()` (all `map[string]bool`), `GetNamingStrategy()`, `GetNamingFunc()`, `SetQueryLimits(limits)` / `GetQueryLimits()`.
 
 > `GetPage()` returns a **copy** of the page. Mutating it has no effect — call `SetPage(skip, take)` to change pagination.
 
@@ -531,10 +585,17 @@ op := figo.GetRegexSQLOperator()
 **`Explain()`** renders the parsed AST as an indented tree — handy for debugging precedence/grouping without a database:
 
 ```go
-f.AddFiltersFromString(`a=1 and (b=2 or c=3)`)
+f.AddFiltersFromString(`id=1 and (age>20 or active=true)`)
 f.Build(figo.RawAdapter{})
 fmt.Println(f.Explain())
+// AND
+//  ├── id = 1
+//  └── OR
+//      ├── age > 20
+//      └── active = true
 ```
+
+Strings are quoted in the output so `name = "john"` is visually distinct from `active = true`; multiple top-level clauses appear under a synthetic `AND` root (matching how the builders combine them); an unparsed instance yields `(no filters)`.
 
 **`Clone()`** deep-copies an instance (clauses, preloads, and nested operand slices are independent — mutating the clone never affects the original).
 
@@ -548,6 +609,8 @@ f.Walk(func(n figo.Expr) {
 	}
 })
 ```
+
+A package-level `figo.Walk(expr, visit)` is also available for traversing a standalone `Expr` tree (it returns the rewritten expression).
 
 ## Caching
 
@@ -568,7 +631,7 @@ stats := f.GetCacheStats() // hits, misses, size, hit rate
 f.ClearCache()
 
 // Or inject your own implementation of the QueryCache interface:
-f.SetCache(myCache)
+f.SetCache(myCache)   // GetCache() / GetCacheConfig() read the current state
 ```
 
 Cache keys are type-aware — `a = int64(1)` and `a = "1"` never collide even when instances share a cache. A cache created via `SetCacheConfig` stops its background goroutine when it's replaced or when the instance is garbage-collected. `NewInMemoryCache(config)` is available if you want to manage one directly (call `Stop()` when done).
@@ -599,7 +662,9 @@ f.UnregisterPlugin("my-plugin")
 
 The `BeforeParse` / `AfterParse` hooks fire automatically inside `AddFiltersFromString` (`BeforeParse` can rewrite the DSL). Hooks run on a snapshot outside the manager's lock, so a hook may call back into the manager without deadlocking.
 
-> **Wiring status:** only the parse hooks (`BeforeParse` / `AfterParse`) are invoked automatically today. `BeforeQuery` / `AfterQuery` exist on the interface and can be driven manually via the plugin manager, but are not yet auto-invoked by the query path.
+> **Wiring status:** only the parse hooks (`BeforeParse` / `AfterParse`) are invoked automatically today. `BeforeQuery` / `AfterQuery` exist on the interface and can be driven manually via the plugin manager (`ExecuteBeforeQuery` / `ExecuteAfterQuery`), but are not yet auto-invoked by the query path.
+
+See [PLUGIN_SYSTEM_GUIDE.md](PLUGIN_SYSTEM_GUIDE.md) for a full walkthrough with example plugins.
 
 ## Validation
 
@@ -686,6 +751,8 @@ go test -race ./...      # race detector
 
 The MongoDB adapter tests use the BSON encoder directly (no server needed). Elasticsearch **integration** tests require a running cluster on `localhost:9200` and skip automatically when it's absent — see [ELASTICSEARCH_TESTING.md](ELASTICSEARCH_TESTING.md) for the Docker Compose setup.
 
+Runnable usage examples live in [examples/example_usage.go](examples/example_usage.go).
+
 ## Status of features
 
 Fully wired end-to-end: the DSL and all operators above, the four adapters, ignore/whitelist/select field controls, naming strategies, pagination/sort/preloads, caching, performance monitoring, batch processing, validation (manual), input repair, and the `Explain`/`Clone`/`Walk` AST tools.
@@ -693,7 +760,7 @@ Fully wired end-to-end: the DSL and all operators above, the four adapters, igno
 Partial / not yet wired (defined in the API but not auto-invoked or without adapter support):
 
 - Plugin `BeforeQuery` / `AfterQuery` hooks — present but not auto-called by the query path (parse hooks are).
-- `QueryLimits` (`SetQueryLimits`) — configurable but not currently enforced during parse/build.
+- `QueryLimits` (`SetQueryLimits` / `GetQueryLimits`) — `New()` seeds defaults (nesting 10, fields 50, parameters 100, expressions 200), but the limits are not currently enforced during parse/build.
 - Advanced expression types (`JsonPathExpr`, `ArrayContainsExpr`, `ArrayOverlapsExpr`, `FullTextSearchExpr`, `GeoDistanceExpr`, `CustomExpr`) — defined for programmatic `AddFilter`, but adapters return an "unsupported expression" error for them rather than rendering.
 
 ## Contributing
