@@ -1,6 +1,8 @@
-package figo
+package adapters
 
 import (
+	. "github.com/bi0dread/figo/v4"
+
 	"testing"
 
 	"github.com/stretchr/testify/assert"

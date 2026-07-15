@@ -1,10 +1,11 @@
-package figo
+package adapters
 
 import (
+	. "github.com/bi0dread/figo/v4"
+
 	"encoding/json"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -43,32 +44,6 @@ func TestRegr_SpacedOperatorWithSpecialFieldNames(t *testing.T) {
 	assert.Equal(t, []any{int64(1), int64(2)}, args)
 }
 
-// #2: the cache key must distinguish numeric value types; int64(1), float64(1)
-// and int(1) must not collide when instances share a cache.
-func TestRegr_CacheKeyDistinguishesNumericTypes(t *testing.T) {
-	cfg := CacheConfig{Enabled: true, TTL: time.Minute, MaxSize: 100}
-	shared := NewInMemoryCache(cfg)
-	defer shared.Stop()
-
-	build := func(v any) SQLQuery {
-		f := New()
-		f.SetCacheConfig(cfg)
-		f.SetCache(shared)
-		f.AddFilter(EqExpr{Field: "a", Value: v})
-		f.Build(RawAdapter{})
-		return f.GetCachedQuery("t").(SQLQuery)
-	}
-
-	qInt64 := build(int64(1))
-	qFloat := build(float64(1))
-	qInt := build(int(1))
-
-	assert.IsType(t, int64(0), qInt64.Args[0])
-	assert.IsType(t, float64(0), qFloat.Args[0], "float64 query must not return the cached int64 entry")
-	assert.IsType(t, int(0), qInt.Args[0], "int query must not return a cached numeric entry of another type")
-}
-
-// #3: the MongoDB find adapter must honor AddSelectFields as a projection.
 func TestRegr_MongoProjectionFromSelectFields(t *testing.T) {
 	f := New()
 	require.NoError(t, f.AddFiltersFromString(`a=1`))

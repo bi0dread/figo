@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/bi0dread/figo/v4"
+	"github.com/bi0dread/figo/v4/adapters"
 )
 
 func main() {
@@ -16,9 +17,9 @@ func main() {
 	fmt.Println("\n📝 Example 1: Basic Term Query")
 	f1 := figo.New()
 	f1.AddFiltersFromString(`status = "active"`)
-	f1.Build(figo.ElasticsearchAdapter{})
+	f1.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr1, _ := figo.GetElasticsearchQueryString(f1)
+	jsonStr1, _ := adapters.GetElasticsearchQueryString(f1)
 	fmt.Printf("DSL: status = \"active\"\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr1)
 
@@ -26,9 +27,9 @@ func main() {
 	fmt.Println("\n📝 Example 2: Range Query")
 	f2 := figo.New()
 	f2.AddFiltersFromString(`age > 25 and score >= 80`)
-	f2.Build(figo.ElasticsearchAdapter{})
+	f2.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr2, _ := figo.GetElasticsearchQueryString(f2)
+	jsonStr2, _ := adapters.GetElasticsearchQueryString(f2)
 	fmt.Printf("DSL: age > 25 and score >= 80\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr2)
 
@@ -36,9 +37,9 @@ func main() {
 	fmt.Println("\n📝 Example 3: Wildcard Search")
 	f3 := figo.New()
 	f3.AddFiltersFromString(`email =^ "%gmail%"`)
-	f3.Build(figo.ElasticsearchAdapter{})
+	f3.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr3, _ := figo.GetElasticsearchQueryString(f3)
+	jsonStr3, _ := adapters.GetElasticsearchQueryString(f3)
 	fmt.Printf("DSL: email =^ \"%%gmail%%\"\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr3)
 
@@ -46,9 +47,9 @@ func main() {
 	fmt.Println("\n📝 Example 4: Terms Query")
 	f4 := figo.New()
 	f4.AddFiltersFromString(`category <in> [tech,business,finance]`)
-	f4.Build(figo.ElasticsearchAdapter{})
+	f4.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr4, _ := figo.GetElasticsearchQueryString(f4)
+	jsonStr4, _ := adapters.GetElasticsearchQueryString(f4)
 	fmt.Printf("DSL: category <in> [tech,business,finance]\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr4)
 
@@ -56,9 +57,9 @@ func main() {
 	fmt.Println("\n📝 Example 5: Between Query")
 	f5 := figo.New()
 	f5.AddFiltersFromString(`price <bet> (100..500)`)
-	f5.Build(figo.ElasticsearchAdapter{})
+	f5.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr5, _ := figo.GetElasticsearchQueryString(f5)
+	jsonStr5, _ := adapters.GetElasticsearchQueryString(f5)
 	fmt.Printf("DSL: price <bet> (100..500)\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr5)
 
@@ -66,9 +67,9 @@ func main() {
 	fmt.Println("\n📝 Example 6: Complex Nested Query")
 	f6 := figo.New()
 	f6.AddFiltersFromString(`((name =^ "%John%" or email =^ "%gmail%") and (age >= 18 and age <= 65)) or (status = "active" and score > 80)`)
-	f6.Build(figo.ElasticsearchAdapter{})
+	f6.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr6, _ := figo.GetElasticsearchQueryString(f6)
+	jsonStr6, _ := adapters.GetElasticsearchQueryString(f6)
 	fmt.Printf("DSL: ((name =^ \"%%John%%\" or email =^ \"%%gmail%%\") and (age >= 18 and age <= 65)) or (status = \"active\" and score > 80)\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr6)
 
@@ -76,15 +77,15 @@ func main() {
 	fmt.Println("\n📝 Example 7: Pagination and Sorting")
 	f7 := figo.New()
 	f7.AddFiltersFromString(`status = "active" sort=score:desc,age:asc page=skip:0,take:5`)
-	f7.Build(figo.ElasticsearchAdapter{})
+	f7.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr7, _ := figo.GetElasticsearchQueryString(f7)
+	jsonStr7, _ := adapters.GetElasticsearchQueryString(f7)
 	fmt.Printf("DSL: status = \"active\" sort=score:desc,age:asc page=skip:0,take:5\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr7)
 
 	// Example 8: Using the fluent builder
 	fmt.Println("\n📝 Example 8: Fluent Builder")
-	builder := figo.NewElasticsearchQueryBuilder()
+	builder := adapters.NewElasticsearchQueryBuilder()
 	query8 := builder.
 		AddSort("score", false). // desc
 		AddSort("age", true).    // asc
@@ -100,9 +101,9 @@ func main() {
 	f9 := figo.New()
 	f9.AddSelectFields("id", "name", "email", "score")
 	f9.AddFiltersFromString(`status = "active"`)
-	f9.Build(figo.ElasticsearchAdapter{})
+	f9.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr9, _ := figo.GetElasticsearchQueryString(f9)
+	jsonStr9, _ := adapters.GetElasticsearchQueryString(f9)
 	fmt.Printf("DSL: status = \"active\" with field selection\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr9)
 

@@ -1,6 +1,9 @@
-package figo
+package figo_test
 
 import (
+	. "github.com/bi0dread/figo/v4"
+	. "github.com/bi0dread/figo/v4/adapters"
+
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -27,26 +30,26 @@ func TestCloneIsIndependent(t *testing.T) {
 	f := New()
 	f.AddFiltersFromString(`id=1`)
 	f.Build(RawAdapter{})
-	f.AddIgnoreFields("secret")
+	f.AddSelectFields("id")
 
 	c := f.Clone()
 
 	// Mutate the clone in several ways.
 	c.AddFilter(EqExpr{Field: "extra", Value: int64(9)})
 	c.SetPage(100, 100)
-	c.AddIgnoreFields("clone_only")
+	c.AddSelectFields("clone_only")
 
 	// Original is untouched.
 	assert.Len(t, f.GetClauses(), 1, "clone AddFilter must not grow the original")
 	assert.Equal(t, Page{Skip: 0, Take: 20}, f.GetPage(), "clone SetPage must not affect the original")
-	assert.NotContains(t, f.GetIgnoreFields(), "clone_only", "clone ignore-field must not leak to original")
+	assert.NotContains(t, f.GetSelectFields(), "clone_only", "clone select-field must not leak to original")
 
 	// Clone has its own changes.
 	assert.Len(t, c.GetClauses(), 2)
 	assert.Equal(t, Page{Skip: 100, Take: 100}, c.GetPage())
-	assert.Contains(t, c.GetIgnoreFields(), "clone_only")
+	assert.Contains(t, c.GetSelectFields(), "clone_only")
 	// Field sets copied at clone time are present.
-	assert.Contains(t, c.GetIgnoreFields(), "secret")
+	assert.Contains(t, c.GetSelectFields(), "id")
 
 	// Mutating the original after cloning must not affect the clone.
 	f.AddFilter(EqExpr{Field: "late", Value: int64(1)})

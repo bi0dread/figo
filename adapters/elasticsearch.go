@@ -1,6 +1,8 @@
-package figo
+package adapters
 
 import (
+	figo "github.com/bi0dread/figo/v4"
+
 	"encoding/json"
 	"fmt"
 	"strings"
@@ -10,7 +12,7 @@ import (
 type ElasticsearchAdapter struct{}
 
 // GetSqlString returns the JSON representation of the Elasticsearch query
-func (e ElasticsearchAdapter) GetSqlString(f Figo, ctx any, conditionType ...string) (string, bool) {
+func (e ElasticsearchAdapter) GetSqlString(f figo.Figo, ctx any, conditionType ...string) (string, bool) {
 	if f == nil {
 		return "", false
 	}
@@ -26,7 +28,7 @@ func (e ElasticsearchAdapter) GetSqlString(f Figo, ctx any, conditionType ...str
 }
 
 // GetQuery returns the Elasticsearch query for the given figo instance
-func (e ElasticsearchAdapter) GetQuery(f Figo, ctx any, conditionType ...string) (Query, bool) {
+func (e ElasticsearchAdapter) GetQuery(f figo.Figo, ctx any, conditionType ...string) (figo.Query, bool) {
 	if f == nil {
 		return nil, false
 	}
@@ -37,13 +39,13 @@ func (e ElasticsearchAdapter) GetQuery(f Figo, ctx any, conditionType ...string)
 	return ElasticsearchQueryWrapper{Query: query}, true
 }
 
-// ElasticsearchQueryWrapper wraps ElasticsearchQuery to implement the Query interface
+// ElasticsearchQueryWrapper wraps ElasticsearchQuery to implement the figo.Query interface
 type ElasticsearchQueryWrapper struct {
 	Query ElasticsearchQuery
 }
 
-// isQuery implements the Query interface
-func (e ElasticsearchQueryWrapper) isQuery() {}
+// IsQuery implements the figo.Query interface
+func (e ElasticsearchQueryWrapper) IsQuery() {}
 
 // GetSQL returns the JSON representation of the Elasticsearch query
 func (e ElasticsearchQueryWrapper) GetSQL() string {
@@ -66,7 +68,7 @@ type ElasticsearchQuery struct {
 }
 
 // BuildElasticsearchQuery converts the built figo expressions into an Elasticsearch query
-func BuildElasticsearchQuery(f Figo) (ElasticsearchQuery, error) {
+func BuildElasticsearchQuery(f figo.Figo) (ElasticsearchQuery, error) {
 	q, err := buildElasticsearchQueryFromExprs(f.GetClauses())
 	if err != nil {
 		return ElasticsearchQuery{}, err
@@ -113,7 +115,7 @@ func BuildElasticsearchQuery(f Figo) (ElasticsearchQuery, error) {
 }
 
 // buildElasticsearchQueryFromExprs converts expressions to Elasticsearch query structure
-func buildElasticsearchQueryFromExprs(exprs []Expr) (map[string]interface{}, error) {
+func buildElasticsearchQueryFromExprs(exprs []figo.Expr) (map[string]interface{}, error) {
 	if len(exprs) == 0 {
 		return map[string]interface{}{
 			"match_all": map[string]interface{}{},
@@ -142,39 +144,39 @@ func buildElasticsearchQueryFromExprs(exprs []Expr) (map[string]interface{}, err
 // query. It returns an error for expression types the adapter does not support,
 // so an unhandled condition fails loudly rather than being silently dropped
 // (which previously degraded to match_all — i.e. return the whole index).
-func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) {
+func buildElasticsearchQueryFromExpr(expr figo.Expr) (map[string]interface{}, error) {
 	switch x := expr.(type) {
-	case EqExpr:
+	case figo.EqExpr:
 		return map[string]interface{}{
 			"term": map[string]interface{}{
 				x.Field: x.Value,
 			},
 		}, nil
-	case GteExpr:
+	case figo.GteExpr:
 		return map[string]interface{}{
 			"range": map[string]interface{}{
 				x.Field: map[string]interface{}{"gte": x.Value},
 			},
 		}, nil
-	case GtExpr:
+	case figo.GtExpr:
 		return map[string]interface{}{
 			"range": map[string]interface{}{
 				x.Field: map[string]interface{}{"gt": x.Value},
 			},
 		}, nil
-	case LtExpr:
+	case figo.LtExpr:
 		return map[string]interface{}{
 			"range": map[string]interface{}{
 				x.Field: map[string]interface{}{"lt": x.Value},
 			},
 		}, nil
-	case LteExpr:
+	case figo.LteExpr:
 		return map[string]interface{}{
 			"range": map[string]interface{}{
 				x.Field: map[string]interface{}{"lte": x.Value},
 			},
 		}, nil
-	case NeqExpr:
+	case figo.NeqExpr:
 		return map[string]interface{}{
 			"bool": map[string]interface{}{
 				"must_not": map[string]interface{}{
@@ -182,13 +184,13 @@ func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) 
 				},
 			},
 		}, nil
-	case LikeExpr:
+	case figo.LikeExpr:
 		return map[string]interface{}{
 			"wildcard": map[string]interface{}{
 				x.Field: sqlLikeToESWildcard(x.Value),
 			},
 		}, nil
-	case ILikeExpr:
+	case figo.ILikeExpr:
 		return map[string]interface{}{
 			"wildcard": map[string]interface{}{
 				x.Field: map[string]interface{}{
@@ -197,13 +199,13 @@ func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) 
 				},
 			},
 		}, nil
-	case RegexExpr:
+	case figo.RegexExpr:
 		return map[string]interface{}{
 			"regexp": map[string]interface{}{
 				x.Field: esRegexpContains(x.Value),
 			},
 		}, nil
-	case IsNullExpr:
+	case figo.IsNullExpr:
 		return map[string]interface{}{
 			"bool": map[string]interface{}{
 				"must_not": map[string]interface{}{
@@ -211,11 +213,11 @@ func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) 
 				},
 			},
 		}, nil
-	case NotNullExpr:
+	case figo.NotNullExpr:
 		return map[string]interface{}{
 			"exists": map[string]interface{}{"field": x.Field},
 		}, nil
-	case InExpr:
+	case figo.InExpr:
 		if len(x.Values) == 0 {
 			// A nil values slice marshals to "terms": {field: null}, which
 			// Elasticsearch rejects. An empty IN set matches nothing.
@@ -226,7 +228,7 @@ func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) 
 		return map[string]interface{}{
 			"terms": map[string]interface{}{x.Field: x.Values},
 		}, nil
-	case NotInExpr:
+	case figo.NotInExpr:
 		if len(x.Values) == 0 {
 			// "NOT IN (empty set)" is true for every document.
 			return map[string]interface{}{
@@ -240,13 +242,13 @@ func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) 
 				},
 			},
 		}, nil
-	case BetweenExpr:
+	case figo.BetweenExpr:
 		return map[string]interface{}{
 			"range": map[string]interface{}{
 				x.Field: map[string]interface{}{"gte": x.Low, "lte": x.High},
 			},
 		}, nil
-	case AndExpr:
+	case figo.AndExpr:
 		must := []map[string]interface{}{}
 		for _, op := range x.Operands {
 			if op == nil {
@@ -261,7 +263,7 @@ func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) 
 		return map[string]interface{}{
 			"bool": map[string]interface{}{"must": must},
 		}, nil
-	case OrExpr:
+	case figo.OrExpr:
 		should := []map[string]interface{}{}
 		for _, op := range x.Operands {
 			if op == nil {
@@ -279,8 +281,8 @@ func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) 
 				"minimum_should_match": 1,
 			},
 		}, nil
-	case NotExpr:
-		// NotExpr means "none of the operands match" — must_not takes every
+	case figo.NotExpr:
+		// figo.NotExpr means "none of the operands match" — must_not takes every
 		// operand, not just the first (dropping operands widened the match).
 		musts := []map[string]interface{}{}
 		for _, op := range x.Operands {
@@ -301,8 +303,8 @@ func buildElasticsearchQueryFromExpr(expr Expr) (map[string]interface{}, error) 
 		return map[string]interface{}{
 			"bool": map[string]interface{}{"must_not": musts},
 		}, nil
-	case OrderBy:
-		// A stray OrderBy in the clause list is a no-op predicate (ordering is
+	case figo.OrderBy:
+		// A stray figo.OrderBy in the clause list is a no-op predicate (ordering is
 		// applied via query.Sort, not the query body). Match everything so it
 		// composes harmlessly inside a bool/must — mirroring the Mongo adapter,
 		// which returns an empty predicate rather than failing the whole query.
@@ -349,7 +351,7 @@ func sqlLikeToESWildcard(v any) string {
 }
 
 // GetElasticsearchQueryString returns the Elasticsearch query as a JSON string
-func GetElasticsearchQueryString(f Figo) (string, error) {
+func GetElasticsearchQueryString(f figo.Figo) (string, error) {
 	query, err := BuildElasticsearchQuery(f)
 	if err != nil {
 		return "", err
@@ -362,7 +364,7 @@ func GetElasticsearchQueryString(f Figo) (string, error) {
 }
 
 // GetElasticsearchQueryStringCompact returns the Elasticsearch query as a compact JSON string
-func GetElasticsearchQueryStringCompact(f Figo) (string, error) {
+func GetElasticsearchQueryStringCompact(f figo.Figo) (string, error) {
 	query, err := BuildElasticsearchQuery(f)
 	if err != nil {
 		return "", err
@@ -394,7 +396,7 @@ func NewElasticsearchQueryBuilder() *ElasticsearchQueryBuilder {
 // FromFigo initializes the builder with a figo instance. If the figo clauses
 // contain an unsupported expression, the error is deferred and returned by
 // ToJSON/ToJSONCompact (the fluent API has no error return here).
-func (b *ElasticsearchQueryBuilder) FromFigo(f Figo) *ElasticsearchQueryBuilder {
+func (b *ElasticsearchQueryBuilder) FromFigo(f figo.Figo) *ElasticsearchQueryBuilder {
 	q, err := BuildElasticsearchQuery(f)
 	if err != nil {
 		b.err = err

@@ -1,6 +1,9 @@
-package figo
+package figo_test
 
 import (
+	. "github.com/bi0dread/figo/v4"
+	. "github.com/bi0dread/figo/v4/adapters"
+
 	"strings"
 	"testing"
 
@@ -8,9 +11,9 @@ import (
 )
 
 func TestCustomNamingFunc(t *testing.T) {
-	t.Run("OverridesStrategy", func(t *testing.T) {
+	t.Run("OverridesDefault", func(t *testing.T) {
 		f := New()
-		// Even with the default snake_case strategy active, the custom func wins.
+		// The custom func replaces the default snake_case conversion.
 		f.SetNamingFunc(func(field string) string { return "t_" + strings.ToUpper(field) })
 		f.AddFiltersFromString(`userId=1 and status="x"`)
 		f.Build(RawAdapter{})
@@ -20,11 +23,10 @@ func TestCustomNamingFunc(t *testing.T) {
 		assert.NotContains(t, where, "user_id") // snake_case did not run
 	})
 
-	t.Run("NilFallsBackToStrategy", func(t *testing.T) {
+	t.Run("NilResetsToDefault", func(t *testing.T) {
 		f := New()
 		f.SetNamingFunc(func(field string) string { return "X" })
-		f.SetNamingFunc(nil) // remove the custom func
-		f.SetNamingStrategy(NAMING_STRATEGY_SNAKE_CASE)
+		f.SetNamingFunc(nil) // reset to the default (SnakeCaseNaming)
 		f.AddFiltersFromString(`userId=1`)
 		f.Build(RawAdapter{})
 		where, _ := BuildRawWhere(f)
@@ -33,19 +35,19 @@ func TestCustomNamingFunc(t *testing.T) {
 
 	t.Run("GetNamingFunc", func(t *testing.T) {
 		f := New()
-		assert.Nil(t, f.GetNamingFunc())
+		assert.NotNil(t, f.GetNamingFunc(), "default SnakeCaseNaming is active from New()")
+		assert.Equal(t, "user_id", f.GetNamingFunc()("userId"))
 		f.SetNamingFunc(func(s string) string { return s })
-		assert.NotNil(t, f.GetNamingFunc())
+		assert.Equal(t, "userId", f.GetNamingFunc()("userId"))
 	})
 }
 
-func TestUnknownStrategyLeavesNameUnchanged(t *testing.T) {
+func TestNoChangeNamingLeavesNameUnchanged(t *testing.T) {
 	f := New()
-	f.SetNamingStrategy("does_not_exist")
+	f.SetNamingFunc(NoChangeNaming)
 	f.AddFiltersFromString(`userId=1`)
 	f.Build(RawAdapter{})
 	where, _ := BuildRawWhere(f)
-	// Previously an unknown strategy blanked the column name; now it is a no-op.
 	assert.Contains(t, where, "`userId`")
 }
 

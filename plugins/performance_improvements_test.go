@@ -1,6 +1,9 @@
-package figo
+package plugins
 
 import (
+	. "github.com/bi0dread/figo/v4"
+	. "github.com/bi0dread/figo/v4/adapters"
+
 	"testing"
 	"time"
 
@@ -9,26 +12,25 @@ import (
 
 func TestQueryCaching(t *testing.T) {
 	t.Run("CacheConfiguration", func(t *testing.T) {
-		f := New()
+		// A disabled plugin has no cache and reports its config as-is
+		cp := NewCachePlugin(CacheConfig{})
+		assert.False(t, cp.GetConfig().Enabled)
+		assert.Nil(t, cp.GetCache())
 
-		// Test default cache config
-		config := f.GetCacheConfig()
-		assert.False(t, config.Enabled)
-
-		// Set cache config
-		cacheConfig := CacheConfig{
+		// Enabling via SetConfig creates an owned cache
+		cp.SetConfig(CacheConfig{
 			Enabled:         true,
 			TTL:             5 * time.Minute,
 			MaxSize:         100,
 			CleanupInterval: 1 * time.Minute,
-		}
-		f.SetCacheConfig(cacheConfig)
+		})
+		defer cp.Close()
 
-		// Verify config was set
-		updatedConfig := f.GetCacheConfig()
+		updatedConfig := cp.GetConfig()
 		assert.True(t, updatedConfig.Enabled)
 		assert.Equal(t, 5*time.Minute, updatedConfig.TTL)
 		assert.Equal(t, 100, updatedConfig.MaxSize)
+		assert.NotNil(t, cp.GetCache())
 	})
 
 	t.Run("InMemoryCache", func(t *testing.T) {
@@ -67,34 +69,28 @@ func TestQueryCaching(t *testing.T) {
 
 	t.Run("CachedQueryExecution", func(t *testing.T) {
 		f := New()
-		f.SetCacheConfig(CacheConfig{
+		cp := NewCachePlugin(CacheConfig{
 			Enabled: true,
 			TTL:     1 * time.Minute,
 			MaxSize: 100,
 		})
+		defer cp.Close()
 
 		// Build a query
 		f.AddFiltersFromString(`id=1 and name="test"`)
 		f.Build(RawAdapter{})
 
 		// First execution (cache miss)
-		start := time.Now()
-		sql1 := f.GetCachedSqlString(RawContext{Table: "GG"})
-		latency1 := time.Since(start)
+		sql1 := cp.GetCachedSqlString(f, RawContext{Table: "GG"})
 
 		// Second execution (cache hit)
-		start = time.Now()
-		sql2 := f.GetCachedSqlString(RawContext{Table: "GG"})
-		latency2 := time.Since(start)
+		sql2 := cp.GetCachedSqlString(f, RawContext{Table: "GG"})
 
 		// Results should be identical
 		assert.Equal(t, sql1, sql2)
 
-		// Cache hit should be faster
-		assert.True(t, latency2 < latency1)
-
 		// Verify cache stats
-		stats := f.GetCacheStats()
+		stats := cp.Stats()
 		assert.Equal(t, int64(1), stats.Hits)
 		assert.Equal(t, int64(1), stats.Misses)
 	})
@@ -146,125 +142,6 @@ func TestQueryCaching(t *testing.T) {
 		assert.True(t, found)
 		_, found = cache.Get("key3")
 		assert.True(t, found)
-	})
-}
-
-func TestBatchOperations(t *testing.T) {
-	t.Run("BatchProcessor", func(t *testing.T) {
-		processor := NewInMemoryBatchProcessor(2, 5*time.Second)
-
-		// Create test queries
-		f1 := New()
-		f1.AddFiltersFromString(`id=1`)
-		f1.Build(RawAdapter{})
-
-		f2 := New()
-		f2.AddFiltersFromString(`name="test"`)
-		f2.Build(RawAdapter{})
-
-		f3 := New()
-		f3.AddFiltersFromString(`age>18`)
-		f3.Build(RawAdapter{})
-
-		// Create batch operations
-		operations := []BatchOperation{
-			{ID: "op1", Query: f1, Context: RawContext{Table: "GG"}, Type: "sql"},
-			{ID: "op2", Query: f2, Context: RawContext{Table: "GG"}, Type: "sql"},
-			{ID: "op3", Query: f3, Context: RawContext{Table: "GG"}, Type: "sql"},
-		}
-
-		// Process batch
-		results := processor.Process(operations)
-
-		// Verify results
-		assert.Len(t, results, 3)
-
-		for i, result := range results {
-			assert.True(t, result.Success)
-			assert.NoError(t, result.Error)
-			assert.Equal(t, operations[i].ID, result.ID)
-			assert.NotNil(t, result.Result)
-		}
-	})
-
-	t.Run("AsyncBatchProcessing", func(t *testing.T) {
-		processor := NewInMemoryBatchProcessor(2, 5*time.Second)
-
-		// Create test queries
-		f1 := New()
-		f1.AddFiltersFromString(`id=1`)
-		f1.Build(RawAdapter{})
-
-		f2 := New()
-		f2.AddFiltersFromString(`name="test"`)
-		f2.Build(RawAdapter{})
-
-		// Create batch operations
-		operations := []BatchOperation{
-			{ID: "op1", Query: f1, Context: nil, Type: "sql"},
-			{ID: "op2", Query: f2, Context: nil, Type: "sql"},
-		}
-
-		// Process async
-		resultChan := processor.ProcessAsync(operations)
-
-		// Collect results
-		var results []BatchResult
-		for result := range resultChan {
-			results = append(results, result)
-		}
-
-		// Verify results
-		assert.Len(t, results, 2)
-
-		for _, result := range results {
-			assert.True(t, result.Success)
-			assert.NoError(t, result.Error)
-			assert.NotNil(t, result.Result)
-		}
-	})
-
-	t.Run("BatchWithDifferentTypes", func(t *testing.T) {
-		processor := NewInMemoryBatchProcessor(2, 5*time.Second)
-
-		f := New()
-		f.AddFiltersFromString(`id=1`)
-		f.Build(RawAdapter{})
-
-		// Test different operation types
-		operations := []BatchOperation{
-			{ID: "sql", Query: f, Context: nil, Type: "sql"},
-			{ID: "query", Query: f, Context: nil, Type: "query"},
-			{ID: "cached_sql", Query: f, Context: nil, Type: "cached_sql"},
-			{ID: "cached_query", Query: f, Context: nil, Type: "cached_query"},
-		}
-
-		results := processor.Process(operations)
-
-		assert.Len(t, results, 4)
-		for _, result := range results {
-			assert.True(t, result.Success)
-			assert.NoError(t, result.Error)
-		}
-	})
-
-	t.Run("BatchTimeout", func(t *testing.T) {
-		// Create processor with very short timeout
-		processor := NewInMemoryBatchProcessor(1, 1*time.Millisecond)
-
-		f := New()
-		f.AddFiltersFromString(`id=1`)
-		f.Build(RawAdapter{})
-
-		operations := []BatchOperation{
-			{ID: "op1", Query: f, Context: nil, Type: "sql"},
-		}
-
-		results := processor.Process(operations)
-
-		// Should complete successfully despite short timeout
-		assert.Len(t, results, 1)
-		assert.True(t, results[0].Success)
 	})
 }
 
@@ -323,25 +200,27 @@ func TestPerformanceMonitoring(t *testing.T) {
 		assert.Equal(t, int64(0), metrics.CacheMisses)
 	})
 
-	t.Run("FigoWithMonitoring", func(t *testing.T) {
+	t.Run("CachePluginWithMonitoring", func(t *testing.T) {
 		f := New()
-		monitor := NewPerformanceMonitor(true)
-		f.SetPerformanceMonitor(monitor)
+		monitor := NewMetricsPlugin(true)
+
+		cp := NewCachePlugin(CacheConfig{Enabled: true, TTL: time.Minute, MaxSize: 10})
+		defer cp.Close()
+		cp.SetPerformanceMonitor(monitor.PerformanceMonitor)
+		assert.NotNil(t, cp.GetPerformanceMonitor())
 
 		// Build and execute query
 		f.AddFiltersFromString(`id=1`)
 		f.Build(RawAdapter{})
 
-		// Execute query (this would normally record metrics)
-		_ = f.GetSqlString(nil)
-
-		// Get metrics
-		metrics := f.GetMetrics()
-		assert.NotNil(t, f.GetPerformanceMonitor())
+		// Rendering through the cache plugin records metrics
+		_ = cp.GetCachedSqlString(f, nil)
+		metrics := monitor.GetMetrics()
+		assert.Equal(t, int64(1), metrics.QueryCount)
 
 		// Reset metrics
-		f.ResetMetrics()
-		metrics = f.GetMetrics()
+		monitor.Reset()
+		metrics = monitor.GetMetrics()
 		assert.Equal(t, int64(0), metrics.QueryCount)
 	})
 }
@@ -351,17 +230,18 @@ func TestPerformanceImprovementsIntegration(t *testing.T) {
 		// Create figo instance with all performance features
 		f := New()
 
-		// Set up caching
-		f.SetCacheConfig(CacheConfig{
+		// Set up caching as a plugin
+		cp := NewCachePlugin(CacheConfig{
 			Enabled:         true,
 			TTL:             1 * time.Minute,
 			MaxSize:         100,
 			CleanupInterval: 30 * time.Second,
 		})
+		defer cp.Close()
 
-		// Set up monitoring
+		// Set up monitoring on the cache plugin
 		monitor := NewPerformanceMonitor(true)
-		f.SetPerformanceMonitor(monitor)
+		cp.SetPerformanceMonitor(monitor)
 
 		// Build query
 		f.AddFiltersFromString(`id=1 and name="test" and age>18`)
@@ -369,54 +249,16 @@ func TestPerformanceImprovementsIntegration(t *testing.T) {
 
 		// Execute multiple times to test caching
 		for i := 0; i < 5; i++ {
-			_ = f.GetCachedSqlString(nil)
+			_ = cp.GetCachedSqlString(f, nil)
 		}
 
 		// Verify cache stats
-		cacheStats := f.GetCacheStats()
+		cacheStats := cp.Stats()
 		assert.True(t, cacheStats.Hits > 0)
 		assert.True(t, cacheStats.HitRate > 0)
 
 		// Verify performance metrics
-		metrics := f.GetMetrics()
+		metrics := monitor.GetMetrics()
 		assert.True(t, metrics.QueryCount > 0)
-	})
-
-	t.Run("BatchProcessingWithCaching", func(t *testing.T) {
-		// Create queries with caching enabled
-		f1 := New()
-		f1.SetCacheConfig(CacheConfig{
-			Enabled: true,
-			TTL:     1 * time.Minute,
-			MaxSize: 100,
-		})
-		f1.AddFiltersFromString(`id=1`)
-		f1.Build(RawAdapter{})
-
-		f2 := New()
-		f2.SetCacheConfig(CacheConfig{
-			Enabled: true,
-			TTL:     1 * time.Minute,
-			MaxSize: 100,
-		})
-		f2.AddFiltersFromString(`name="test"`)
-		f2.Build(RawAdapter{})
-
-		// Create batch operations
-		processor := NewInMemoryBatchProcessor(2, 5*time.Second)
-		operations := []BatchOperation{
-			{ID: "op1", Query: f1, Context: nil, Type: "cached_sql"},
-			{ID: "op2", Query: f2, Context: nil, Type: "cached_sql"},
-		}
-
-		// Process batch
-		results := processor.Process(operations)
-
-		// Verify results
-		assert.Len(t, results, 2)
-		for _, result := range results {
-			assert.True(t, result.Success)
-			assert.NoError(t, result.Error)
-		}
 	})
 }

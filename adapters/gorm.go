@@ -1,6 +1,8 @@
-package figo
+package adapters
 
 import (
+	figo "github.com/bi0dread/figo/v4"
+
 	"fmt"
 
 	"gorm.io/gorm"
@@ -8,13 +10,8 @@ import (
 	"gorm.io/gorm/logger"
 )
 
-// toGormClause converts an internal Expr tree into a gorm clause.Expression
-func toGormClause(e Expr) clause.Expression {
-	return toGormClauseWithFigo(e, nil)
-}
-
-// toGormClauseWithFigo converts an internal Expr tree into a gorm clause.Expression with field name normalization
-func toGormClauseWithFigo(e Expr, f Figo) clause.Expression {
+// toGormClauseWithFigo converts an internal figo.Expr tree into a gorm clause.Expression with field name normalization
+func toGormClauseWithFigo(e figo.Expr, f figo.Figo) clause.Expression {
 	// Helper function to get normalized field name
 	getFieldName := func(field string) string {
 		if f != nil {
@@ -24,38 +21,38 @@ func toGormClauseWithFigo(e Expr, f Figo) clause.Expression {
 	}
 
 	switch x := e.(type) {
-	case EqExpr:
+	case figo.EqExpr:
 		return clause.Eq{Column: getFieldName(x.Field), Value: x.Value}
-	case GteExpr:
+	case figo.GteExpr:
 		return clause.Gte{Column: getFieldName(x.Field), Value: x.Value}
-	case GtExpr:
+	case figo.GtExpr:
 		return clause.Gt{Column: getFieldName(x.Field), Value: x.Value}
-	case LtExpr:
+	case figo.LtExpr:
 		return clause.Lt{Column: getFieldName(x.Field), Value: x.Value}
-	case LteExpr:
+	case figo.LteExpr:
 		return clause.Lte{Column: getFieldName(x.Field), Value: x.Value}
-	case NeqExpr:
+	case figo.NeqExpr:
 		return clause.Neq{Column: getFieldName(x.Field), Value: x.Value}
-	case LikeExpr:
+	case figo.LikeExpr:
 		return clause.Like{Column: getFieldName(x.Field), Value: x.Value}
-	case RegexExpr:
+	case figo.RegexExpr:
 		// Use configurable regex operator; default REGEXP, set to ~ or ~* for Postgres.
-		return clause.Expr{SQL: fmt.Sprintf("? %s ?", GetRegexSQLOperator()), Vars: []any{clause.Column{Name: getFieldName(x.Field)}, x.Value}}
-	case ILikeExpr:
+		return clause.Expr{SQL: fmt.Sprintf("? %s ?", figo.GetRegexSQLOperator()), Vars: []any{clause.Column{Name: getFieldName(x.Field)}, x.Value}}
+	case figo.ILikeExpr:
 		// GORM has no ILIKE portable operator; fallback to LOWER(col) LIKE LOWER(?)
 		return clause.Expr{SQL: "LOWER(?) LIKE LOWER(?)", Vars: []any{clause.Column{Name: getFieldName(x.Field)}, x.Value}}
-	case IsNullExpr:
+	case figo.IsNullExpr:
 		return clause.Eq{Column: getFieldName(x.Field), Value: nil}
-	case NotNullExpr:
+	case figo.NotNullExpr:
 		return clause.Neq{Column: getFieldName(x.Field), Value: nil}
-	case InExpr:
+	case figo.InExpr:
 		if len(x.Values) == 0 {
 			// Empty IN matches nothing. Mirror the raw adapter's 1=0 rather than
 			// relying on GORM's clause.IN, which for zero values emits "IN (NULL)".
 			return clause.Expr{SQL: "1=0"}
 		}
 		return clause.IN{Column: getFieldName(x.Field), Values: x.Values}
-	case NotInExpr:
+	case figo.NotInExpr:
 		if len(x.Values) == 0 {
 			// "NOT IN (empty set)" is true for every row. GORM's
 			// clause.Not(clause.IN{}) instead emits "col IS NOT NULL", which
@@ -63,9 +60,9 @@ func toGormClauseWithFigo(e Expr, f Figo) clause.Expression {
 			return clause.Expr{SQL: "1=1"}
 		}
 		return clause.Not(clause.IN{Column: getFieldName(x.Field), Values: x.Values})
-	case BetweenExpr:
+	case figo.BetweenExpr:
 		return clause.Expr{SQL: "? BETWEEN ? AND ?", Vars: []any{clause.Column{Name: getFieldName(x.Field)}, x.Low, x.High}}
-	case AndExpr:
+	case figo.AndExpr:
 		var parts []clause.Expression
 		for _, op := range x.Operands {
 			if op == nil {
@@ -74,7 +71,7 @@ func toGormClauseWithFigo(e Expr, f Figo) clause.Expression {
 			parts = append(parts, toGormClauseWithFigo(op, f))
 		}
 		return clause.And(parts...)
-	case OrExpr:
+	case figo.OrExpr:
 		var parts []clause.Expression
 		for _, op := range x.Operands {
 			if op == nil {
@@ -83,7 +80,7 @@ func toGormClauseWithFigo(e Expr, f Figo) clause.Expression {
 			parts = append(parts, toGormClauseWithFigo(op, f))
 		}
 		return clause.Or(parts...)
-	case NotExpr:
+	case figo.NotExpr:
 		var parts []clause.Expression
 		for _, op := range x.Operands {
 			if op == nil {
@@ -92,7 +89,7 @@ func toGormClauseWithFigo(e Expr, f Figo) clause.Expression {
 			parts = append(parts, toGormClauseWithFigo(op, f))
 		}
 		return clause.Not(parts...)
-	case OrderBy:
+	case figo.OrderBy:
 		var cols []clause.OrderByColumn
 		for _, c := range x.Columns {
 			normalizedName := getFieldName(c.Name)
@@ -110,7 +107,7 @@ func toGormClauseWithFigo(e Expr, f Figo) clause.Expression {
 const gormAppliedSetting = "figo:applied"
 
 // ApplyGorm applies pagination, preloads, where clauses, and sorting to a GORM DB instance.
-func ApplyGorm(f Figo, trx *gorm.DB) *gorm.DB {
+func ApplyGorm(f figo.Figo, trx *gorm.DB) *gorm.DB {
 	trx = trx.Set(gormAppliedSetting, true)
 	// Take/Skip <= 0 mean "no limit"/"no offset" in every other adapter;
 	// passing 0 to GORM's Limit would return zero rows instead.
@@ -202,7 +199,7 @@ func getGormSqlString(trx *gorm.DB, conditionType ...string) string {
 
 // applyGormOnce applies figo's state to the DB unless it already went through
 // ApplyGorm (the caller may pre-apply and pass the result back in).
-func applyGormOnce(f Figo, db *gorm.DB) *gorm.DB {
+func applyGormOnce(f figo.Figo, db *gorm.DB) *gorm.DB {
 	if _, applied := db.Get(gormAppliedSetting); applied {
 		return db
 	}
@@ -210,7 +207,7 @@ func applyGormOnce(f Figo, db *gorm.DB) *gorm.DB {
 }
 
 // AdapterGormGetSql is an internal helper to integrate with figo.GetSqlString
-func AdapterGormGetSql(f Figo, ctx any, conditionType ...string) (string, bool) {
+func AdapterGormGetSql(f figo.Figo, ctx any, conditionType ...string) (string, bool) {
 	db, ok := ctx.(*gorm.DB)
 	if !ok || db == nil {
 		return "", false
@@ -221,14 +218,14 @@ func AdapterGormGetSql(f Figo, ctx any, conditionType ...string) (string, bool) 
 // GormAdapter is an Adapter object you can pass to Build
 type GormAdapter struct{}
 
-func (GormAdapter) GetSqlString(f Figo, ctx any, conditionType ...string) (string, bool) {
+func (GormAdapter) GetSqlString(f figo.Figo, ctx any, conditionType ...string) (string, bool) {
 	if f == nil {
 		return "", false
 	}
 	return AdapterGormGetSql(f, ctx, conditionType...)
 }
 
-func (GormAdapter) GetQuery(f Figo, ctx any, conditionType ...string) (Query, bool) {
+func (GormAdapter) GetQuery(f figo.Figo, ctx any, conditionType ...string) (figo.Query, bool) {
 	if f == nil {
 		return nil, false
 	}
@@ -237,5 +234,5 @@ func (GormAdapter) GetQuery(f Figo, ctx any, conditionType ...string) (Query, bo
 		return nil, false
 	}
 	sql, args := gormDryRunSQL(applyGormOnce(f, db), conditionType...)
-	return SQLQuery{SQL: sql, Args: args}, true
+	return figo.SQLQuery{SQL: sql, Args: args}, true
 }

@@ -1,6 +1,9 @@
-package figo
+package figo_test
 
 import (
+	. "github.com/bi0dread/figo/v4"
+	. "github.com/bi0dread/figo/v4/adapters"
+
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -47,94 +50,6 @@ func TestKeywordValuesStayValues(t *testing.T) {
 		or, ok := clauses[0].(OrExpr)
 		require.True(t, ok, "expected OrExpr, got %T", clauses[0])
 		assert.Len(t, or.Operands, 2)
-	})
-}
-
-// Dropping an ignored field must remove its condition from the logical
-// structure without leaving the neighboring NOT/AND/OR to re-bind elsewhere.
-func TestIgnoreFieldsDoNotOrphanOperators(t *testing.T) {
-	t.Run("not on ignored field does not retarget", func(t *testing.T) {
-		f := New()
-		f.AddIgnoreFields("secret")
-		require.NoError(t, f.AddFiltersFromString(`not secret=1 and a=2`))
-		f.Build(RawAdapter{})
-
-		clauses := f.GetClauses()
-		require.Len(t, clauses, 1)
-		eq, ok := clauses[0].(EqExpr)
-		require.True(t, ok, "expected bare EqExpr on a, got %#v", clauses[0])
-		assert.Equal(t, "a", eq.Field)
-	})
-
-	t.Run("or survives an ignored middle condition", func(t *testing.T) {
-		f := New()
-		f.AddIgnoreFields("secret")
-		require.NoError(t, f.AddFiltersFromString(`a=1 and secret=2 or b=3`))
-		f.Build(RawAdapter{})
-
-		clauses := f.GetClauses()
-		require.Len(t, clauses, 1)
-		or, ok := clauses[0].(OrExpr)
-		require.True(t, ok, "OR must survive, got %#v", clauses[0])
-		assert.Len(t, or.Operands, 2)
-	})
-
-	t.Run("ignore matches across naming strategies", func(t *testing.T) {
-		f := New() // default snake_case strategy
-		f.AddIgnoreFields("user_name")
-		require.NoError(t, f.AddFiltersFromString(`userName=1 and a=2`))
-		f.Build(RawAdapter{})
-
-		clauses := f.GetClauses()
-		require.Len(t, clauses, 1)
-		eq, ok := clauses[0].(EqExpr)
-		require.True(t, ok, "expected bare EqExpr on a, got %#v", clauses[0])
-		assert.Equal(t, "a", eq.Field)
-	})
-
-	t.Run("ignored fields pruned from preloads", func(t *testing.T) {
-		f := New()
-		f.AddIgnoreFields("secret")
-		require.NoError(t, f.AddFiltersFromString(`a=1 load=[Orders:secret=1]`))
-		f.Build(RawAdapter{})
-
-		assert.Empty(t, f.GetPreloads()["Orders"])
-	})
-}
-
-// A leading NOT is valid and must survive all three entry paths unchanged.
-func TestLeadingNotNeverStripped(t *testing.T) {
-	assertNegated := func(t *testing.T, f Figo) {
-		t.Helper()
-		clauses := f.GetClauses()
-		require.Len(t, clauses, 1)
-		not, ok := clauses[0].(NotExpr)
-		require.True(t, ok, "expected NotExpr, got %#v", clauses[0])
-		require.Len(t, not.Operands, 1)
-		eq, ok := not.Operands[0].(EqExpr)
-		require.True(t, ok)
-		assert.Equal(t, "deleted", eq.Field)
-	}
-
-	t.Run("plain", func(t *testing.T) {
-		f := New()
-		require.NoError(t, f.AddFiltersFromString(`not deleted=true`))
-		f.Build(RawAdapter{})
-		assertNegated(t, f)
-	})
-
-	t.Run("with repair enabled", func(t *testing.T) {
-		f := New()
-		require.NoError(t, f.AddFiltersFromStringWithRepair(`not deleted=true`, true))
-		f.Build(RawAdapter{})
-		assertNegated(t, f)
-	})
-
-	t.Run("with repair disabled (validation)", func(t *testing.T) {
-		f := New()
-		require.NoError(t, f.AddFiltersFromStringWithRepair(`not deleted=true`, false))
-		f.Build(RawAdapter{})
-		assertNegated(t, f)
 	})
 }
 

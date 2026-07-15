@@ -1,6 +1,9 @@
-package figo
+package plugins
 
 import (
+	. "github.com/bi0dread/figo/v4"
+	. "github.com/bi0dread/figo/v4/adapters"
+
 	"sync"
 	"testing"
 	"time"
@@ -37,7 +40,8 @@ func TestConcurrentCacheGet(t *testing.T) {
 // (readers) must not race on f.clauses / f.preloads / f.dsl.
 func TestConcurrentBuildAndRead(t *testing.T) {
 	f := New()
-	f.SetCacheConfig(CacheConfig{Enabled: true, MaxSize: 100, TTL: time.Minute})
+	cp := NewCachePlugin(CacheConfig{Enabled: true, MaxSize: 100, TTL: time.Minute})
+	defer cp.Close()
 
 	var wg sync.WaitGroup
 	stop := make(chan struct{})
@@ -61,7 +65,7 @@ func TestConcurrentBuildAndRead(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 300; j++ {
-				f.GetCachedSqlString("t")
+				cp.GetCachedSqlString(f, "t")
 				_ = f.GetPreloads()
 				_ = f.GetClauses()
 			}
@@ -82,23 +86,6 @@ func TestCacheCloseIsIdempotent(t *testing.T) {
 	})
 }
 
-// #14: a non-positive batch concurrency must not deadlock or panic.
-func TestBatchProcessorClampsConcurrency(t *testing.T) {
-	for _, n := range []int{0, -1} {
-		done := make(chan struct{})
-		go func() {
-			bp := NewInMemoryBatchProcessor(n, time.Second)
-			bp.Process([]BatchOperation{{ID: "1"}})
-			close(done)
-		}()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-			t.Fatalf("Process deadlocked for maxConcurrency=%d", n)
-		}
-	}
-}
-
 // #19: eviction is LRU (by last access), not FIFO (by creation).
 func TestCacheEvictsLeastRecentlyUsed(t *testing.T) {
 	c := NewInMemoryCache(CacheConfig{Enabled: true, MaxSize: 2})
@@ -117,12 +104,13 @@ func TestCacheEvictsLeastRecentlyUsed(t *testing.T) {
 // #20: SQL and Query results must not share a cache key.
 func TestCacheKeyDistinguishesSqlAndQuery(t *testing.T) {
 	f := New()
-	f.SetCacheConfig(CacheConfig{Enabled: true, MaxSize: 100, TTL: time.Minute})
+	cp := NewCachePlugin(CacheConfig{Enabled: true, MaxSize: 100, TTL: time.Minute})
+	defer cp.Close()
 	f.AddFiltersFromString(`id=1`)
 	f.Build(RawAdapter{})
 
-	sql := f.GetCachedSqlString("t")
-	q := f.GetCachedQuery("t")
+	sql := cp.GetCachedSqlString(f, "t")
+	q := cp.GetCachedQuery(f, "t")
 	assert.NotEmpty(t, sql)
 	assert.NotNil(t, q, "GetCachedQuery must not receive the string cached under the same key")
 	_, ok := q.(SQLQuery)

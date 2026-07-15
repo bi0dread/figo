@@ -1,12 +1,12 @@
-package figo
+package adapters
 
 import (
+	figo "github.com/bi0dread/figo/v4"
+
 	"fmt"
 	"sort"
 	"strings"
 	"time"
-
-	"github.com/gobeam/stringy"
 )
 
 // sortedKeys returns the keys of a set-like map in deterministic order, so the
@@ -28,68 +28,47 @@ type RawPreload struct {
 }
 
 // BuildRawPreloads builds WHERE clauses for each preload relationship without any ORM dependency
-func BuildRawPreloads(f Figo) map[string]RawPreload {
+func BuildRawPreloads(f figo.Figo) map[string]RawPreload {
+	d := rawDialectOf(f)
 	result := make(map[string]RawPreload)
 	for rel, exprs := range f.GetPreloads() {
-		where, args := buildWhereFromExprs(exprs)
+		where, args := buildWhereFromExprs(d, exprs)
+		if d.NumberedPlaceholders {
+			where = numberPlaceholders(where)
+		}
 		result[rel] = RawPreload{Where: where, Args: args}
 	}
 	return result
 }
 
 // BuildRawWhere builds a SQL WHERE clause (without the leading WHERE keyword) and its args
-func BuildRawWhere(f Figo) (string, []any) {
-	return buildWhereFromExprs(f.GetClauses())
+func BuildRawWhere(f figo.Figo) (string, []any) {
+	d := rawDialectOf(f)
+	where, args := buildWhereFromExprs(d, f.GetClauses())
+	if d.NumberedPlaceholders {
+		where = numberPlaceholders(where)
+	}
+	return where, args
 }
 
 // BuildRawSelect builds a full SELECT query for the given table and columns.
-// Identifiers are quoted with backticks to be broadly compatible with MySQL-like dialects.
-// Placeholders use the '?' style.
-func BuildRawSelect(f Figo, table string, columns ...string) (string, []any) {
-	cols := "*"
-	// prefer selectFields if provided
-	if sel := f.GetSelectFields(); len(sel) > 0 {
-		quoted := make([]string, 0, len(sel))
-		for _, name := range sortedKeys(sel) {
-			quoted = append(quoted, quoteIdent(normalizeColumnName(f, name)))
-		}
-		cols = strings.Join(quoted, ", ")
-	} else if len(columns) > 0 {
-		quoted := make([]string, 0, len(columns))
-		for _, c := range columns {
-			quoted = append(quoted, quoteIdent(c))
-		}
-		cols = strings.Join(quoted, ", ")
+// Identifier quoting and placeholder style come from the instance's raw
+// adapter dialect (MySQL backticks and '?' by default).
+func BuildRawSelect(f figo.Figo, table string, columns ...string) (string, []any) {
+	d := rawDialectOf(f)
+	sql, args := buildFullSelect(d, f, table, columns...)
+	if d.NumberedPlaceholders {
+		sql = numberPlaceholders(sql)
 	}
-
-	// joins must come before WHERE and their args first
-	joinSQL, joinArgs := buildJoins(f)
-	where, whereArgs := BuildRawWhere(f)
-	orderBy := buildOrderBy(f)
-	limitOffset := buildLimitOffset(f)
-
-	query := fmt.Sprintf("SELECT %s FROM %s", cols, quoteIdent(table))
-	if joinSQL != "" {
-		query += " " + joinSQL
-	}
-	if where != "" {
-		query += " WHERE " + where
-	}
-	if orderBy != "" {
-		query += " " + orderBy
-	}
-	if limitOffset != "" {
-		query += " " + limitOffset
-	}
-	// args: first joins, then where
-	args := append([]any{}, joinArgs...)
-	args = append(args, whereArgs...)
-	return query, args
+	return sql, args
 }
 
 // -- internals --
+// Internal builders always emit '?' placeholders; numbered dialects rewrite
+// them ONCE on the fully assembled statement (numbering fragments and then
+// concatenating them would repeat $1).
 
-func buildWhereFromExprs(exprs []Expr) (string, []any) {
+func buildWhereFromExprs(d *SQLDialect, exprs []figo.Expr) (string, []any) {
 	if len(exprs) == 0 {
 		return "", nil
 	}
@@ -101,7 +80,7 @@ func buildWhereFromExprs(exprs []Expr) (string, []any) {
 		if e == nil {
 			continue
 		}
-		p, a := exprToSQL(e)
+		p, a := exprToSQL(d, e)
 		if p != "" {
 			parts = append(parts, p)
 			args = append(args, a...)
@@ -110,32 +89,32 @@ func buildWhereFromExprs(exprs []Expr) (string, []any) {
 	return strings.Join(parts, " AND "), args
 }
 
-func exprToSQL(e Expr) (string, []any) {
+func exprToSQL(d *SQLDialect, e figo.Expr) (string, []any) {
 	switch x := e.(type) {
-	case EqExpr:
-		return fmt.Sprintf("%s = ?", quoteIdent(x.Field)), []any{x.Value}
-	case GteExpr:
-		return fmt.Sprintf("%s >= ?", quoteIdent(x.Field)), []any{x.Value}
-	case GtExpr:
-		return fmt.Sprintf("%s > ?", quoteIdent(x.Field)), []any{x.Value}
-	case LtExpr:
-		return fmt.Sprintf("%s < ?", quoteIdent(x.Field)), []any{x.Value}
-	case LteExpr:
-		return fmt.Sprintf("%s <= ?", quoteIdent(x.Field)), []any{x.Value}
-	case NeqExpr:
-		return fmt.Sprintf("%s != ?", quoteIdent(x.Field)), []any{x.Value}
-	case LikeExpr:
-		return fmt.Sprintf("%s LIKE ?", quoteIdent(x.Field)), []any{x.Value}
-	case RegexExpr:
-		// Use configurable operator (default REGEXP). For Postgres, set to ~ or ~* via SetRegexSQLOperator
-		return fmt.Sprintf("%s %s ?", quoteIdent(x.Field), GetRegexSQLOperator()), []any{x.Value}
-	case ILikeExpr:
-		return fmt.Sprintf("LOWER(%s) LIKE LOWER(?)", quoteIdent(x.Field)), []any{x.Value}
-	case IsNullExpr:
-		return fmt.Sprintf("%s IS NULL", quoteIdent(x.Field)), nil
-	case NotNullExpr:
-		return fmt.Sprintf("%s IS NOT NULL", quoteIdent(x.Field)), nil
-	case InExpr:
+	case figo.EqExpr:
+		return fmt.Sprintf("%s = ?", d.quoteIdent(x.Field)), []any{x.Value}
+	case figo.GteExpr:
+		return fmt.Sprintf("%s >= ?", d.quoteIdent(x.Field)), []any{x.Value}
+	case figo.GtExpr:
+		return fmt.Sprintf("%s > ?", d.quoteIdent(x.Field)), []any{x.Value}
+	case figo.LtExpr:
+		return fmt.Sprintf("%s < ?", d.quoteIdent(x.Field)), []any{x.Value}
+	case figo.LteExpr:
+		return fmt.Sprintf("%s <= ?", d.quoteIdent(x.Field)), []any{x.Value}
+	case figo.NeqExpr:
+		return fmt.Sprintf("%s != ?", d.quoteIdent(x.Field)), []any{x.Value}
+	case figo.LikeExpr:
+		return fmt.Sprintf("%s LIKE ?", d.quoteIdent(x.Field)), []any{x.Value}
+	case figo.RegexExpr:
+		// The operator comes from the dialect: REGEXP (MySQL/SQLite), ~ (Postgres).
+		return fmt.Sprintf("%s %s ?", d.quoteIdent(x.Field), d.RegexOperator), []any{x.Value}
+	case figo.ILikeExpr:
+		return fmt.Sprintf("LOWER(%s) LIKE LOWER(?)", d.quoteIdent(x.Field)), []any{x.Value}
+	case figo.IsNullExpr:
+		return fmt.Sprintf("%s IS NULL", d.quoteIdent(x.Field)), nil
+	case figo.NotNullExpr:
+		return fmt.Sprintf("%s IS NOT NULL", d.quoteIdent(x.Field)), nil
+	case figo.InExpr:
 		if len(x.Values) == 0 {
 			// An empty IN set matches nothing. Returning "" would drop the whole
 			// predicate (WHERE disappears), turning a match-nothing filter into a
@@ -144,34 +123,34 @@ func exprToSQL(e Expr) (string, []any) {
 		}
 		placeholders := strings.Repeat("?,", len(x.Values))
 		placeholders = placeholders[:len(placeholders)-1]
-		return fmt.Sprintf("%s IN (%s)", quoteIdent(x.Field), placeholders), append([]any{}, x.Values...)
-	case NotInExpr:
+		return fmt.Sprintf("%s IN (%s)", d.quoteIdent(x.Field), placeholders), append([]any{}, x.Values...)
+	case figo.NotInExpr:
 		if len(x.Values) == 0 {
 			// "NOT IN (empty set)" is true for every row.
 			return "1=1", nil
 		}
 		placeholders := strings.Repeat("?,", len(x.Values))
 		placeholders = placeholders[:len(placeholders)-1]
-		return fmt.Sprintf("%s NOT IN (%s)", quoteIdent(x.Field), placeholders), append([]any{}, x.Values...)
-	case BetweenExpr:
-		return fmt.Sprintf("%s BETWEEN ? AND ?", quoteIdent(x.Field)), []any{x.Low, x.High}
-	case AndExpr:
-		return joinGroup("AND", x.Operands)
-	case OrExpr:
-		return joinGroup("OR", x.Operands)
-	case NotExpr:
+		return fmt.Sprintf("%s NOT IN (%s)", d.quoteIdent(x.Field), placeholders), append([]any{}, x.Values...)
+	case figo.BetweenExpr:
+		return fmt.Sprintf("%s BETWEEN ? AND ?", d.quoteIdent(x.Field)), []any{x.Low, x.High}
+	case figo.AndExpr:
+		return joinGroup(d, "AND", x.Operands)
+	case figo.OrExpr:
+		return joinGroup(d, "OR", x.Operands)
+	case figo.NotExpr:
 		if len(x.Operands) == 0 {
 			return "", nil
 		}
-		// NotExpr means "none of the operands match": NOT(a OR b), matching
+		// figo.NotExpr means "none of the operands match": NOT(a OR b), matching
 		// Mongo's $nor and GORM's clause.Not. Joining with AND here rendered
 		// NOT(a AND b), which matches rows the other adapters exclude.
-		inner, args := joinGroup("OR", x.Operands)
+		inner, args := joinGroup(d, "OR", x.Operands)
 		if inner == "" {
 			return "", nil
 		}
 		return fmt.Sprintf("NOT (%s)", inner), args
-	case OrderBy:
+	case figo.OrderBy:
 		// handled separately in buildOrderBy
 		return "", nil
 	default:
@@ -179,33 +158,33 @@ func exprToSQL(e Expr) (string, []any) {
 	}
 }
 
-func exprToSQLQualified(e Expr, qualifier string) (string, []any) {
+func exprToSQLQualified(d *SQLDialect, e figo.Expr, qualifier string) (string, []any) {
 	// Qualify column references with the given table name
-	qcol := func(field string) string { return quoteIdent(qualifier) + "." + quoteIdent(field) }
+	qcol := func(field string) string { return d.quoteIdent(qualifier) + "." + d.quoteIdent(field) }
 	switch x := e.(type) {
-	case EqExpr:
+	case figo.EqExpr:
 		return fmt.Sprintf("%s = ?", qcol(x.Field)), []any{x.Value}
-	case GteExpr:
+	case figo.GteExpr:
 		return fmt.Sprintf("%s >= ?", qcol(x.Field)), []any{x.Value}
-	case GtExpr:
+	case figo.GtExpr:
 		return fmt.Sprintf("%s > ?", qcol(x.Field)), []any{x.Value}
-	case LtExpr:
+	case figo.LtExpr:
 		return fmt.Sprintf("%s < ?", qcol(x.Field)), []any{x.Value}
-	case LteExpr:
+	case figo.LteExpr:
 		return fmt.Sprintf("%s <= ?", qcol(x.Field)), []any{x.Value}
-	case NeqExpr:
+	case figo.NeqExpr:
 		return fmt.Sprintf("%s != ?", qcol(x.Field)), []any{x.Value}
-	case LikeExpr:
+	case figo.LikeExpr:
 		return fmt.Sprintf("%s LIKE ?", qcol(x.Field)), []any{x.Value}
-	case RegexExpr:
-		return fmt.Sprintf("%s %s ?", qcol(x.Field), GetRegexSQLOperator()), []any{x.Value}
-	case ILikeExpr:
+	case figo.RegexExpr:
+		return fmt.Sprintf("%s %s ?", qcol(x.Field), d.RegexOperator), []any{x.Value}
+	case figo.ILikeExpr:
 		return fmt.Sprintf("LOWER(%s) LIKE LOWER(?)", qcol(x.Field)), []any{x.Value}
-	case IsNullExpr:
+	case figo.IsNullExpr:
 		return fmt.Sprintf("%s IS NULL", qcol(x.Field)), nil
-	case NotNullExpr:
+	case figo.NotNullExpr:
 		return fmt.Sprintf("%s IS NOT NULL", qcol(x.Field)), nil
-	case InExpr:
+	case figo.InExpr:
 		if len(x.Values) == 0 {
 			// Empty IN set matches nothing; see exprToSQL for rationale.
 			return "1=0", nil
@@ -213,7 +192,7 @@ func exprToSQLQualified(e Expr, qualifier string) (string, []any) {
 		placeholders := strings.Repeat("?,", len(x.Values))
 		placeholders = placeholders[:len(placeholders)-1]
 		return fmt.Sprintf("%s IN (%s)", qcol(x.Field), placeholders), append([]any{}, x.Values...)
-	case NotInExpr:
+	case figo.NotInExpr:
 		if len(x.Values) == 0 {
 			// "NOT IN (empty set)" is true for every row.
 			return "1=1", nil
@@ -221,37 +200,37 @@ func exprToSQLQualified(e Expr, qualifier string) (string, []any) {
 		placeholders := strings.Repeat("?,", len(x.Values))
 		placeholders = placeholders[:len(placeholders)-1]
 		return fmt.Sprintf("%s NOT IN (%s)", qcol(x.Field), placeholders), append([]any{}, x.Values...)
-	case BetweenExpr:
+	case figo.BetweenExpr:
 		return fmt.Sprintf("%s BETWEEN ? AND ?", qcol(x.Field)), []any{x.Low, x.High}
-	case AndExpr:
-		return joinGroupQualified("AND", x.Operands, qualifier)
-	case OrExpr:
-		return joinGroupQualified("OR", x.Operands, qualifier)
-	case NotExpr:
+	case figo.AndExpr:
+		return joinGroupQualified(d, "AND", x.Operands, qualifier)
+	case figo.OrExpr:
+		return joinGroupQualified(d, "OR", x.Operands, qualifier)
+	case figo.NotExpr:
 		if len(x.Operands) == 0 {
 			return "", nil
 		}
-		// See exprToSQL: NotExpr is NOT(a OR b) across all adapters.
-		inner, args := joinGroupQualified("OR", x.Operands, qualifier)
+		// See exprToSQL: figo.NotExpr is NOT(a OR b) across all adapters.
+		inner, args := joinGroupQualified(d, "OR", x.Operands, qualifier)
 		if inner == "" {
 			return "", nil
 		}
 		return fmt.Sprintf("NOT (%s)", inner), args
-	case OrderBy:
+	case figo.OrderBy:
 		return "", nil
 	default:
 		return "", nil
 	}
 }
 
-func joinGroup(op string, operands []Expr) (string, []any) {
+func joinGroup(d *SQLDialect, op string, operands []figo.Expr) (string, []any) {
 	parts := make([]string, 0, len(operands))
 	args := make([]any, 0)
 	for _, e := range operands {
 		if e == nil {
 			continue
 		}
-		p, a := exprToSQL(e)
+		p, a := exprToSQL(d, e)
 		if p != "" {
 			parts = append(parts, p)
 			args = append(args, a...)
@@ -266,14 +245,14 @@ func joinGroup(op string, operands []Expr) (string, []any) {
 	return "(" + strings.Join(parts, " "+op+" ") + ")", args
 }
 
-func joinGroupQualified(op string, operands []Expr, qualifier string) (string, []any) {
+func joinGroupQualified(d *SQLDialect, op string, operands []figo.Expr, qualifier string) (string, []any) {
 	parts := make([]string, 0, len(operands))
 	args := make([]any, 0)
 	for _, e := range operands {
 		if e == nil {
 			continue
 		}
-		p, a := exprToSQLQualified(e, qualifier)
+		p, a := exprToSQLQualified(d, e, qualifier)
 		if p != "" {
 			parts = append(parts, p)
 			args = append(args, a...)
@@ -288,7 +267,7 @@ func joinGroupQualified(op string, operands []Expr, qualifier string) (string, [
 	return "(" + strings.Join(parts, " "+op+" ") + ")", args
 }
 
-func buildOrderBy(f Figo) string {
+func buildOrderBy(d *SQLDialect, f figo.Figo) string {
 	sort := f.GetSort()
 	if sort != nil {
 		cols := make([]string, 0, len(sort.Columns))
@@ -297,7 +276,7 @@ func buildOrderBy(f Figo) string {
 			if c.Desc {
 				dir = "DESC"
 			}
-			cols = append(cols, fmt.Sprintf("%s %s", quoteIdent(c.Name), dir))
+			cols = append(cols, fmt.Sprintf("%s %s", d.quoteIdent(c.Name), dir))
 		}
 		if len(cols) > 0 {
 			return "ORDER BY " + strings.Join(cols, ", ")
@@ -306,7 +285,7 @@ func buildOrderBy(f Figo) string {
 	return ""
 }
 
-func buildLimitOffset(f Figo) string {
+func buildLimitOffset(d *SQLDialect, f figo.Figo) string {
 	p := f.GetPage()
 	// Embed numbers directly for broad driver compatibility
 	// If Take is 0, skip LIMIT clause
@@ -319,17 +298,10 @@ func buildLimitOffset(f Figo) string {
 	if p.Take > 0 {
 		return fmt.Sprintf("LIMIT %d", p.Take)
 	}
-	// OFFSET without LIMIT is a syntax error on MySQL/SQLite, so pair it with the
-	// conventional "unbounded" LIMIT.
-	return fmt.Sprintf("LIMIT 18446744073709551615 OFFSET %d", p.Skip)
-}
-
-func quoteIdent(ident string) string {
-	// Escape embedded backticks by doubling them (MySQL/SQLite identifier rule).
-	// Without this, a crafted field/table name can break out of the quoting and
-	// inject SQL — and identifiers can't be parametrized, so this is the only
-	// defense on both the GetSqlString and GetQuery paths.
-	return "`" + strings.ReplaceAll(ident, "`", "``") + "`"
+	// OFFSET without LIMIT is a syntax error on MySQL/SQLite, so pair it with
+	// the dialect's "unbounded" LIMIT token (MySQL max-uint64, Postgres ALL,
+	// SQLite -1).
+	return fmt.Sprintf("LIMIT %s OFFSET %d", d.NoLimitToken, p.Skip)
 }
 
 // AdapterRawGetSql is an internal helper to integrate with figo.GetSqlString
@@ -338,7 +310,10 @@ type RawContext struct {
 	Table string
 }
 
-func AdapterRawGetSql(f Figo, ctx any, conditionType ...string) (string, []any, bool) {
+// AdapterRawGetSql renders the statement with '?' placeholders regardless of
+// dialect; callers that hand args to a driver convert via the adapter
+// (RawAdapter.GetQuery numbers them for Postgres).
+func AdapterRawGetSql(f figo.Figo, ctx any, conditionType ...string) (string, []any, bool) {
 	switch v := ctx.(type) {
 	case string:
 		sql, args := buildByConditions(f, v, conditionType...)
@@ -351,10 +326,24 @@ func AdapterRawGetSql(f Figo, ctx any, conditionType ...string) (string, []any, 
 	}
 }
 
-// RawAdapter is an Adapter object you can pass to NewWithAdapterObject
-type RawAdapter struct{}
+// RawAdapter renders standalone SQL. The zero value uses the MySQL dialect
+// (backtick identifiers, ? placeholders, REGEXP); set Dialect to
+// PostgresDialect / SQLiteDialect (or a custom *SQLDialect) to change the
+// rendering. Select the dialect BEFORE rendering, e.g. Build(RawAdapter{
+// Dialect: figo.PostgresDialect}).
+type RawAdapter struct {
+	Dialect *SQLDialect
+}
 
-func (RawAdapter) GetSqlString(f Figo, ctx any, conditionType ...string) (string, bool) {
+// dialect returns the configured dialect, defaulting to MySQL.
+func (a RawAdapter) dialect() *SQLDialect {
+	if a.Dialect == nil {
+		return MySQLDialect
+	}
+	return a.Dialect
+}
+
+func (a RawAdapter) GetSqlString(f figo.Figo, ctx any, conditionType ...string) (string, bool) {
 	if f == nil {
 		return "", false
 	}
@@ -362,10 +351,11 @@ func (RawAdapter) GetSqlString(f Figo, ctx any, conditionType ...string) (string
 	if !ok {
 		return "", false
 	}
-	return expandPlaceholders(sql, args), true
+	// Interpolate literals into the ?-form; numbering never applies here.
+	return expandPlaceholders(a.dialect(), sql, args), true
 }
 
-func (RawAdapter) GetQuery(f Figo, ctx any, conditionType ...string) (Query, bool) {
+func (a RawAdapter) GetQuery(f figo.Figo, ctx any, conditionType ...string) (figo.Query, bool) {
 	if f == nil {
 		return nil, false
 	}
@@ -373,28 +363,34 @@ func (RawAdapter) GetQuery(f Figo, ctx any, conditionType ...string) (Query, boo
 	if !ok {
 		return nil, false
 	}
-	return SQLQuery{SQL: sql, Args: args}, true
+	if a.dialect().NumberedPlaceholders {
+		sql = numberPlaceholders(sql)
+	}
+	return figo.SQLQuery{SQL: sql, Args: args}, true
 }
 
-func buildByConditions(f Figo, table string, conditionType ...string) (string, []any) {
+func buildByConditions(f figo.Figo, table string, conditionType ...string) (string, []any) {
+	d := rawDialectOf(f)
+
 	// Determine columns from selectFields; default to *
 	cols := "*"
 	if sel := f.GetSelectFields(); len(sel) > 0 {
 		quoted := make([]string, 0, len(sel))
 		for _, name := range sortedKeys(sel) {
-			quoted = append(quoted, quoteIdent(normalizeColumnName(f, name)))
+			quoted = append(quoted, d.quoteIdent(normalizeColumnName(f, name)))
 		}
 		cols = strings.Join(quoted, ", ")
 	}
 
-	joinSQL, joinArgs := buildJoins(f)
-	where, whereArgs := BuildRawWhere(f)
-	orderBy := buildOrderBy(f)
-	limitOffset := buildLimitOffset(f)
+	joinSQL, joinArgs := buildJoins(d, f)
+	where, whereArgs := buildWhereFromExprs(d, f.GetClauses())
+	orderBy := buildOrderBy(d, f)
+	limitOffset := buildLimitOffset(d, f)
 
-	// If no conditionType specified, return full SELECT
+	// If no conditionType specified, return full SELECT (?-form; the adapter
+	// numbers or interpolates at its boundary)
 	if len(conditionType) == 0 {
-		return BuildRawSelect(f, table)
+		return buildFullSelect(d, f, table)
 	}
 
 	// Build only requested parts, in the order provided
@@ -409,7 +405,7 @@ func buildByConditions(f Figo, table string, conditionType ...string) (string, [
 		case "SELECT":
 			parts = append(parts, fmt.Sprintf("SELECT %s", cols))
 		case "FROM":
-			parts = append(parts, fmt.Sprintf("FROM %s", quoteIdent(table)))
+			parts = append(parts, fmt.Sprintf("FROM %s", d.quoteIdent(table)))
 		case "WHERE", "LIKE":
 			// "WHERE" and "LIKE" are aliases for the same clause; guard against
 			// emitting it (and its args) twice when both are requested, which
@@ -458,6 +454,54 @@ func buildByConditions(f Figo, table string, conditionType ...string) (string, [
 	return fullSQL, args
 }
 
+// buildFullSelect assembles the complete SELECT in ?-form (numbering, when the
+// dialect requires it, happens at the adapter/helper boundary). Explicit
+// columns are used only when the instance has no select fields.
+func buildFullSelect(d *SQLDialect, f figo.Figo, table string, columns ...string) (string, []any) {
+	cols := columnsOnly(f, d)
+	if cols == "*" && len(columns) > 0 {
+		quoted := make([]string, 0, len(columns))
+		for _, c := range columns {
+			quoted = append(quoted, d.quoteIdent(c))
+		}
+		cols = strings.Join(quoted, ", ")
+	}
+
+	joinSQL, joinArgs := buildJoins(d, f)
+	where, whereArgs := buildWhereFromExprs(d, f.GetClauses())
+	orderBy := buildOrderBy(d, f)
+	limitOffset := buildLimitOffset(d, f)
+
+	query := fmt.Sprintf("SELECT %s FROM %s", cols, d.quoteIdent(table))
+	if joinSQL != "" {
+		query += " " + joinSQL
+	}
+	if where != "" {
+		query += " WHERE " + where
+	}
+	if orderBy != "" {
+		query += " " + orderBy
+	}
+	if limitOffset != "" {
+		query += " " + limitOffset
+	}
+	args := append([]any{}, joinArgs...)
+	args = append(args, whereArgs...)
+	return query, args
+}
+
+// columnsOnly renders the SELECT column list from the instance's selects.
+func columnsOnly(f figo.Figo, d *SQLDialect) string {
+	if sel := f.GetSelectFields(); len(sel) > 0 {
+		quoted := make([]string, 0, len(sel))
+		for _, name := range sortedKeys(sel) {
+			quoted = append(quoted, d.quoteIdent(normalizeColumnName(f, name)))
+		}
+		return strings.Join(quoted, ", ")
+	}
+	return "*"
+}
+
 func normalizeConditionType(s string) string {
 	up := strings.ToUpper(strings.TrimSpace(s))
 	switch up {
@@ -475,7 +519,7 @@ func normalizeConditionType(s string) string {
 // buildJoins constructs INNER JOIN clauses for all preloads with ON conditions
 // derived from each preload's expression. Since schema metadata is unavailable,
 // the ON clause uses the preload's filters only (equivalent to ON 1=1 AND (...)).
-func buildJoins(f Figo) (string, []any) {
+func buildJoins(d *SQLDialect, f figo.Figo) (string, []any) {
 	pre := f.GetPreloads()
 	if len(pre) == 0 {
 		return "", nil
@@ -489,18 +533,18 @@ func buildJoins(f Figo) (string, []any) {
 	parts := make([]string, 0, len(pre))
 	args := make([]any, 0)
 	for _, table := range tables {
-		onSQL, onArgs := buildWhereFromExprsQualified(pre[table], table)
+		onSQL, onArgs := buildWhereFromExprsQualified(d, pre[table], table)
 		if onSQL == "" {
-			parts = append(parts, fmt.Sprintf("JOIN %s ON 1=1", quoteIdent(table)))
+			parts = append(parts, fmt.Sprintf("JOIN %s ON 1=1", d.quoteIdent(table)))
 			continue
 		}
-		parts = append(parts, fmt.Sprintf("JOIN %s ON %s", quoteIdent(table), onSQL))
+		parts = append(parts, fmt.Sprintf("JOIN %s ON %s", d.quoteIdent(table), onSQL))
 		args = append(args, onArgs...)
 	}
 	return strings.Join(parts, " "), args
 }
 
-func buildWhereFromExprsQualified(exprs []Expr, qualifier string) (string, []any) {
+func buildWhereFromExprsQualified(d *SQLDialect, exprs []figo.Expr, qualifier string) (string, []any) {
 	if len(exprs) == 0 {
 		return "", nil
 	}
@@ -510,7 +554,7 @@ func buildWhereFromExprsQualified(exprs []Expr, qualifier string) (string, []any
 		if e == nil {
 			continue
 		}
-		p, a := exprToSQLQualified(e, qualifier)
+		p, a := exprToSQLQualified(d, e, qualifier)
 		if p != "" {
 			parts = append(parts, p)
 			args = append(args, a...)
@@ -521,7 +565,7 @@ func buildWhereFromExprsQualified(exprs []Expr, qualifier string) (string, []any
 
 // expandPlaceholders replaces '?' with SQL literals derived from args in order.
 // This is intended for debugging/logging, similar to GORM's DryRun Explain.
-func expandPlaceholders(sql string, args []any) string {
+func expandPlaceholders(d *SQLDialect, sql string, args []any) string {
 	if len(args) == 0 {
 		return sql
 	}
@@ -554,7 +598,7 @@ func expandPlaceholders(sql string, args []any) string {
 			continue
 		}
 		if ch == '?' && !inSingle && !inDouble && !inBacktick && idx < len(args) {
-			b.WriteString(toSQLLiteral(args[idx]))
+			b.WriteString(toSQLLiteral(d, args[idx]))
 			idx++
 			continue
 		}
@@ -563,7 +607,7 @@ func expandPlaceholders(sql string, args []any) string {
 	return b.String()
 }
 
-func toSQLLiteral(v any) string {
+func toSQLLiteral(d *SQLDialect, v any) string {
 	switch x := v.(type) {
 	case nil:
 		return "NULL"
@@ -582,43 +626,15 @@ func toSQLLiteral(v any) string {
 		// Render as a SQL datetime literal, not Go's "... +0000 UTC" String().
 		return "'" + x.Format("2006-01-02 15:04:05") + "'"
 	case string:
-		return "'" + escapeSQLString(x) + "'"
+		return "'" + d.escapeString(x) + "'"
 	default:
 		// Fallback: quote stringified value
-		return "'" + escapeSQLString(fmt.Sprintf("%v", x)) + "'"
+		return "'" + d.escapeString(fmt.Sprintf("%v", x)) + "'"
 	}
 }
 
-// escapeSQLString escapes a value for embedding in a single-quoted SQL string
-// literal. NOTE: this interpolated path (GetSqlString) is inherently riskier
-// than parametrized queries — prefer GetQuery. We double single quotes per ANSI
-// SQL and also escape backslashes because MySQL's default mode treats '\' as an
-// escape character (a trailing '\' could otherwise escape the closing quote).
-func escapeSQLString(s string) string {
-	s = strings.ReplaceAll(s, "\\", "\\\\")
-	s = strings.ReplaceAll(s, "'", "''")
-	return s
-}
-
-func normalizeColumnName(f Figo, name string) string {
-	// A custom naming func overrides the strategy, exactly as it does at
-	// parse time — re-normalizing with the strategy here would undo the
-	// custom func's output (e.g. re-snake_casing a deliberately preserved
-	// camelCase name).
-	if fn := f.GetNamingFunc(); fn != nil {
-		return fn(name)
-	}
-	switch f.GetNamingStrategy() {
-	case NAMING_STRATEGY_SNAKE_CASE:
-		result := stringy.New(name).SnakeCase("?", "").ToLower()
-		// If stringy returns empty string, fallback to original name
-		if result == "" {
-			return name
-		}
-		return result
-	case NAMING_STRATEGY_NO_CHANGE:
-		fallthrough
-	default:
-		return name
-	}
+func normalizeColumnName(f figo.Figo, name string) string {
+	// Apply the instance's naming func — the same conversion the parser runs,
+	// so a deliberately preserved camelCase name is not re-snake_cased here.
+	return f.GetNamingFunc()(name) // never nil: SnakeCaseNaming is the default
 }

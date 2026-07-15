@@ -1,12 +1,7 @@
 package figo
 
 import (
-	"context"
-	"crypto/md5"
 	"fmt"
-	"regexp"
-	"runtime"
-	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -40,16 +35,26 @@ func SetRegexSQLOperator(op string) {
 // GetRegexSQLOperator returns the configured SQL regex operator
 func GetRegexSQLOperator() string { return regexSQLOperator.Load().(string) }
 
-type NamingStrategy string
-
-const NAMING_STRATEGY_NO_CHANGE = "no_change"
-const NAMING_STRATEGY_SNAKE_CASE = "snake_case"
-
 // NamingFunc transforms a DSL field name into the column/field name used by the
 // target store. Register one with SetNamingFunc to supply custom naming logic
-// (e.g. camelCase, a fixed prefix, or a lookup table) instead of the built-in
-// NAMING_STRATEGY_* strategies.
+// (e.g. camelCase, a fixed prefix, or a lookup table), or use one of the
+// built-ins: SnakeCaseNaming (the default) or NoChangeNaming.
 type NamingFunc func(field string) string
+
+// SnakeCaseNaming is the default NamingFunc: userName -> user_name.
+var SnakeCaseNaming NamingFunc = func(field string) string {
+	// Use stringy to convert to snake_case, but handle edge cases: if stringy
+	// returns an empty string, fall back to the original name rather than
+	// silently dropping the column.
+	result := stringy.New(field).SnakeCase("?", "").ToLower()
+	if result == "" {
+		return field
+	}
+	return result
+}
+
+// NoChangeNaming leaves field names exactly as written in the DSL.
+var NoChangeNaming NamingFunc = func(field string) string { return field }
 
 type Operation string
 
@@ -86,153 +91,6 @@ type Page struct {
 	Take int
 }
 
-// QueryLimits defines limits for query complexity
-type QueryLimits struct {
-	MaxNestingDepth    int
-	MaxFieldCount      int
-	MaxParameterCount  int
-	MaxExpressionCount int
-}
-
-// CacheConfig defines caching configuration
-type CacheConfig struct {
-	Enabled         bool
-	TTL             time.Duration
-	MaxSize         int
-	CleanupInterval time.Duration
-}
-
-// CacheEntry represents a cached query result
-type CacheEntry struct {
-	Data           interface{}
-	ExpiresAt      time.Time
-	CreatedAt      time.Time
-	LastAccessedAt time.Time // updated on each Get; drives LRU eviction
-	HitCount       int64
-}
-
-// QueryCache interface for different cache implementations
-type QueryCache interface {
-	Get(key string) (interface{}, bool)
-	Set(key string, value interface{}, ttl time.Duration)
-	Delete(key string)
-	Clear()
-	Stats() CacheStats
-}
-
-// CacheStats provides cache performance metrics
-type CacheStats struct {
-	Hits        int64
-	Misses      int64
-	Size        int
-	HitRate     float64
-	MemoryUsage int64
-}
-
-// BatchOperation represents a single operation in a batch
-type BatchOperation struct {
-	ID      string
-	Query   Figo
-	Context any
-	Type    string
-}
-
-// BatchResult represents the result of a batch operation
-type BatchResult struct {
-	ID      string
-	Result  interface{}
-	Error   error
-	Success bool
-}
-
-// BatchProcessor handles batch operations
-type BatchProcessor interface {
-	Process(operations []BatchOperation) []BatchResult
-	ProcessAsync(operations []BatchOperation) <-chan BatchResult
-}
-
-// InMemoryBatchProcessor implements BatchProcessor using in-memory processing
-type InMemoryBatchProcessor struct {
-	maxConcurrency int
-	timeout        time.Duration
-}
-
-// Metrics represents performance metrics
-type Metrics struct {
-	QueryCount     int64
-	CacheHits      int64
-	CacheMisses    int64
-	AverageLatency time.Duration
-	TotalLatency   time.Duration
-	ErrorCount     int64
-	LastQueryTime  time.Time
-}
-
-// PerformanceMonitor tracks query performance
-type PerformanceMonitor struct {
-	metrics *Metrics
-	enabled bool
-	mu      sync.RWMutex
-}
-
-// NewPerformanceMonitor creates a new performance monitor
-func NewPerformanceMonitor(enabled bool) *PerformanceMonitor {
-	return &PerformanceMonitor{
-		metrics: &Metrics{},
-		enabled: enabled,
-	}
-}
-
-// RecordQuery records a query execution
-func (pm *PerformanceMonitor) RecordQuery(latency time.Duration, cacheHit bool, err error) {
-	if !pm.enabled {
-		return
-	}
-
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
-	pm.metrics.QueryCount++
-	pm.metrics.TotalLatency += latency
-	pm.metrics.AverageLatency = time.Duration(int64(pm.metrics.TotalLatency) / pm.metrics.QueryCount)
-	pm.metrics.LastQueryTime = time.Now()
-
-	if cacheHit {
-		pm.metrics.CacheHits++
-	} else {
-		pm.metrics.CacheMisses++
-	}
-
-	if err != nil {
-		pm.metrics.ErrorCount++
-	}
-}
-
-// GetMetrics returns current metrics
-func (pm *PerformanceMonitor) GetMetrics() Metrics {
-	pm.mu.RLock()
-	defer pm.mu.RUnlock()
-
-	// Create a copy to avoid returning a value that contains a lock
-	return Metrics{
-		QueryCount:     pm.metrics.QueryCount,
-		CacheHits:      pm.metrics.CacheHits,
-		CacheMisses:    pm.metrics.CacheMisses,
-		AverageLatency: pm.metrics.AverageLatency,
-		TotalLatency:   pm.metrics.TotalLatency,
-		ErrorCount:     pm.metrics.ErrorCount,
-		LastQueryTime:  pm.metrics.LastQueryTime,
-	}
-}
-
-// Reset resets all metrics
-func (pm *PerformanceMonitor) Reset() {
-	pm.mu.Lock()
-	defer pm.mu.Unlock()
-
-	pm.metrics = &Metrics{}
-}
-
 // Plugin System
 
 // Plugin interface for extending Figo functionality
@@ -244,6 +102,30 @@ type Plugin interface {
 	AfterQuery(f Figo, ctx any, result interface{}) error
 	BeforeParse(f Figo, dsl string) (string, error)
 	AfterParse(f Figo, dsl string) error
+}
+
+// ExprFilter is an optional interface a Plugin may implement to transform or
+// prune expressions as they enter the clause tree. Build applies it to the
+// parsed expression (and every preload expression); AddFilter applies it to
+// the programmatic expression. Return nil to drop the expression entirely.
+//
+// FilterExpr runs outside the instance's lock, so it may safely call back
+// into the Figo's read methods (GetNamingFunc, GetClauses, ...).
+type ExprFilter interface {
+	FilterExpr(f Figo, e Expr) Expr
+}
+
+// ClauseFinalizer is an optional interface a Plugin may implement to
+// transform the finished top-level clause list at the end of every Build —
+// including a Build whose DSL produced no filters at all (the list may be
+// empty), which is what lets a plugin GUARANTEE a clause is present (e.g.
+// ScopePlugin's mandatory tenant filter). The returned slice replaces the
+// instance's clauses.
+//
+// FinalizeClauses runs once per Build, after all ExprFilters, outside the
+// instance's lock (calling back into read methods is safe).
+type ClauseFinalizer interface {
+	FinalizeClauses(f Figo, clauses []Expr) []Expr
 }
 
 // PluginManager manages plugins
@@ -362,299 +244,30 @@ func (pm *PluginManager) ExecuteAfterParse(f Figo, dsl string) error {
 	return nil
 }
 
-// NewInMemoryBatchProcessor creates a new batch processor
-func NewInMemoryBatchProcessor(maxConcurrency int, timeout time.Duration) *InMemoryBatchProcessor {
-	// A non-positive concurrency would make the semaphore channel either
-	// unbuffered (deadlock) or panic on make(chan, negative); clamp to >= 1.
-	if maxConcurrency < 1 {
-		maxConcurrency = 1
-	}
-	return &InMemoryBatchProcessor{
-		maxConcurrency: maxConcurrency,
-		timeout:        timeout,
-	}
-}
-
-// Process executes batch operations synchronously
-func (bp *InMemoryBatchProcessor) Process(operations []BatchOperation) []BatchResult {
-	results := make([]BatchResult, len(operations))
-
-	// Use a semaphore to limit concurrency
-	semaphore := make(chan struct{}, bp.maxConcurrency)
-	var wg sync.WaitGroup
-
-	for i, op := range operations {
-		wg.Add(1)
-		go func(index int, operation BatchOperation) {
-			defer wg.Done()
-
-			// Acquire semaphore. Release is handed to executeOperation: on a
-			// timeout the result comes back early, but the slot stays held
-			// until the operation actually finishes — otherwise a stampede of
-			// timed-out operations would exceed maxConcurrency exactly when
-			// the backend is slow.
-			semaphore <- struct{}{}
-			results[index] = bp.executeOperation(operation, func() { <-semaphore })
-		}(i, op)
-	}
-
-	wg.Wait()
-	return results
-}
-
-// ProcessAsync executes batch operations asynchronously
-func (bp *InMemoryBatchProcessor) ProcessAsync(operations []BatchOperation) <-chan BatchResult {
-	resultChan := make(chan BatchResult, len(operations))
-
-	go func() {
-		defer close(resultChan)
-
-		// Use a semaphore to limit concurrency
-		semaphore := make(chan struct{}, bp.maxConcurrency)
-		var wg sync.WaitGroup
-
-		for _, op := range operations {
-			wg.Add(1)
-			go func(operation BatchOperation) {
-				defer wg.Done()
-
-				// Acquire semaphore; released when the work truly finishes
-				// (see Process).
-				semaphore <- struct{}{}
-				resultChan <- bp.executeOperation(operation, func() { <-semaphore })
-			}(op)
+// ExecuteExprFilters runs every registered plugin that implements ExprFilter
+// over the expression. A filter returning nil drops the expression and
+// short-circuits the remaining filters.
+func (pm *PluginManager) ExecuteExprFilters(f Figo, e Expr) Expr {
+	for _, plugin := range pm.ListPlugins() {
+		if e == nil {
+			return nil
 		}
-
-		wg.Wait()
-	}()
-
-	return resultChan
-}
-
-// executeOperation executes a single operation. release frees the caller's
-// concurrency slot and is invoked only when the underlying work has actually
-// completed — a timed-out operation keeps its slot until it finishes, so the
-// concurrency cap holds even under timeouts.
-func (bp *InMemoryBatchProcessor) executeOperation(operation BatchOperation, release func()) BatchResult {
-	// run performs the actual (synchronous, non-cancellable) work.
-	run := func() BatchResult {
-		r := BatchResult{ID: operation.ID}
-		switch operation.Type {
-		case "sql":
-			r.Result = operation.Query.GetSqlString(operation.Context)
-			r.Success = true
-		case "query":
-			r.Result = operation.Query.GetQuery(operation.Context)
-			r.Success = true
-		case "cached_sql":
-			r.Result = operation.Query.GetCachedSqlString(operation.Context)
-			r.Success = true
-		case "cached_query":
-			r.Result = operation.Query.GetCachedQuery(operation.Context)
-			r.Success = true
-		default:
-			r.Error = fmt.Errorf("unknown operation type: %s", operation.Type)
-		}
-		return r
-	}
-
-	// A non-positive timeout means "no timeout". (The old code applied the timeout
-	// AFTER running the work and flipped a completed result to failed when the
-	// deadline had already passed — so timeout==0 failed every operation.)
-	if bp.timeout <= 0 {
-		defer release()
-		return run()
-	}
-
-	ctx, cancel := context.WithTimeout(context.Background(), bp.timeout)
-	defer cancel()
-
-	done := make(chan BatchResult, 1) // buffered so the goroutine can't leak-block
-	go func() {
-		done <- run()
-		release()
-	}()
-
-	select {
-	case r := <-done:
-		return r
-	case <-ctx.Done():
-		return BatchResult{ID: operation.ID, Success: false, Error: ctx.Err()}
-	}
-}
-
-// InMemoryCache implements QueryCache using in-memory storage
-type InMemoryCache struct {
-	mu       sync.RWMutex
-	entries  map[string]*CacheEntry
-	config   CacheConfig
-	hits     int64
-	misses   int64
-	stopChan chan struct{}
-	stopOnce sync.Once // guards stopChan against double-close
-}
-
-// NewInMemoryCache creates a new in-memory cache instance
-func NewInMemoryCache(config CacheConfig) *InMemoryCache {
-	cache := &InMemoryCache{
-		entries:  make(map[string]*CacheEntry),
-		config:   config,
-		stopChan: make(chan struct{}),
-	}
-
-	if config.Enabled && config.CleanupInterval > 0 {
-		go cache.cleanup()
-	}
-
-	return cache
-}
-
-// Close properly stops the cache and cleans up resources
-func (c *InMemoryCache) Close() {
-	c.Stop()
-}
-
-// Get retrieves a value from the cache. It takes a full write lock because it
-// mutates hit/miss counters, HitCount, and LastAccessedAt — doing this under a
-// read lock (as before) is a data race across concurrent Get callers.
-func (c *InMemoryCache) Get(key string) (interface{}, bool) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	entry, exists := c.entries[key]
-	if !exists {
-		c.misses++
-		return nil, false
-	}
-
-	// Check if expired. Delete it here so expired entries don't linger (and
-	// inflate Size) when no periodic cleanup runs — e.g. CleanupInterval <= 0.
-	if time.Now().After(entry.ExpiresAt) {
-		delete(c.entries, key)
-		c.misses++
-		return nil, false
-	}
-
-	entry.HitCount++
-	entry.LastAccessedAt = time.Now()
-	c.hits++
-	return entry.Data, true
-}
-
-// Set stores a value in the cache
-func (c *InMemoryCache) Set(key string, value interface{}, ttl time.Duration) {
-	if !c.config.Enabled {
-		return
-	}
-
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	// Check size limit. MaxSize <= 0 means unlimited; without this guard a
-	// zero MaxSize would evict on every Set, pinning the cache to one entry.
-	// Overwriting an existing key doesn't grow the map, so it must never
-	// evict an unrelated entry.
-	if _, exists := c.entries[key]; !exists && c.config.MaxSize > 0 && len(c.entries) >= c.config.MaxSize {
-		c.evictLRU()
-	}
-
-	now := time.Now()
-	c.entries[key] = &CacheEntry{
-		Data:           value,
-		ExpiresAt:      now.Add(ttl),
-		CreatedAt:      now,
-		LastAccessedAt: now,
-		HitCount:       0,
-	}
-}
-
-// Delete removes a value from the cache
-func (c *InMemoryCache) Delete(key string) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	delete(c.entries, key)
-}
-
-// Clear removes all entries from the cache
-func (c *InMemoryCache) Clear() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.entries = make(map[string]*CacheEntry)
-}
-
-// Stats returns cache performance statistics
-func (c *InMemoryCache) Stats() CacheStats {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-
-	total := c.hits + c.misses
-	hitRate := float64(0)
-	if total > 0 {
-		hitRate = float64(c.hits) / float64(total)
-	}
-
-	return CacheStats{
-		Hits:        c.hits,
-		Misses:      c.misses,
-		Size:        len(c.entries),
-		HitRate:     hitRate,
-		MemoryUsage: int64(len(c.entries) * 100), // Rough estimate
-	}
-}
-
-// evictLRU removes the least recently used entry (by last access time, not
-// creation time — otherwise a hot early entry would be evicted before a cold
-// later one, i.e. FIFO rather than LRU).
-func (c *InMemoryCache) evictLRU() {
-	var oldestKey string
-	var oldestTime time.Time
-
-	for key, entry := range c.entries {
-		if oldestKey == "" || entry.LastAccessedAt.Before(oldestTime) {
-			oldestKey = key
-			oldestTime = entry.LastAccessedAt
+		if filter, ok := plugin.(ExprFilter); ok {
+			e = filter.FilterExpr(f, e)
 		}
 	}
-
-	if oldestKey != "" {
-		delete(c.entries, oldestKey)
-	}
+	return e
 }
 
-// cleanup removes expired entries periodically
-func (c *InMemoryCache) cleanup() {
-	ticker := time.NewTicker(c.config.CleanupInterval)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ticker.C:
-			c.cleanupExpired()
-		case <-c.stopChan:
-			return
+// ExecuteClauseFinalizers runs every registered plugin that implements
+// ClauseFinalizer over the top-level clause list.
+func (pm *PluginManager) ExecuteClauseFinalizers(f Figo, clauses []Expr) []Expr {
+	for _, plugin := range pm.ListPlugins() {
+		if fin, ok := plugin.(ClauseFinalizer); ok {
+			clauses = fin.FinalizeClauses(f, clauses)
 		}
 	}
-}
-
-// cleanupExpired removes expired entries
-func (c *InMemoryCache) cleanupExpired() {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-
-	now := time.Now()
-	for key, entry := range c.entries {
-		if now.After(entry.ExpiresAt) {
-			delete(c.entries, key)
-		}
-	}
-}
-
-// Stop stops the cleanup goroutine. Safe to call multiple times (and alongside
-// Close, which delegates here) — the underlying channel is closed at most once.
-func (c *InMemoryCache) Stop() {
-	c.stopOnce.Do(func() {
-		close(c.stopChan)
-	})
+	return clauses
 }
 
 // ParseError represents a DSL parsing error with context
@@ -733,7 +346,10 @@ type OrderBy struct{ Columns []OrderByColumn }
 
 // Query is a marker interface for adapter-agnostic rendered queries
 // Concrete types are provided per adapter (e.g., SQLQuery, MongoFindQuery)
-type Query interface{ isQuery() }
+// Query is the marker interface for adapter-agnostic rendered queries.
+// IsQuery is exported so adapter packages (including third-party ones) can
+// implement their own typed results.
+type Query interface{ IsQuery() }
 
 // SQLQuery represents a parametrized SQL statement
 type SQLQuery struct {
@@ -741,7 +357,7 @@ type SQLQuery struct {
 	Args []any
 }
 
-func (SQLQuery) isQuery() {}
+func (SQLQuery) IsQuery() {}
 
 func (EqExpr) isExpr()    {}
 func (GteExpr) isExpr()   {}
@@ -834,117 +450,6 @@ type CustomExpr struct {
 	Handler  func(field, operator string, value any) (string, []any, error)
 }
 
-// Validation System
-
-// ValidationRule represents a validation rule
-type ValidationRule struct {
-	Field   string
-	Rule    string
-	Value   any
-	Message string
-	Handler func(field, rule string, value any) error
-}
-
-// Validator interface for custom validation
-type Validator interface {
-	Validate(field, rule string, value any) error
-	GetRuleName() string
-}
-
-// ValidationManager manages validation rules
-type ValidationManager struct {
-	rules      []ValidationRule
-	validators map[string]Validator
-	mu         sync.RWMutex
-}
-
-// NewValidationManager creates a new validation manager
-func NewValidationManager() *ValidationManager {
-	return &ValidationManager{
-		rules:      make([]ValidationRule, 0),
-		validators: make(map[string]Validator),
-	}
-}
-
-// AddRule adds a validation rule
-func (vm *ValidationManager) AddRule(rule ValidationRule) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-	vm.rules = append(vm.rules, rule)
-}
-
-// RegisterValidator registers a custom validator
-func (vm *ValidationManager) RegisterValidator(validator Validator) {
-	vm.mu.Lock()
-	defer vm.mu.Unlock()
-	vm.validators[validator.GetRuleName()] = validator
-}
-
-// Validate validates a field value against all applicable rules
-func (vm *ValidationManager) Validate(field string, value any) error {
-	// Snapshot rules and validators under the lock, then run the user's
-	// handlers WITHOUT it — a handler calling AddRule/RegisterValidator
-	// must not deadlock.
-	vm.mu.RLock()
-	rules := make([]ValidationRule, len(vm.rules))
-	copy(rules, vm.rules)
-	validators := make(map[string]Validator, len(vm.validators))
-	for k, v := range vm.validators {
-		validators[k] = v
-	}
-	vm.mu.RUnlock()
-
-	for _, rule := range rules {
-		if rule.Field == field || rule.Field == "*" {
-			if rule.Handler != nil {
-				if err := rule.Handler(field, rule.Rule, value); err != nil {
-					return fmt.Errorf("validation failed for field %s: %s", field, rule.Message)
-				}
-			} else if validator, exists := validators[rule.Rule]; exists {
-				if err := validator.Validate(field, rule.Rule, value); err != nil {
-					return fmt.Errorf("validation failed for field %s: %s", field, rule.Message)
-				}
-			}
-		}
-	}
-	return nil
-}
-
-// Built-in validators
-type RequiredValidator struct{}
-
-func (v RequiredValidator) Validate(field, rule string, value any) error {
-	if value == nil || value == "" {
-		return fmt.Errorf("field %s is required", field)
-	}
-	return nil
-}
-func (v RequiredValidator) GetRuleName() string { return "required" }
-
-type MinLengthValidator struct{}
-
-func (v MinLengthValidator) Validate(field, rule string, value any) error {
-	if str, ok := value.(string); ok {
-		if len(str) < 3 { // Example minimum length
-			return fmt.Errorf("field %s must be at least 3 characters", field)
-		}
-	}
-	return nil
-}
-func (v MinLengthValidator) GetRuleName() string { return "min_length" }
-
-type EmailValidator struct{}
-
-func (v EmailValidator) Validate(field, rule string, value any) error {
-	if str, ok := value.(string); ok {
-		if !strings.Contains(str, "@") {
-			return fmt.Errorf("field %s must be a valid email", field)
-		}
-	}
-	return nil
-}
-func (v EmailValidator) GetRuleName() string { return "email" }
-
 // Implement Expr interface for new operators
 func (JsonPathExpr) isExpr()       {}
 func (ArrayContainsExpr) isExpr()  {}
@@ -955,58 +460,26 @@ func (CustomExpr) isExpr()         {}
 
 type Figo interface {
 	AddFiltersFromString(input string) error
-	AddFiltersFromStringWithRepair(input string, useRepair bool) error
 	AddFilter(exp Expr)
-	AddIgnoreFields(fields ...string)
 	AddSelectFields(fields ...string)
-	SetAllowedFields(fields ...string)
-	EnableFieldWhitelist()
-	DisableFieldWhitelist()
-	IsFieldAllowed(field string) bool
-	SetQueryLimits(limits QueryLimits)
-	GetQueryLimits() QueryLimits
-	ParseFieldsValue(str string) any
-	IsFieldWhitelistEnabled() bool
 	GetDSL() string
-	SetCache(cache QueryCache)
-	GetCache() QueryCache
-	SetCacheConfig(config CacheConfig)
-	GetCacheConfig() CacheConfig
-	GetCacheStats() CacheStats
-	ClearCache()
-	SetPerformanceMonitor(monitor *PerformanceMonitor)
-	GetPerformanceMonitor() *PerformanceMonitor
-	GetMetrics() Metrics
-	ResetMetrics()
 	SetPluginManager(manager *PluginManager)
 	GetPluginManager() *PluginManager
 	RegisterPlugin(plugin Plugin) error
 	UnregisterPlugin(name string) error
-	SetValidationManager(manager *ValidationManager)
-	GetValidationManager() *ValidationManager
-	AddValidationRule(rule ValidationRule)
-	RegisterValidator(validator Validator)
-	ValidateField(field string, value any) error
-	SetNamingStrategy(strategy NamingStrategy)
 	SetNamingFunc(fn NamingFunc)
 	GetNamingFunc() NamingFunc
 	SetPage(skip, take int)
 	SetPageString(v string)
 	SetAdapterObject(adapter Adapter)
-	GetNamingStrategy() NamingStrategy
-	GetIgnoreFields() map[string]bool
 	GetSelectFields() map[string]bool
-	GetAllowedFields() map[string]bool
 	GetClauses() []Expr
 	GetPreloads() map[string][]Expr
 	GetPage() Page
 	GetSort() *OrderBy
 	GetAdapterObject() Adapter
 	GetSqlString(ctx any, conditionType ...string) string
-	GetExplainedSqlString(ctx any, conditionType ...string) string
 	GetQuery(ctx any, conditionType ...string) Query
-	GetCachedSqlString(ctx any, conditionType ...string) string
-	GetCachedQuery(ctx any, conditionType ...string) Query
 	Build(adapter Adapter)
 	Explain() string
 	Clone() Figo
@@ -1019,26 +492,16 @@ type Adapter interface {
 }
 
 type figo struct {
-	clauses           []Expr
-	preloads          map[string][]Expr
-	page              Page
-	sort              *OrderBy
-	ignoreFields      map[string]bool
-	selectFields      map[string]bool
-	allowedFields     map[string]bool
-	fieldWhitelist    bool
-	queryLimits       QueryLimits
-	cache             QueryCache
-	ownedCache        *InMemoryCache // cache created by SetCacheConfig, stopped on replacement/GC
-	cacheConfig       CacheConfig
-	monitor           *PerformanceMonitor
-	pluginManager     *PluginManager
-	validationManager *ValidationManager
-	dsl               string
-	namingStrategy    NamingStrategy
-	namingFunc        NamingFunc // when non-nil, overrides namingStrategy
-	adapterObj        Adapter
-	mu                sync.RWMutex // Mutex for concurrent access protection
+	clauses       []Expr
+	preloads      map[string][]Expr
+	page          Page
+	sort          *OrderBy
+	selectFields  map[string]bool
+	pluginManager *PluginManager
+	dsl           string
+	namingFunc    NamingFunc // never nil; SnakeCaseNaming by default
+	adapterObj    Adapter
+	mu            sync.RWMutex // Mutex for concurrent access protection
 }
 
 // New constructs a new instance. Supply the adapter when you build:
@@ -1047,12 +510,7 @@ func New() Figo {
 	return &figo{page: Page{
 		Skip: 0,
 		Take: 20,
-	}, preloads: make(map[string][]Expr), ignoreFields: make(map[string]bool), selectFields: make(map[string]bool), allowedFields: make(map[string]bool), fieldWhitelist: false, queryLimits: QueryLimits{
-		MaxNestingDepth:    10,
-		MaxFieldCount:      50,
-		MaxParameterCount:  100,
-		MaxExpressionCount: 200,
-	}, clauses: make([]Expr, 0), namingStrategy: NAMING_STRATEGY_SNAKE_CASE}
+	}, preloads: make(map[string][]Expr), selectFields: make(map[string]bool), clauses: make([]Expr, 0), namingFunc: SnakeCaseNaming}
 }
 
 func (p *Page) validate() {
@@ -1073,224 +531,6 @@ type Node struct {
 	Parent     *Node
 }
 
-// validateParentheses checks if parentheses are properly matched
-func (f *figo) validateParentheses(expr string) bool {
-	count := 0
-	for _, char := range expr {
-		if char == '(' {
-			count++
-		} else if char == ')' {
-			count--
-			if count < 0 {
-				return false // Unmatched closing parenthesis
-			}
-		}
-	}
-	return count == 0 // All parentheses matched
-}
-
-// validateParenthesesWithPosition checks parentheses with detailed error reporting
-func (f *figo) validateParenthesesWithPosition(expr string) error {
-	count := 0
-	line := 1
-	column := 1
-	var lastOpenPos int
-
-	for i, char := range expr {
-		if char == '\n' {
-			line++
-			column = 1
-		} else {
-			column++
-		}
-
-		if char == '(' {
-			count++
-			lastOpenPos = i
-		} else if char == ')' {
-			count--
-			if count < 0 {
-				return &ParseError{
-					Message:    "unmatched closing parenthesis",
-					Position:   i,
-					Line:       line,
-					Column:     column,
-					Context:    expr,
-					Suggestion: "Remove extra closing parenthesis or add opening parenthesis",
-				}
-			}
-		}
-	}
-
-	if count > 0 {
-		return &ParseError{
-			Message:    "unmatched opening parenthesis",
-			Position:   lastOpenPos,
-			Line:       line,
-			Column:     column,
-			Context:    expr,
-			Suggestion: "Add closing parenthesis to match opening one",
-		}
-	}
-
-	return nil
-}
-
-// validateQuotes checks if quotes are properly matched
-func (f *figo) validateQuotes(expr string) bool {
-	inQuotes := false
-	quoteChar := rune(0)
-
-	for _, char := range expr {
-		if char == '"' || char == '\'' {
-			if !inQuotes {
-				inQuotes = true
-				quoteChar = char
-			} else if char == quoteChar {
-				inQuotes = false
-				quoteChar = 0
-			}
-		}
-	}
-
-	return !inQuotes // All quotes properly closed
-}
-
-// validateQuotesWithPosition checks quotes with detailed error reporting
-func (f *figo) validateQuotesWithPosition(expr string) error {
-	inQuotes := false
-	quoteChar := rune(0)
-	line := 1
-	column := 1
-	var quoteStartPos int
-
-	for i, char := range expr {
-		if char == '\n' {
-			line++
-			column = 1
-		} else {
-			column++
-		}
-
-		if char == '"' || char == '\'' {
-			if !inQuotes {
-				inQuotes = true
-				quoteChar = char
-				quoteStartPos = i
-			} else if char == quoteChar {
-				inQuotes = false
-				quoteChar = 0
-			}
-		}
-	}
-
-	if inQuotes {
-		return &ParseError{
-			Message:    "unmatched quote",
-			Position:   quoteStartPos,
-			Line:       line,
-			Column:     column,
-			Context:    expr,
-			Suggestion: "Add closing quote to match opening one",
-		}
-	}
-
-	return nil
-}
-
-// validateBrackets checks if brackets are properly matched for load expressions
-func (f *figo) validateBrackets(expr string) error {
-	count := 0
-	line := 1
-	column := 1
-	var lastOpenPos int
-
-	for i, char := range expr {
-		if char == '\n' {
-			line++
-			column = 1
-		} else {
-			column++
-		}
-
-		if char == '[' {
-			count++
-			lastOpenPos = i
-		} else if char == ']' {
-			count--
-			if count < 0 {
-				return &ParseError{
-					Message:    "unmatched closing bracket",
-					Position:   i,
-					Line:       line,
-					Column:     column,
-					Context:    expr,
-					Suggestion: "Remove extra closing bracket or add opening bracket",
-				}
-			}
-		}
-	}
-
-	if count > 0 {
-		return &ParseError{
-			Message:    "unmatched opening bracket",
-			Position:   lastOpenPos,
-			Line:       line,
-			Column:     column,
-			Context:    expr,
-			Suggestion: "Add closing bracket to match opening one",
-		}
-	}
-
-	return nil
-}
-
-// validateBasicSyntax checks for common syntax errors
-func (f *figo) validateBasicSyntax(expr string) error {
-	// Check for common malformed patterns
-	patterns := []struct {
-		pattern    string
-		message    string
-		suggestion string
-	}{
-		{`\s+and\s*$`, "incomplete AND expression", "Add field and value after AND"},
-		{`\s+or\s*$`, "incomplete OR expression", "Add field and value after OR"},
-		{`\s+not\s*$`, "incomplete NOT expression", "Add expression after NOT"},
-		{`=\s*$`, "incomplete equality expression", "Add value after ="},
-		{`>\s*$`, "incomplete greater than expression", "Add value after >"},
-		{`<\s*$`, "incomplete less than expression", "Add value after <"},
-		{`!=\s*$`, "incomplete not equal expression", "Add value after !="},
-		{`>=\s*$`, "incomplete greater than or equal expression", "Add value after >="},
-		{`<=\s*$`, "incomplete less than or equal expression", "Add value after <="},
-		{`=^\s*$`, "incomplete LIKE expression", "Add value after =^"},
-		{`!=^\s*$`, "incomplete NOT LIKE expression", "Add value after !=^"},
-		{`=~\s*$`, "incomplete regex expression", "Add value after =~"},
-		{`!=~\s*$`, "incomplete NOT regex expression", "Add value after !=~"},
-		{`<in>\s*$`, "incomplete IN expression", "Add value list after <in>"},
-		{`<nin>\s*$`, "incomplete NOT IN expression", "Add value list after <nin>"},
-		{`<bet>\s*$`, "incomplete BETWEEN expression", "Add value range after <bet>"},
-		{`^\s*and\b`, "expression starts with AND", "Remove AND or add field before it"},
-		{`^\s*or\b`, "expression starts with OR", "Remove OR or add field before it"},
-		// A leading NOT is valid syntax ("not deleted=true") and must not be
-		// flagged or "repaired" away — stripping it would invert the filter.
-	}
-
-	for _, p := range patterns {
-		if matched, _ := regexp.MatchString(p.pattern, expr); matched {
-			return &ParseError{
-				Message:    p.message,
-				Position:   0,
-				Line:       1,
-				Column:     1,
-				Context:    expr,
-				Suggestion: p.suggestion,
-			}
-		}
-	}
-
-	return nil
-}
-
 // isDSLSpace reports whether c separates tokens in the DSL. Tabs and
 // newlines count so multi-line filters parse the same as single-line ones;
 // whitespace inside quoted values never reaches these checks.
@@ -1302,7 +542,7 @@ func isDSLSpace(c byte) bool {
 // be consumed as that operator's value. A fully quoted (or bracketed/
 // parenthesized list) token is always a value — operator characters inside it
 // are literal, so `name = "a=b"` keeps its value instead of silently becoming
-// `name = ''`. An unquoted token containing operator characters or a logical
+// `name = ”`. An unquoted token containing operator characters or a logical
 // keyword is not consumed (it belongs to the next expression).
 func isSafeLookaheadValue(v string) bool {
 	if v == "" {
@@ -1772,30 +1012,26 @@ func (f *figo) parseDSL(expr string) *Node {
 }
 
 func (f *figo) parsFieldsName(str string) string {
-	// A user-supplied naming function takes precedence over the built-in
-	// strategies, letting callers plug in arbitrary field-name logic.
-	if f.namingFunc != nil {
-		return f.namingFunc(str)
-	}
-	switch f.namingStrategy {
-	case NAMING_STRATEGY_NO_CHANGE:
-		return str
-	case NAMING_STRATEGY_SNAKE_CASE:
-		// Use stringy to convert to snake_case, but handle edge cases
-		result := stringy.New(str).SnakeCase("?", "").ToLower()
-		// If stringy returns empty string, fallback to original string
-		if result == "" {
-			return str
-		}
-		return result
-	default:
-		// Unknown strategy: leave the field name unchanged rather than blanking
-		// it out (the old behavior returned "" and silently dropped columns).
-		return str
-	}
+	return convertFieldName(f.namingFunc, str)
 }
 
-func (f *figo) parsFieldsValue(str string) any {
+// convertFieldName applies a naming func to a field name (nil-safe: a nil
+// func leaves the name unchanged). Shared by the parser (via parsFieldsName)
+// and plugins that need to match field names in their converted form
+// (e.g. FieldsPlugin's ignore matching).
+func convertFieldName(fn NamingFunc, str string) string {
+	if fn != nil {
+		return fn(str)
+	}
+	return str
+}
+
+// ParseValue types a single DSL literal exactly the way the parser types
+// filter values: quoted literals stay strings verbatim; unquoted literals get
+// bool/null/int64/float64/date detection. Use it to coerce a value outside
+// the DSL (e.g. one incoming parameter) the way figo would — a=1 and a="1"
+// render different SQL, so matching the DSL's typing matters.
+func ParseValue(str string) any {
 	return parseScalarLiteral(str)
 }
 
@@ -2137,46 +1373,6 @@ func expressionParser(node *Node) {
 	}
 }
 
-// buildExpressionTree builds a simple expression tree
-func buildExpressionTree(children []*Node) Expr {
-	if len(children) == 0 {
-		return nil
-	}
-
-	// If we have only one child, return its expression
-	if len(children) == 1 {
-		child := children[0]
-		if len(child.Expression) > 0 {
-			return child.Expression[len(child.Expression)-1]
-		}
-		return nil
-	}
-
-	// For multiple children, we need to build a proper logical expression tree
-	// The expressionParser should have already built the logical expressions
-	// We just need to find the final expression that represents the entire tree
-
-	// Look for the most recent logical expression that combines all operands
-	for i := len(children) - 1; i >= 0; i-- {
-		child := children[i]
-
-		// Skip child nodes (parentheses groups) as they should be processed separately
-		if child.Operator == OperationChild {
-			continue
-		}
-
-		// Look for logical operators that have expressions
-		if (child.Operator == OperationAnd || child.Operator == OperationOr || child.Operator == OperationNot) &&
-			len(child.Expression) > 0 {
-			// Return the most recent expression from this logical operator
-			return child.Expression[len(child.Expression)-1]
-		}
-	}
-
-	// If no logical expressions found, return nil
-	return nil
-}
-
 // buildExpressionTreeWithPrecedence builds a proper expression tree respecting operator precedence
 func buildExpressionTreeWithPrecedence(children []*Node) Expr {
 	if len(children) == 0 {
@@ -2363,173 +1559,6 @@ func getFinalExpr(node Node) Expr {
 	return nil
 }
 
-// validateInput validates the input DSL string with enhanced error reporting
-func (f *figo) validateInput(input string) error {
-	// Validate parentheses with position tracking
-	if err := f.validateParenthesesWithPosition(input); err != nil {
-		return err
-	}
-
-	// Validate quotes with position tracking
-	if err := f.validateQuotesWithPosition(input); err != nil {
-		return err
-	}
-
-	// Validate brackets for load expressions
-	if err := f.validateBrackets(input); err != nil {
-		return err
-	}
-
-	// Validate basic syntax patterns
-	if err := f.validateBasicSyntax(input); err != nil {
-		return err
-	}
-
-	return nil
-}
-
-// attemptInputRepair tries to fix common malformed input patterns
-func (f *figo) attemptInputRepair(input string) (string, error) {
-	original := input
-	fixed := input
-
-	// Fix common patterns - be more conservative
-	repairs := []struct {
-		pattern     *regexp.Regexp
-		replacement string
-		description string
-	}{
-		{regexp.MustCompile(`\s+and\s*$`), "", "Remove trailing AND"},
-		{regexp.MustCompile(`\s+or\s*$`), "", "Remove trailing OR"},
-		{regexp.MustCompile(`\s+not\s*$`), "", "Remove trailing NOT"},
-		{regexp.MustCompile(`^\s*and\b`), "", "Remove leading AND"},
-		{regexp.MustCompile(`^\s*or\b`), "", "Remove leading OR"},
-		// A leading NOT is valid and must never be stripped (filter inversion).
-	}
-
-	// Apply repairs
-	for _, repair := range repairs {
-		if repair.pattern.MatchString(fixed) {
-			fixed = repair.pattern.ReplaceAllString(fixed, repair.replacement)
-		}
-	}
-
-	// Try to fix unmatched parentheses
-	if !f.validateParentheses(fixed) {
-		fixed = f.fixUnmatchedParentheses(fixed)
-	}
-
-	// Try to fix unmatched quotes
-	if !f.validateQuotes(fixed) {
-		fixed = f.fixUnmatchedQuotes(fixed)
-	}
-
-	// Try to fix unmatched brackets
-	if err := f.validateBrackets(fixed); err != nil {
-		fixed = f.fixUnmatchedBrackets(fixed)
-	}
-
-	// If no changes were made, return original
-	if fixed == original {
-		return original, fmt.Errorf("no repairs could be applied")
-	}
-
-	// Validate the fixed input
-	if err := f.validateInput(fixed); err != nil {
-		return original, fmt.Errorf("repair failed validation: %w", err)
-	}
-
-	return fixed, nil
-}
-
-// fixUnmatchedParentheses attempts to fix unmatched parentheses
-func (f *figo) fixUnmatchedParentheses(input string) string {
-	count := 0
-	result := strings.Builder{}
-
-	for _, char := range input {
-		if char == '(' {
-			count++
-			result.WriteRune(char)
-		} else if char == ')' {
-			if count > 0 {
-				count--
-				result.WriteRune(char)
-			}
-			// Skip extra closing parentheses
-		} else {
-			result.WriteRune(char)
-		}
-	}
-
-	// Add missing closing parentheses
-	for i := 0; i < count; i++ {
-		result.WriteRune(')')
-	}
-
-	return result.String()
-}
-
-// fixUnmatchedQuotes attempts to fix unmatched quotes
-func (f *figo) fixUnmatchedQuotes(input string) string {
-	inQuotes := false
-	quoteChar := rune(0)
-	result := strings.Builder{}
-
-	for _, char := range input {
-		if char == '"' || char == '\'' {
-			if !inQuotes {
-				inQuotes = true
-				quoteChar = char
-				result.WriteRune(char)
-			} else if char == quoteChar {
-				inQuotes = false
-				quoteChar = 0
-				result.WriteRune(char)
-			} else {
-				result.WriteRune(char)
-			}
-		} else {
-			result.WriteRune(char)
-		}
-	}
-
-	// Add missing closing quote
-	if inQuotes {
-		result.WriteRune(quoteChar)
-	}
-
-	return result.String()
-}
-
-// fixUnmatchedBrackets attempts to fix unmatched brackets
-func (f *figo) fixUnmatchedBrackets(input string) string {
-	count := 0
-	result := strings.Builder{}
-
-	for _, char := range input {
-		if char == '[' {
-			count++
-			result.WriteRune(char)
-		} else if char == ']' {
-			if count > 0 {
-				count--
-				result.WriteRune(char)
-			}
-			// Skip extra closing brackets
-		} else {
-			result.WriteRune(char)
-		}
-	}
-
-	// Add missing closing brackets
-	for i := 0; i < count; i++ {
-		result.WriteRune(']')
-	}
-
-	return result.String()
-}
-
 func (f *figo) AddFiltersFromString(input string) error {
 	// Handle empty input
 	if strings.TrimSpace(input) == "" {
@@ -2567,87 +1596,25 @@ func (f *figo) AddFiltersFromString(input string) error {
 	return nil
 }
 
-// AddFiltersFromStringWithRepair allows controlling whether input repair is used
-func (f *figo) AddFiltersFromStringWithRepair(input string, useRepair bool) error {
-	// Handle empty input
-	if strings.TrimSpace(input) == "" {
-		return nil
-	}
-
-	var fixedInput string
-	var err error
-
-	if useRepair {
-		// Try to fix common malformed input patterns
-		fixedInput, err = f.attemptInputRepair(input)
-		if err != nil {
-			// If repair fails, validate original input
-			if validationErr := f.validateInput(input); validationErr != nil {
-				return validationErr
-			}
-			fixedInput = input
-		}
-	} else {
-		// Validate input without repair
-		if err := f.validateInput(input); err != nil {
-			return err
-		}
-		fixedInput = input
-	}
-
-	// Snapshot the plugin manager under the lock (see AddFiltersFromString).
+// AddFilter appends a programmatic expression. Plugin expression filters
+// (e.g. FieldsPlugin's ignore/whitelist pruning) apply here exactly as they
+// do to DSL input — register them BEFORE adding filters.
+func (f *figo) AddFilter(exp Expr) {
 	f.mu.RLock()
 	pm := f.pluginManager
 	f.mu.RUnlock()
 
-	// Execute BeforeParse plugin hooks
+	// Filters run outside the lock (see Build).
 	if pm != nil {
-		var err error
-		fixedInput, err = pm.ExecuteBeforeParse(f, fixedInput)
-		if err != nil {
-			return fmt.Errorf("plugin BeforeParse error: %w", err)
-		}
+		exp = pm.ExecuteExprFilters(f, exp)
+	}
+	if exp == nil {
+		return
 	}
 
-	// Update DSL string (replace existing) - protected by mutex
-	f.mu.Lock()
-	f.dsl = fixedInput
-	f.mu.Unlock()
-
-	// Execute AfterParse plugin hooks
-	if pm != nil {
-		err := pm.ExecuteAfterParse(f, fixedInput)
-		if err != nil {
-			return fmt.Errorf("plugin AfterParse error: %w", err)
-		}
-	}
-
-	return nil
-}
-
-// AddFilter appends a programmatic expression. The ignore-field list and the
-// field whitelist (when enabled) apply here exactly as they do to DSL input —
-// configure them BEFORE adding filters.
-func (f *figo) AddFilter(exp Expr) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-
-	exp = f.filterIgnoredFields(exp)
-	if exp != nil && f.fieldWhitelist {
-		exp = f.filterAllowedFields(exp)
-	}
-	if exp != nil {
-		f.clauses = append(f.clauses, exp)
-	}
-}
-
-func (f *figo) AddIgnoreFields(fields ...string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	for _, field := range fields {
-		f.ignoreFields[field] = true
-	}
+	f.clauses = append(f.clauses, exp)
 }
 
 func (f *figo) AddSelectFields(fields ...string) {
@@ -2657,18 +1624,6 @@ func (f *figo) AddSelectFields(fields ...string) {
 	for _, field := range fields {
 		f.selectFields[field] = true
 	}
-}
-
-func (f *figo) GetIgnoreFields() map[string]bool {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	// Return a copy to avoid race conditions
-	result := make(map[string]bool)
-	for k, v := range f.ignoreFields {
-		result[k] = v
-	}
-	return result
 }
 
 func (f *figo) GetClauses() []Expr {
@@ -2757,29 +1712,20 @@ func (f *figo) GetSelectFields() map[string]bool {
 	return result
 }
 
-func (f *figo) SetNamingStrategy(strategy NamingStrategy) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.namingStrategy = strategy
-}
-
-func (f *figo) GetNamingStrategy() NamingStrategy {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.namingStrategy
-}
-
-// SetNamingFunc installs a custom field-name transformer. While set (non-nil),
-// it fully overrides the NAMING_STRATEGY_* strategy for every field name the DSL
-// produces. Pass nil to remove it and fall back to the configured strategy.
-// Configure this before Build()/AddFiltersFromString, like SetNamingStrategy.
+// SetNamingFunc installs the field-name transformer applied to every field
+// name the DSL produces. Use a built-in (SnakeCaseNaming, NoChangeNaming) or
+// any custom func. Passing nil resets to the default (SnakeCaseNaming).
+// Configure this before Build()/AddFiltersFromString.
 func (f *figo) SetNamingFunc(fn NamingFunc) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	if fn == nil {
+		fn = SnakeCaseNaming
+	}
 	f.namingFunc = fn
 }
 
-// GetNamingFunc returns the custom field-name transformer, or nil if none is set.
+// GetNamingFunc returns the active field-name transformer (never nil).
 func (f *figo) GetNamingFunc() NamingFunc {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -2801,130 +1747,63 @@ func (f *figo) GetAdapterObject() Adapter {
 // GetSqlString returns a SQL string based on the selected adapter.
 // For AdapterGorm, ctx should be a *gorm.DB configured with Model(...).
 // For AdapterRaw, ctx can be a table name (string) or RawContext.
+//
+// Registered plugins' BeforeQuery hooks run before the adapter renders (an
+// error vetoes the render and returns ""); AfterQuery hooks run on the
+// rendered SQL (an error vetoes the result the same way). Hooks must not
+// render through this instance themselves — that would recurse.
 func (f *figo) GetSqlString(ctx any, conditionType ...string) string {
-	// Snapshot the adapter under the lock, then call it WITHOUT holding the lock
-	// (the adapter calls back into locked getters like GetClauses).
+	// Snapshot the adapter and plugin manager under the lock, then call them
+	// WITHOUT holding it (the adapter and hooks call back into locked getters
+	// like GetClauses).
 	f.mu.RLock()
 	adapter := f.adapterObj
+	pm := f.pluginManager
 	f.mu.RUnlock()
+
+	if pm != nil {
+		if err := pm.ExecuteBeforeQuery(f, ctx); err != nil {
+			return ""
+		}
+	}
 	if adapter != nil {
 		if sql, ok := adapter.GetSqlString(f, ctx, conditionType...); ok {
+			if pm != nil {
+				if err := pm.ExecuteAfterQuery(f, ctx, sql); err != nil {
+					return ""
+				}
+			}
 			return sql
 		}
 	}
 	return ""
 }
 
-// GetExplainedSqlString delegates to the adapter's GetSqlString. Whether
-// placeholders appear expanded depends on the adapter (RawAdapter and
-// GormAdapter interpolate literals on this path; others render as-is) —
-// this method performs no expansion of its own. For the AST, use Explain.
-func (f *figo) GetExplainedSqlString(ctx any, conditionType ...string) string {
-	f.mu.RLock()
-	adapter := f.adapterObj
-	f.mu.RUnlock()
-	if adapter != nil {
-		if sql, ok := adapter.GetSqlString(f, ctx, conditionType...); ok {
-			return sql
-		}
-	}
-	return ""
-}
-
-// GetQuery delegates to the configured adapter to obtain a typed query object
+// GetQuery delegates to the configured adapter to obtain a typed query object.
+// Plugin BeforeQuery/AfterQuery hooks run around the render exactly as in
+// GetSqlString (an error from either vetoes the result: nil is returned).
 func (f *figo) GetQuery(ctx any, conditionType ...string) Query {
 	f.mu.RLock()
 	adapter := f.adapterObj
+	pm := f.pluginManager
 	f.mu.RUnlock()
+
+	if pm != nil {
+		if err := pm.ExecuteBeforeQuery(f, ctx); err != nil {
+			return nil
+		}
+	}
 	if adapter != nil {
 		if q, ok := adapter.GetQuery(f, ctx, conditionType...); ok {
+			if pm != nil {
+				if err := pm.ExecuteAfterQuery(f, ctx, q); err != nil {
+					return nil
+				}
+			}
 			return q
 		}
 	}
 	return nil
-}
-
-// Field Whitelisting Methods
-
-// SetAllowedFields sets the list of allowed fields for querying
-func (f *figo) SetAllowedFields(fields ...string) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-
-	f.allowedFields = make(map[string]bool)
-	for _, field := range fields {
-		f.allowedFields[field] = true
-	}
-}
-
-// EnableFieldWhitelist enables field whitelist validation
-func (f *figo) EnableFieldWhitelist() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.fieldWhitelist = true
-}
-
-// DisableFieldWhitelist disables field whitelist validation
-func (f *figo) DisableFieldWhitelist() {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.fieldWhitelist = false
-}
-
-// IsFieldAllowed checks if a field is allowed for querying
-func (f *figo) IsFieldAllowed(field string) bool {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	return f.isFieldAllowedUnsafe(field)
-}
-
-// isFieldAllowedUnsafe checks if a field is allowed without acquiring locks
-// This should only be called when the caller already holds the appropriate lock
-func (f *figo) isFieldAllowedUnsafe(field string) bool {
-	if !f.fieldWhitelist {
-		return true // If whitelist is disabled, all fields are allowed
-	}
-	return f.allowedFields[field]
-}
-
-// GetAllowedFields returns the map of allowed fields
-func (f *figo) GetAllowedFields() map[string]bool {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	// Return a copy to avoid race conditions
-	result := make(map[string]bool)
-	for k, v := range f.allowedFields {
-		result[k] = v
-	}
-	return result
-}
-
-// SetQueryLimits sets the query complexity limits
-func (f *figo) SetQueryLimits(limits QueryLimits) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.queryLimits = limits
-}
-
-// GetQueryLimits returns the current query limits
-func (f *figo) GetQueryLimits() QueryLimits {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.queryLimits
-}
-
-// ParseFieldsValue parses a string value with enhanced type support
-func (f *figo) ParseFieldsValue(str string) any {
-	return f.parsFieldsValue(str)
-}
-
-// IsFieldWhitelistEnabled returns whether field whitelist is enabled
-func (f *figo) IsFieldWhitelistEnabled() bool {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.fieldWhitelist
 }
 
 // GetDSL returns the current DSL string
@@ -2939,7 +1818,6 @@ func (f *figo) GetDSL() string {
 // GetSqlString/GetQuery will use, or set it earlier via New / SetAdapterObject.
 func (f *figo) Build(adapter Adapter) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
 
 	// A non-nil adapter selects/replaces the adapter; passing nil rebuilds
 	// against whatever adapter was set previously (via an earlier Build or
@@ -2949,6 +1827,10 @@ func (f *figo) Build(adapter Adapter) {
 	}
 
 	if f.dsl == "" {
+		f.mu.Unlock()
+		// Even with no DSL, clause finalizers must run (a ScopePlugin's
+		// mandatory filter applies to unfiltered queries too).
+		f.finalizeClauses()
 		return
 	}
 
@@ -2965,31 +1847,63 @@ func (f *figo) Build(adapter Adapter) {
 
 	finalExpr := getFinalExpr(*root)
 
-	if finalExpr != nil {
-		finalExpr = f.filterIgnoredFields(finalExpr)
+	// Detach the freshly parsed preloads so plugin filters can run on them
+	// outside the lock (concurrent readers see an empty map until the
+	// filtered results are written back below).
+	preloads := f.preloads
+	f.preloads = make(map[string][]Expr)
+	pm := f.pluginManager
+	f.mu.Unlock()
+
+	// Run plugin expression filters (e.g. FieldsPlugin's ignore/whitelist
+	// pruning) OUTSIDE the lock — a FilterExpr callback may call back into
+	// this instance's read methods, which must not deadlock. Preload
+	// conditions parse through the same DSL, so they are filtered as well.
+	if pm != nil {
+		if finalExpr != nil {
+			finalExpr = pm.ExecuteExprFilters(f, finalExpr)
+		}
+		for table, exprs := range preloads {
+			kept := exprs[:0]
+			for _, e := range exprs {
+				if pruned := pm.ExecuteExprFilters(f, e); pruned != nil {
+					kept = append(kept, pruned)
+				}
+			}
+			if len(kept) == 0 {
+				delete(preloads, table)
+			} else {
+				preloads[table] = kept
+			}
+		}
 	}
-	if finalExpr != nil && f.fieldWhitelist {
-		finalExpr = f.filterAllowedFields(finalExpr)
-	}
+
+	f.mu.Lock()
 	if finalExpr != nil {
 		f.clauses = append(f.clauses, finalExpr)
 	}
+	f.preloads = preloads
+	f.mu.Unlock()
 
-	// Preload conditions parse through the same DSL, so ignored fields must
-	// be pruned from them as well.
-	for table, exprs := range f.preloads {
-		kept := exprs[:0]
-		for _, e := range exprs {
-			if pruned := f.filterIgnoredFields(e); pruned != nil {
-				kept = append(kept, pruned)
-			}
-		}
-		if len(kept) == 0 {
-			delete(f.preloads, table)
-		} else {
-			f.preloads[table] = kept
-		}
+	f.finalizeClauses()
+}
+
+// finalizeClauses runs registered ClauseFinalizer plugins over the top-level
+// clause list and writes the result back. Runs outside the lock (a finalizer
+// may call back into read methods).
+func (f *figo) finalizeClauses() {
+	f.mu.RLock()
+	pm := f.pluginManager
+	f.mu.RUnlock()
+	if pm == nil {
+		return
 	}
+
+	finalized := pm.ExecuteClauseFinalizers(f, f.GetClauses())
+
+	f.mu.Lock()
+	f.clauses = finalized
+	f.mu.Unlock()
 }
 
 // exprField returns the field a leaf expression filters on, or "" for
@@ -3041,6 +1955,27 @@ func exprField(expr Expr) string {
 	}
 }
 
+// PruneExprFields removes every leaf whose field fails keep, rebuilding the
+// logical structure around the survivors. Dropping a leaf drops it from its
+// parent's operand list, so no dangling AND/OR/NOT is left behind. Used by
+// the plugins package (FieldsPlugin) and available for custom ExprFilters.
+func PruneExprFields(expr Expr, keep func(field string) bool) Expr {
+	return pruneExprFields(expr, keep)
+}
+
+// ExprField returns the field a leaf expression filters on, or "" for
+// expressions without one (logical nodes, OrderBy, unknown types). It works
+// on the value-typed nodes returned by GetClauses; for the pointer nodes a
+// Walk visitor receives, use NodeField.
+func ExprField(e Expr) string {
+	return exprField(e)
+}
+
+// CloneExpr returns an independent deep copy of an expression tree.
+func CloneExpr(e Expr) Expr {
+	return cloneExpr(e)
+}
+
 // pruneExprFields removes every leaf whose field fails keep, rebuilding the
 // logical structure around the survivors. Dropping a leaf drops it from its
 // parent's operand list, so no dangling AND/OR/NOT is left behind.
@@ -3086,362 +2021,6 @@ func pruneOperands(operands []Expr, keep func(field string) bool) []Expr {
 		}
 	}
 	return kept
-}
-
-// filterAllowedFields recursively filters out disallowed fields from expressions
-func (f *figo) filterAllowedFields(expr Expr) Expr {
-	return pruneExprFields(expr, f.isFieldAllowedUnsafe)
-}
-
-// filterIgnoredFields prunes conditions on ignored fields. Expression fields
-// have already been through the naming strategy, so each registered ignore
-// name is matched both verbatim and in its converted form — callers may
-// register either spelling.
-func (f *figo) filterIgnoredFields(expr Expr) Expr {
-	if len(f.ignoreFields) == 0 {
-		return expr
-	}
-	ignored := make(map[string]bool, len(f.ignoreFields)*2)
-	for name := range f.ignoreFields {
-		ignored[name] = true
-		ignored[f.parsFieldsName(name)] = true
-	}
-	return pruneExprFields(expr, func(field string) bool {
-		return !ignored[field]
-	})
-}
-
-// Cache Management Methods
-
-// SetCache sets the query cache instance
-func (f *figo) SetCache(cache QueryCache) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.stopOwnedCacheLocked()
-	f.cache = cache
-}
-
-// stopOwnedCacheLocked stops the cleanup goroutine of a cache this instance
-// created itself (via SetCacheConfig) when that cache is being replaced.
-// Caller must hold f.mu.
-func (f *figo) stopOwnedCacheLocked() {
-	if f.ownedCache != nil && QueryCache(f.ownedCache) == f.cache {
-		f.ownedCache.Stop()
-	}
-	f.ownedCache = nil
-}
-
-// GetCache returns the current cache instance
-func (f *figo) GetCache() QueryCache {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.cache
-}
-
-// SetCacheConfig sets the cache configuration
-func (f *figo) SetCacheConfig(config CacheConfig) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.cacheConfig = config
-	if f.cache == nil && config.Enabled {
-		owned := NewInMemoryCache(config)
-		f.cache = owned
-		f.ownedCache = owned
-		// The cleanup goroutine keeps the cache alive forever; stop it when
-		// this figo instance is garbage-collected so instances created per
-		// request don't accumulate goroutines.
-		runtime.SetFinalizer(f, func(ff *figo) {
-			if ff.ownedCache != nil {
-				ff.ownedCache.Stop()
-			}
-		})
-	}
-}
-
-// GetCacheConfig returns the current cache configuration
-func (f *figo) GetCacheConfig() CacheConfig {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.cacheConfig
-}
-
-// GetCacheStats returns cache performance statistics
-func (f *figo) GetCacheStats() CacheStats {
-	f.mu.RLock()
-	cache := f.cache
-	f.mu.RUnlock()
-	if cache == nil {
-		return CacheStats{}
-	}
-	return cache.Stats()
-}
-
-// ClearCache clears all cached entries
-func (f *figo) ClearCache() {
-	f.mu.RLock()
-	cache := f.cache
-	f.mu.RUnlock()
-	if cache != nil {
-		cache.Clear()
-	}
-}
-
-// generateCacheKey creates a unique cache key for a query. kind ("sql"/"query")
-// keeps the two result types in separate slots — otherwise GetCachedSqlString and
-// GetCachedQuery share a key and clobber each other's entries. The key also
-// covers everything that changes the rendered output: the adapter type, the
-// custom naming func, and the global regex SQL operator (previously omitted,
-// which returned a stale result after SetAdapterObject / a regex-operator change).
-// valueTypeSignature renders the Go type of every value carried by the given
-// expression trees, in order. It exists because the cache key's %#v encoding
-// collapses int(1)/int64(1)/float64(1) to the same text; appending this makes
-// two clauses that differ only in a value's numeric type produce distinct keys.
-func valueTypeSignature(exprs []Expr) string {
-	var b strings.Builder
-	for _, e := range exprs {
-		appendValueTypes(&b, e)
-		b.WriteByte('|')
-	}
-	return b.String()
-}
-
-// preloadValueTypeSignature does the same across all preload expression lists,
-// keyed by relation name so two preloads can't swap type signatures unnoticed.
-func preloadValueTypeSignature(preloads map[string][]Expr) string {
-	var b strings.Builder
-	for _, name := range sortedKeys2(preloads) {
-		b.WriteString(name)
-		b.WriteByte(':')
-		b.WriteString(valueTypeSignature(preloads[name]))
-	}
-	return b.String()
-}
-
-// sortedKeys2 returns the map keys in deterministic order (the key must be
-// stable regardless of Go's random map iteration).
-func sortedKeys2(m map[string][]Expr) []string {
-	keys := make([]string, 0, len(m))
-	for k := range m {
-		keys = append(keys, k)
-	}
-	sort.Strings(keys)
-	return keys
-}
-
-func appendValueTypes(b *strings.Builder, e Expr) {
-	writeT := func(v any) { b.WriteString(fmt.Sprintf("%T,", v)) }
-	writeList := func(vs []any) {
-		for _, v := range vs {
-			writeT(v)
-		}
-	}
-	switch x := e.(type) {
-	case EqExpr:
-		writeT(x.Value)
-	case NeqExpr:
-		writeT(x.Value)
-	case GtExpr:
-		writeT(x.Value)
-	case GteExpr:
-		writeT(x.Value)
-	case LtExpr:
-		writeT(x.Value)
-	case LteExpr:
-		writeT(x.Value)
-	case LikeExpr:
-		writeT(x.Value)
-	case ILikeExpr:
-		writeT(x.Value)
-	case RegexExpr:
-		writeT(x.Value)
-	case InExpr:
-		writeList(x.Values)
-	case NotInExpr:
-		writeList(x.Values)
-	case BetweenExpr:
-		writeT(x.Low)
-		writeT(x.High)
-	case AndExpr:
-		for _, op := range x.Operands {
-			appendValueTypes(b, op)
-		}
-	case OrExpr:
-		for _, op := range x.Operands {
-			appendValueTypes(b, op)
-		}
-	case NotExpr:
-		for _, op := range x.Operands {
-			appendValueTypes(b, op)
-		}
-	}
-}
-
-func (f *figo) generateCacheKey(kind string, ctx any, conditionType ...string) string {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-
-	components := []string{
-		kind,
-		f.dsl,
-		// %#v keeps value types in the key: a = int64(1) and a = "1" render
-		// different SQL and must not share a cache slot (%v printed both as
-		// "1", colliding when instances share one cache). %#v alone is not
-		// enough for numeric types — it renders int(1), int64(1) and float64(1)
-		// identically as "1" — so append an explicit type signature of every
-		// clause/preload value to keep those from colliding.
-		fmt.Sprintf("%#v", f.clauses),
-		valueTypeSignature(f.clauses),
-		fmt.Sprintf("%#v", f.preloads),
-		preloadValueTypeSignature(f.preloads),
-		fmt.Sprintf("%v", f.page),
-		fmt.Sprintf("%v", f.sort),
-		fmt.Sprintf("%v", f.ignoreFields),
-		fmt.Sprintf("%v", f.selectFields),
-		fmt.Sprintf("%v", f.allowedFields),
-		fmt.Sprintf("%v", f.fieldWhitelist),
-		fmt.Sprintf("%v", f.namingStrategy),
-		fmt.Sprintf("%p", f.namingFunc),
-		fmt.Sprintf("%T", f.adapterObj),
-		GetRegexSQLOperator(),
-		fmt.Sprintf("%v", ctx),
-		fmt.Sprintf("%v", conditionType),
-	}
-
-	content := strings.Join(components, "|")
-	hash := md5.Sum([]byte(content))
-	return fmt.Sprintf("figo:%x", hash)
-}
-
-// GetCachedSqlString retrieves SQL string from cache or generates it
-func (f *figo) GetCachedSqlString(ctx any, conditionType ...string) string {
-	start := time.Now()
-	var cacheHit bool
-	var err error
-
-	defer func() {
-		latency := time.Since(start)
-		f.recordQueryExecution(latency, cacheHit, err)
-	}()
-
-	f.mu.RLock()
-	cache := f.cache
-	enabled := f.cacheConfig.Enabled
-	ttl := f.cacheConfig.TTL
-	f.mu.RUnlock()
-
-	if cache == nil || !enabled {
-		return f.GetSqlString(ctx, conditionType...)
-	}
-
-	key := f.generateCacheKey("sql", ctx, conditionType...)
-
-	// Try to get from cache
-	if cached, found := cache.Get(key); found {
-		if sql, ok := cached.(string); ok {
-			cacheHit = true
-			return sql
-		}
-	}
-
-	// Generate and cache. The key was computed from a snapshot taken before
-	// rendering; if a concurrent Build/AddFiltersFromString changed the state
-	// in between, the rendered SQL belongs to the NEW state and storing it
-	// under the OLD key would poison the cache — verify and skip caching.
-	sql := f.GetSqlString(ctx, conditionType...)
-	if f.generateCacheKey("sql", ctx, conditionType...) == key {
-		cache.Set(key, sql, ttl)
-	}
-	cacheHit = false
-
-	return sql
-}
-
-// GetCachedQuery retrieves query from cache or generates it
-func (f *figo) GetCachedQuery(ctx any, conditionType ...string) Query {
-	start := time.Now()
-	var cacheHit bool
-	var err error
-
-	defer func() {
-		latency := time.Since(start)
-		f.recordQueryExecution(latency, cacheHit, err)
-	}()
-
-	f.mu.RLock()
-	cache := f.cache
-	enabled := f.cacheConfig.Enabled
-	ttl := f.cacheConfig.TTL
-	f.mu.RUnlock()
-
-	if cache == nil || !enabled {
-		return f.GetQuery(ctx, conditionType...)
-	}
-
-	key := f.generateCacheKey("query", ctx, conditionType...)
-
-	// Try to get from cache
-	if cached, found := cache.Get(key); found {
-		if query, ok := cached.(Query); ok {
-			cacheHit = true
-			return query
-		}
-	}
-
-	// Generate and cache (see GetCachedSqlString for the key re-check).
-	query := f.GetQuery(ctx, conditionType...)
-	if query != nil && f.generateCacheKey("query", ctx, conditionType...) == key {
-		cache.Set(key, query, ttl)
-	}
-	cacheHit = false
-
-	return query
-}
-
-// Performance Monitoring Methods
-
-// SetPerformanceMonitor sets the performance monitor
-func (f *figo) SetPerformanceMonitor(monitor *PerformanceMonitor) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.monitor = monitor
-}
-
-// GetPerformanceMonitor returns the current performance monitor
-func (f *figo) GetPerformanceMonitor() *PerformanceMonitor {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.monitor
-}
-
-// GetMetrics returns current performance metrics
-func (f *figo) GetMetrics() Metrics {
-	f.mu.RLock()
-	m := f.monitor
-	f.mu.RUnlock()
-	if m == nil {
-		return Metrics{}
-	}
-	return m.GetMetrics()
-}
-
-// ResetMetrics resets all performance metrics
-func (f *figo) ResetMetrics() {
-	f.mu.RLock()
-	m := f.monitor
-	f.mu.RUnlock()
-	if m != nil {
-		m.Reset()
-	}
-}
-
-// recordQueryExecution records a query execution for monitoring
-func (f *figo) recordQueryExecution(latency time.Duration, cacheHit bool, err error) {
-	f.mu.RLock()
-	m := f.monitor
-	f.mu.RUnlock()
-	if m != nil {
-		m.RecordQuery(latency, cacheHit, err)
-	}
 }
 
 // Plugin Management Methods
@@ -3494,52 +2073,4 @@ func (f *figo) UnregisterPlugin(name string) error {
 		return fmt.Errorf("no plugin manager available")
 	}
 	return pm.UnregisterPlugin(name)
-}
-
-// Validation Management Methods
-
-// SetValidationManager sets the validation manager
-func (f *figo) SetValidationManager(manager *ValidationManager) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.validationManager = manager
-}
-
-// GetValidationManager returns the current validation manager
-func (f *figo) GetValidationManager() *ValidationManager {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
-	return f.validationManager
-}
-
-// validationMgr returns the manager, lazily creating it under the lock so
-// concurrent first-callers can't each construct one (with one lost).
-func (f *figo) validationMgr() *ValidationManager {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.validationManager == nil {
-		f.validationManager = NewValidationManager()
-	}
-	return f.validationManager
-}
-
-// AddValidationRule adds a validation rule
-func (f *figo) AddValidationRule(rule ValidationRule) {
-	f.validationMgr().AddRule(rule)
-}
-
-// RegisterValidator registers a custom validator
-func (f *figo) RegisterValidator(validator Validator) {
-	f.validationMgr().RegisterValidator(validator)
-}
-
-// ValidateField validates a field value
-func (f *figo) ValidateField(field string, value any) error {
-	f.mu.RLock()
-	vm := f.validationManager
-	f.mu.RUnlock()
-	if vm == nil {
-		return nil // No validation if no manager
-	}
-	return vm.Validate(field, value)
 }

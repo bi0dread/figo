@@ -1,6 +1,9 @@
-package figo
+package figo_test
 
 import (
+	. "github.com/bi0dread/figo/v4"
+	. "github.com/bi0dread/figo/v4/adapters"
+
 	"sync"
 	"testing"
 	"time"
@@ -158,26 +161,34 @@ func TestRegisterPluginRollsBackOnInitError(t *testing.T) {
 	assert.Error(t, f.RegisterPlugin(failingInitPlugin{}), "expect same init error, not 'already registered'")
 }
 
-// A validation handler may call back into the manager without deadlocking.
-func TestValidationHandlerMayCallManager(t *testing.T) {
-	vm := NewValidationManager()
-	vm.AddRule(ValidationRule{
-		Field: "*",
-		Rule:  "custom",
-		Handler: func(field, rule string, value any) error {
-			vm.AddRule(ValidationRule{Field: "other", Rule: "noop"})
-			return nil
-		},
-	})
+// reentrantFilter calls back into the Figo instance from FilterExpr — legal
+// because Build/AddFilter run expression filters outside the instance lock.
+type reentrantFilter struct{ failingInitPlugin }
+
+func (reentrantFilter) Name() string          { return "reentrant-filter" }
+func (reentrantFilter) Initialize(Figo) error { return nil }
+func (reentrantFilter) FilterExpr(f Figo, e Expr) Expr {
+	_ = f.GetNamingFunc() // read call-back must not deadlock
+	_ = f.GetSelectFields()
+	return e
+}
+
+// A FilterExpr callback may call back into the instance without deadlocking.
+func TestExprFilterMayCallBackIntoFigo(t *testing.T) {
+	f := New()
+	require.NoError(t, f.RegisterPlugin(reentrantFilter{}))
 
 	done := make(chan struct{})
 	go func() {
-		_ = vm.Validate("x", 1)
+		require.NoError(t, f.AddFiltersFromString(`a=1 and b=2`))
+		f.Build(RawAdapter{})
+		f.AddFilter(EqExpr{Field: "c", Value: int64(3)})
 		close(done)
 	}()
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("validation handler calling AddRule deadlocked")
+		t.Fatal("FilterExpr calling back into Figo deadlocked")
 	}
+	assert.Len(t, f.GetClauses(), 2)
 }

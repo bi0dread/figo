@@ -38,16 +38,46 @@ type Plugin interface {
 - **Example**: Validate parsed expressions, add metadata
 
 ### 4. BeforeQuery Hook
-- **When**: Called before query execution
-- **Purpose**: Modify query context or add pre-execution logic
-- **Return**: Error if pre-processing fails
-- **Example**: Add authentication checks, modify query parameters
+- **When**: Called automatically before every `GetSqlString` / `GetQuery` render (on cached paths: on misses, when a render actually happens)
+- **Purpose**: Authorization checks, auditing, pre-render logic
+- **Return**: Error to veto the render — `GetSqlString` returns `""`, `GetQuery` returns `nil`
+- **Example**: Block rendering for unauthorized contexts, log query attempts
+- **Note**: Must not render through the same instance (that would recurse)
 
 ### 5. AfterQuery Hook
-- **When**: Called after query execution
-- **Purpose**: Post-process query results
-- **Return**: Error if post-processing fails
-- **Example**: Transform results, add logging, cache results
+- **When**: Called automatically after a successful render, with the result (the SQL `string` or the `Query`)
+- **Purpose**: Observe or veto rendered output
+- **Return**: Error to veto the result — the caller gets `""` / `nil`
+- **Example**: Log rendered SQL, reject queries matching a deny-pattern
+
+### 6. FilterExpr Hook (optional interface)
+
+`ExprFilter` is an *optional* interface — implement it on your plugin alongside the base `Plugin` methods and figo picks it up automatically by type assertion:
+
+```go
+type ExprFilter interface {
+    FilterExpr(f Figo, e Expr) Expr // return nil to drop the expression
+}
+```
+
+- **When**: Called by `Build` on the parsed expression tree (and every preload condition) and by `AddFilter` on programmatic expressions
+- **Purpose**: Transform or prune expressions as they enter the clause tree
+- **Return**: The (possibly rewritten) expression, or `nil` to drop it entirely
+- **Example**: The built-in `FieldsPlugin` uses this for ignore-list and whitelist pruning
+- **Note**: Runs outside the instance's lock, so calling back into `f`'s read methods is safe
+
+### 7. FinalizeClauses Hook (optional interface)
+
+```go
+type ClauseFinalizer interface {
+    FinalizeClauses(f Figo, clauses []Expr) []Expr
+}
+```
+
+- **When**: Called once at the end of **every** `Build` — including a Build whose DSL produced no filters (the list may be empty)
+- **Purpose**: Transform the finished top-level clause list; the returned slice replaces the instance's clauses
+- **Example**: The built-in `ScopePlugin` uses this to guarantee mandatory filters (tenant scoping) are always present
+- **Note**: Runs after all `ExprFilter` passes, outside the instance's lock
 
 ## Creating a Plugin
 
@@ -199,6 +229,127 @@ func (p *IdToIddPlugin) Disable() { p.enabled = false }
 func (p *IdToIddPlugin) IsEnabled() bool { return p.enabled }
 ```
 
+## Built-in Plugins
+
+Figo ships eight plugins out of the box: `ValidationPlugin`, `CachePlugin`, `MetricsPlugin`, `FieldsPlugin`, `LimitsPlugin`, `SyntaxPlugin`, `ScopePlugin`, and `AuditPlugin`.
+
+### Scoping (mandatory filters)
+
+`ScopePlugin` guarantees filters are present in every built query — the multi-tenant classic. It uses the `FinalizeClauses` hook, which runs at the end of **every** Build (even one with no filters), so an unfiltered query cannot escape the scope. Injection happens after `FieldsPlugin` pruning, so a whitelist never strips the scope:
+
+```go
+sp := plugins.NewScopePlugin(figo.EqExpr{Field: "tenant_id", Value: tenantID})
+f.RegisterPlugin(sp)
+
+f.AddFiltersFromString(untrustedDSL)
+f.Build(adapters.RawAdapter{})
+// WHERE (...caller filters...) AND `tenant_id` = ?
+```
+
+### Auditing
+
+`AuditPlugin` records every parsed DSL (`AfterParse`) and every rendered statement (`AfterQuery` — real renders only, not cache hits) into an optional `slog.Logger` and a bounded in-memory history:
+
+```go
+ap := plugins.NewAuditPlugin(slog.Default(), 100) // nil logger = history only; 0 size = log only
+f.RegisterPlugin(ap)
+
+for _, e := range ap.History() {
+	fmt.Println(e.Kind, e.DSL, e.Result) // "parse"/"query" entries, oldest first
+}
+```
+
+### Validation
+
+`ValidationPlugin` attaches validation rules to fields and enforces them through the `AfterParse` hook — once registered, any `AddFiltersFromString` call whose filter values violate a rule fails with an error.
+
+```go
+vp := plugins.NewValidationPlugin()
+vp.RegisterValidator(plugins.EmailValidator{})   // built-ins: required, min_length, email
+vp.AddRule(plugins.ValidationRule{Field: "email", Rule: "email", Message: "invalid email"})
+
+f := figo.New()
+f.RegisterPlugin(vp)
+
+err := f.AddFiltersFromString(`email="not-an-email"`) // validation error
+err = vp.Validate("email", "x@y.com")                 // direct one-off check
+```
+
+Custom rules can supply a `Handler` func instead of a named validator, and custom validators implement the `Validator` interface (`Validate`, `GetRuleName`).
+
+### Caching
+
+`CachePlugin` caches rendered SQL/query results keyed by the full state of the instance passed to it. Unlike the validation plugin it doesn't rely on hooks — you render *through* it, so registration is optional (register it if you want it discoverable via the plugin manager). One plugin can serve many `Figo` instances.
+
+```go
+cp := plugins.NewCachePlugin(plugins.CacheConfig{
+	Enabled: true,
+	TTL:     time.Minute,
+	MaxSize: 1000,
+})
+defer cp.Close()
+
+sql := cp.GetCachedSqlString(f, adapters.RawContext{Table: "users"})
+q := cp.GetCachedQuery(f, adapters.RawContext{Table: "users"})
+
+stats := cp.Stats()
+cp.Clear()
+```
+
+Cache hits and misses are reported into the plugin's attached `PerformanceMonitor` when one is set (`cp.SetPerformanceMonitor(...)` — see Metrics below). Inject a custom store with `cp.SetCache(myQueryCache)`.
+
+### Metrics
+
+`MetricsPlugin` wraps a `PerformanceMonitor` as a registerable plugin. Attach its embedded monitor to whatever produces metrics — typically the cache plugin:
+
+```go
+mp := plugins.NewMetricsPlugin(true)
+cp.SetPerformanceMonitor(mp.PerformanceMonitor)
+
+m := mp.GetMetrics() // QueryCount, CacheHits, CacheMisses, AverageLatency, ...
+mp.Reset()
+```
+
+You can also record manually from your own code via `mp.RecordQuery(latency, cacheHit, err)`.
+
+### Field policy
+
+`FieldsPlugin` carries the ignore list and the allowed-fields whitelist. It implements the `FilterExpr` hook, so once registered its pruning applies to every expression entering the clause tree — parsed DSL, preload conditions, and programmatic `AddFilter` calls alike:
+
+```go
+fp := plugins.NewFieldsPlugin()
+fp.AddIgnoreFields("internal_flag")
+fp.SetAllowedFields("id", "name", "email")
+fp.EnableFieldWhitelist()
+f.RegisterPlugin(fp)
+
+f.AddFiltersFromString(`id=1 and internal_flag=true and secret="x"`)
+f.Build(adapters.RawAdapter{}) // only id=1 survives
+```
+
+Ignore names match both raw and naming-converted spellings. Select fields (`AddSelectFields`) are not part of this plugin — they are projection state on the instance itself.
+
+### Syntax validation & repair
+
+`SyntaxPlugin` validates DSL syntax through `BeforeParse` — balanced parentheses, quotes, and brackets, plus common malformed patterns — failing `AddFiltersFromString` with a structured `*ParseError` (line/column/suggestion). With repair enabled it first fixes what it safely can (a leading `not` is never stripped):
+
+```go
+f.RegisterPlugin(plugins.NewSyntaxPlugin(false)) // strict
+f.RegisterPlugin(plugins.NewSyntaxPlugin(true))  // repair, then validate
+```
+
+### Query limits
+
+`LimitsPlugin` enforces complexity limits on parsed DSL via `AfterParse` — a real guard for untrusted input. A zero value disables that particular limit:
+
+```go
+lp := plugins.NewLimitsPlugin(plugins.DefaultQueryLimits())
+f.RegisterPlugin(lp)
+
+err := f.AddFiltersFromString(deepUntrustedDSL)
+// "plugin figo-limits AfterParse error: query exceeds MaxNestingDepth: 12 > 10"
+```
+
 ## Using Plugins
 
 ### 1. Register a Plugin
@@ -235,6 +386,8 @@ if exists {
 ```
 
 ### 3. Manual Hook Execution
+
+All hooks fire automatically (parse hooks in `AddFiltersFromString`, query hooks around `GetSqlString`/`GetQuery`), so manual execution is rarely needed — but the plugin manager exposes it, e.g. for testing a plugin in isolation:
 
 ```go
 // Execute hooks manually
@@ -362,7 +515,7 @@ func TestPluginIntegration(t *testing.T) {
     
     // Test with real queries
     f.AddFiltersFromString("id=1")
-    f.Build(figo.RawAdapter{})
+    f.Build(adapters.RawAdapter{})
     
     // Verify plugin effects
     sql := f.GetSqlString(nil)

@@ -3,17 +3,15 @@ package figo
 // Clone returns a deep copy of the Figo instance.
 //
 // The query-building state is fully independent: filters (clauses), preloads,
-// pagination, sort, the ignore/select/allowed field sets, query limits, the DSL
-// string, naming strategy and cache config are all copied, so mutating the clone
-// (AddFilter, SetPage, AddIgnoreFields, EnableFieldWhitelist, …) never affects
-// the original and vice versa.
+// pagination, sort, the select-field set, the DSL string and naming strategy
+// are all copied, so mutating the clone (AddFilter, SetPage, AddSelectFields,
+// …) never affects the original and vice versa.
 //
-// Shared collaborators are referenced, not duplicated: the adapter, cache,
-// performance monitor, plugin manager and validation manager are stateful
-// services (several hold their own locks or background goroutines) meant to be
-// shared, and copying them would be unsafe or semantically wrong. If you need
-// the clone to be isolated from one of these, assign a fresh one on the clone
-// (e.g. clone.SetCache(...), clone.SetPerformanceMonitor(...)).
+// Shared collaborators are referenced, not duplicated: the adapter and the
+// plugin manager are stateful services meant to be shared, and copying them
+// would be unsafe or semantically wrong. If you need the clone to be isolated
+// from one of these, assign a fresh one on the clone
+// (e.g. clone.SetPluginManager(...), clone.SetAdapterObject(...)).
 func (f *figo) Clone() Figo {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -22,28 +20,19 @@ func (f *figo) Clone() Figo {
 	// the source struct by value would copy f.mu (a sync.RWMutex) — a vet error.
 	return &figo{
 		// Independent value-typed state (safe to copy directly).
-		page:           f.page,
-		fieldWhitelist: f.fieldWhitelist,
-		queryLimits:    f.queryLimits,
-		cacheConfig:    f.cacheConfig,
-		dsl:            f.dsl,
-		namingStrategy: f.namingStrategy,
-		namingFunc:     f.namingFunc, // shared transformer; assumed pure
+		page:       f.page,
+		dsl:        f.dsl,
+		namingFunc: f.namingFunc, // shared transformer; assumed pure
 
 		// Deep-copied reference-typed state.
-		clauses:       cloneExprs(f.clauses),
-		preloads:      clonePreloads(f.preloads),
-		ignoreFields:  cloneStringBoolMap(f.ignoreFields),
-		selectFields:  cloneStringBoolMap(f.selectFields),
-		allowedFields: cloneStringBoolMap(f.allowedFields),
-		sort:          cloneOrderBy(f.sort),
+		clauses:      cloneExprs(f.clauses),
+		preloads:     clonePreloads(f.preloads),
+		selectFields: cloneStringBoolMap(f.selectFields),
+		sort:         cloneOrderBy(f.sort),
 
 		// Shared collaborators (referenced, see doc comment).
-		cache:             f.cache,
-		monitor:           f.monitor,
-		pluginManager:     f.pluginManager,
-		validationManager: f.validationManager,
-		adapterObj:        f.adapterObj,
+		pluginManager: f.pluginManager,
+		adapterObj:    f.adapterObj,
 	}
 }
 

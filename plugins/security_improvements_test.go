@@ -1,6 +1,9 @@
-package figo
+package plugins
 
 import (
+	. "github.com/bi0dread/figo/v4"
+	. "github.com/bi0dread/figo/v4/adapters"
+
 	"testing"
 	"time"
 
@@ -9,35 +12,37 @@ import (
 
 func TestFieldWhitelisting(t *testing.T) {
 	t.Run("FieldWhitelistDisabled", func(t *testing.T) {
-		f := New()
-		f.DisableFieldWhitelist()
+		fp := NewFieldsPlugin()
+		fp.DisableFieldWhitelist()
 
 		// All fields should be allowed when whitelist is disabled
-		assert.True(t, f.IsFieldAllowed("any_field"))
-		assert.True(t, f.IsFieldAllowed("sensitive_data"))
+		assert.True(t, fp.IsFieldAllowed("any_field"))
+		assert.True(t, fp.IsFieldAllowed("sensitive_data"))
 	})
 
 	t.Run("FieldWhitelistEnabled", func(t *testing.T) {
-		f := New()
-		f.SetAllowedFields("id", "name", "email", "created_at")
-		f.EnableFieldWhitelist()
+		fp := NewFieldsPlugin()
+		fp.SetAllowedFields("id", "name", "email", "created_at")
+		fp.EnableFieldWhitelist()
 
 		// Allowed fields should pass
-		assert.True(t, f.IsFieldAllowed("id"))
-		assert.True(t, f.IsFieldAllowed("name"))
-		assert.True(t, f.IsFieldAllowed("email"))
-		assert.True(t, f.IsFieldAllowed("created_at"))
+		assert.True(t, fp.IsFieldAllowed("id"))
+		assert.True(t, fp.IsFieldAllowed("name"))
+		assert.True(t, fp.IsFieldAllowed("email"))
+		assert.True(t, fp.IsFieldAllowed("created_at"))
 
 		// Disallowed fields should be blocked
-		assert.False(t, f.IsFieldAllowed("password"))
-		assert.False(t, f.IsFieldAllowed("secret_key"))
-		assert.False(t, f.IsFieldAllowed("internal_data"))
+		assert.False(t, fp.IsFieldAllowed("password"))
+		assert.False(t, fp.IsFieldAllowed("secret_key"))
+		assert.False(t, fp.IsFieldAllowed("internal_data"))
 	})
 
 	t.Run("FieldWhitelistWithDSL", func(t *testing.T) {
 		f := New()
-		f.SetAllowedFields("id", "name", "email")
-		f.EnableFieldWhitelist()
+		fp := NewFieldsPlugin()
+		fp.SetAllowedFields("id", "name", "email")
+		fp.EnableFieldWhitelist()
+		assert.NoError(t, f.RegisterPlugin(fp))
 
 		// Add filters with allowed and disallowed fields
 		f.AddFiltersFromString(`id=1 and name="test" and password="secret"`)
@@ -67,8 +72,7 @@ func TestFieldWhitelisting(t *testing.T) {
 
 func TestQueryLimits(t *testing.T) {
 	t.Run("DefaultLimits", func(t *testing.T) {
-		f := New()
-		limits := f.GetQueryLimits()
+		limits := DefaultQueryLimits()
 
 		assert.Equal(t, 10, limits.MaxNestingDepth)
 		assert.Equal(t, 50, limits.MaxFieldCount)
@@ -77,27 +81,44 @@ func TestQueryLimits(t *testing.T) {
 	})
 
 	t.Run("CustomLimits", func(t *testing.T) {
-		f := New()
+		lp := NewLimitsPlugin(DefaultQueryLimits())
 		customLimits := QueryLimits{
 			MaxNestingDepth:    5,
 			MaxFieldCount:      10,
 			MaxParameterCount:  20,
 			MaxExpressionCount: 50,
 		}
-		f.SetQueryLimits(customLimits)
+		lp.SetLimits(customLimits)
 
-		limits := f.GetQueryLimits()
+		limits := lp.GetLimits()
 		assert.Equal(t, 5, limits.MaxNestingDepth)
 		assert.Equal(t, 10, limits.MaxFieldCount)
 		assert.Equal(t, 20, limits.MaxParameterCount)
 		assert.Equal(t, 50, limits.MaxExpressionCount)
 	})
+
+	t.Run("EnforcedLimits", func(t *testing.T) {
+		f := New()
+		lp := NewLimitsPlugin(QueryLimits{MaxNestingDepth: 2, MaxParameterCount: 3})
+		assert.NoError(t, f.RegisterPlugin(lp))
+
+		// Within limits.
+		assert.NoError(t, f.AddFiltersFromString(`a=1 and b=2`))
+
+		// Too many parameters (an <in> list element each counts).
+		err := f.AddFiltersFromString(`a<in>[1,2,3,4]`)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "MaxParameterCount")
+
+		// Too deeply nested.
+		err = f.AddFiltersFromString(`a=1 and (b=2 or (c=3 and d=4))`)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "MaxNestingDepth")
+	})
 }
 
 func TestEnhancedTypeParsing(t *testing.T) {
 	t.Run("DateParsing", func(t *testing.T) {
-		f := New()
-
 		// Unquoted date literals get date detection; quoted literals stay
 		// strings (quoting is the "do not re-type this" escape hatch).
 		testCases := []struct {
@@ -113,7 +134,7 @@ func TestEnhancedTypeParsing(t *testing.T) {
 		for _, tc := range testCases {
 			t.Run(tc.input, func(t *testing.T) {
 				// Parse the value
-				value := f.ParseFieldsValue(tc.input)
+				value := ParseValue(tc.input)
 
 				// Should be a time.Time
 				if dateVal, ok := value.(time.Time); ok {
@@ -128,54 +149,49 @@ func TestEnhancedTypeParsing(t *testing.T) {
 	})
 
 	t.Run("NullParsing", func(t *testing.T) {
-		f := New()
-
 		// Test null values
-		assert.Nil(t, f.ParseFieldsValue("null"))
-		assert.Nil(t, f.ParseFieldsValue("NULL"))
+		assert.Nil(t, ParseValue("null"))
+		assert.Nil(t, ParseValue("NULL"))
 	})
 
 	t.Run("BooleanParsing", func(t *testing.T) {
-		f := New()
-
 		// Test boolean values
-		assert.True(t, f.ParseFieldsValue("true").(bool))
-		assert.False(t, f.ParseFieldsValue("false").(bool))
+		assert.True(t, ParseValue("true").(bool))
+		assert.False(t, ParseValue("false").(bool))
 	})
 
 	t.Run("NumericParsing", func(t *testing.T) {
-		f := New()
-
 		// Test numeric values
-		assert.Equal(t, int64(123), f.ParseFieldsValue("123"))
-		assert.Equal(t, float64(123.45), f.ParseFieldsValue("123.45"))
+		assert.Equal(t, int64(123), ParseValue("123"))
+		assert.Equal(t, float64(123.45), ParseValue("123.45"))
 	})
 
 	t.Run("StringParsing", func(t *testing.T) {
-		f := New()
-
 		// Test string values
-		assert.Equal(t, "hello", f.ParseFieldsValue(`"hello"`))
-		assert.Equal(t, "unquoted", f.ParseFieldsValue("unquoted"))
+		assert.Equal(t, "hello", ParseValue(`"hello"`))
+		assert.Equal(t, "unquoted", ParseValue("unquoted"))
 	})
 }
 
 func TestSecurityImprovementsIntegration(t *testing.T) {
 	t.Run("CompleteSecurityWorkflow", func(t *testing.T) {
-		// Create a figo instance with security features enabled
+		// Create a figo instance with security plugins registered
 		f := New()
 
 		// Set up field whitelist
-		f.SetAllowedFields("id", "name", "email", "age", "created_at")
-		f.EnableFieldWhitelist()
+		fp := NewFieldsPlugin()
+		fp.SetAllowedFields("id", "name", "email", "age", "created_at")
+		fp.EnableFieldWhitelist()
+		assert.NoError(t, f.RegisterPlugin(fp))
 
 		// Set up query limits
-		f.SetQueryLimits(QueryLimits{
+		lp := NewLimitsPlugin(QueryLimits{
 			MaxNestingDepth:    5,
 			MaxFieldCount:      10,
 			MaxParameterCount:  20,
 			MaxExpressionCount: 50,
 		})
+		assert.NoError(t, f.RegisterPlugin(lp))
 
 		// Test complex query with mixed data types
 		dsl := `id=1 and name="John" and email=^"%@gmail.com" and age>18 and created_at>"2023-01-01" and password="secret"`
@@ -222,7 +238,7 @@ func TestSecurityImprovementsIntegration(t *testing.T) {
 		assert.False(t, fieldNames["password"])
 
 		// Verify limits are respected
-		limits := f.GetQueryLimits()
+		limits := lp.GetLimits()
 		assert.Equal(t, 5, limits.MaxNestingDepth)
 		assert.Equal(t, 10, limits.MaxFieldCount)
 	})
@@ -238,8 +254,10 @@ func TestSecurityImprovementsIntegration(t *testing.T) {
 		for _, adapter := range adapters {
 			t.Run("Adapter", func(t *testing.T) {
 				f := New()
-				f.SetAllowedFields("id", "name")
-				f.EnableFieldWhitelist()
+				fp := NewFieldsPlugin()
+				fp.SetAllowedFields("id", "name")
+				fp.EnableFieldWhitelist()
+				assert.NoError(t, f.RegisterPlugin(fp))
 
 				f.AddFiltersFromString(`id=1 and name="test" and password="secret"`)
 				f.Build(adapter)
@@ -289,9 +307,9 @@ func TestBackwardCompatibility(t *testing.T) {
 		clauses := f.GetClauses()
 		assert.Len(t, clauses, 1) // Should be a single AndExpr clause
 
-		// Test that new features are optional
-		assert.True(t, f.IsFieldAllowed("any_field")) // Should return true when whitelist is disabled
-		limits := f.GetQueryLimits()
-		assert.Equal(t, 10, limits.MaxNestingDepth) // Should have default limits
+		// Policy features are optional plugins with permissive defaults.
+		fp := NewFieldsPlugin()
+		assert.True(t, fp.IsFieldAllowed("any_field")) // whitelist disabled by default
+		assert.Equal(t, 10, DefaultQueryLimits().MaxNestingDepth)
 	})
 }

@@ -1,11 +1,11 @@
-package figo
+package adapters
 
 import (
+	. "github.com/bi0dread/figo/v4"
+
 	"encoding/json"
 	"strings"
-	"sync/atomic"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -124,73 +124,4 @@ func TestGormTakeZeroMeansNoLimit(t *testing.T) {
 
 	sql := f.GetSqlString(db.Model(&gormRegModel{}))
 	assert.NotContains(t, sql, "LIMIT 0", "take=0 must not become LIMIT 0: %s", sql)
-}
-
-// The batch concurrency cap must hold even when operations time out.
-func TestBatchTimeoutKeepsConcurrencyCap(t *testing.T) {
-	var inFlight, maxInFlight int64
-	blocker := &slowAdapter{
-		onCall: func() {
-			cur := atomic.AddInt64(&inFlight, 1)
-			for {
-				max := atomic.LoadInt64(&maxInFlight)
-				if cur <= max || atomic.CompareAndSwapInt64(&maxInFlight, max, cur) {
-					break
-				}
-			}
-			time.Sleep(120 * time.Millisecond)
-			atomic.AddInt64(&inFlight, -1)
-		},
-	}
-
-	ops := make([]BatchOperation, 3)
-	for i := range ops {
-		f := New()
-		f.AddFilter(EqExpr{Field: "a", Value: int64(1)})
-		f.SetAdapterObject(blocker)
-		ops[i] = BatchOperation{ID: "op", Type: "sql", Query: f, Context: "t"}
-	}
-
-	bp := NewInMemoryBatchProcessor(1, 20*time.Millisecond)
-	results := bp.Process(ops)
-
-	for _, r := range results {
-		assert.Error(t, r.Error, "each op should time out")
-	}
-	// Give stragglers a moment to finish, then check the observed peak.
-	time.Sleep(500 * time.Millisecond)
-	assert.LessOrEqual(t, atomic.LoadInt64(&maxInFlight), int64(1),
-		"maxConcurrency=1 must hold even under timeouts")
-}
-
-type slowAdapter struct {
-	onCall func()
-}
-
-func (s *slowAdapter) GetSqlString(f Figo, ctx any, conditionType ...string) (string, bool) {
-	s.onCall()
-	return "SELECT 1", true
-}
-
-func (s *slowAdapter) GetQuery(f Figo, ctx any, conditionType ...string) (Query, bool) {
-	s.onCall()
-	return SQLQuery{SQL: "SELECT 1"}, true
-}
-
-// AddFilter must respect the whitelist and ignore-fields, including for the
-// advanced expression types.
-func TestAddFilterRespectsWhitelistAndIgnores(t *testing.T) {
-	f := New()
-	f.SetAllowedFields("name")
-	f.EnableFieldWhitelist()
-	f.AddFilter(EqExpr{Field: "secret", Value: 1})
-	f.AddFilter(GeoDistanceExpr{Field: "hidden_location", Latitude: 1, Longitude: 2, Distance: 3})
-	f.AddFilter(EqExpr{Field: "name", Value: "x"})
-	require.Len(t, f.GetClauses(), 1)
-	assert.Equal(t, "name", exprField(f.GetClauses()[0]))
-
-	f2 := New()
-	f2.AddIgnoreFields("secret")
-	f2.AddFilter(NotExpr{Operands: []Expr{EqExpr{Field: "secret", Value: 1}}})
-	assert.Empty(t, f2.GetClauses(), "ignored field must not enter via AddFilter")
 }

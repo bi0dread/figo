@@ -1,28 +1,13 @@
-package figo
+package adapters
 
 import (
+	. "github.com/bi0dread/figo/v4"
+
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"go.mongodb.org/mongo-driver/bson"
 )
-
-// #22: a zero timeout must not fail an operation that completed successfully.
-func TestBatchZeroTimeoutSucceeds(t *testing.T) {
-	f := New()
-	f.AddFiltersFromString(`id=1`)
-	f.Build(RawAdapter{})
-
-	bp := NewInMemoryBatchProcessor(2, 0) // 0 => no timeout
-	results := bp.Process([]BatchOperation{
-		{ID: "1", Query: f, Context: "t", Type: "sql"},
-	})
-	assert.Len(t, results, 1)
-	assert.True(t, results[0].Success, "zero timeout must not fail a completed op")
-	assert.NoError(t, results[0].Error)
-	assert.NotEmpty(t, results[0].Result)
-}
 
 // #26: Mongo IS NULL / IS NOT NULL use null semantics (match explicit null),
 // not $exists (which only matches missing fields).
@@ -85,16 +70,4 @@ func TestDeterministicColumnAndJoinOrder(t *testing.T) {
 	}
 	// Columns come out sorted.
 	assert.Contains(t, first, "`alpha`, `mu`, `zeta`")
-}
-
-// #30: an expired entry is removed on access and no longer counted in Size.
-func TestExpiredEntryDeletedOnGet(t *testing.T) {
-	c := NewInMemoryCache(CacheConfig{Enabled: true, MaxSize: 10}) // no cleanup goroutine
-	defer c.Close()
-	c.Set("k", "v", time.Nanosecond)
-	time.Sleep(time.Millisecond)
-
-	_, ok := c.Get("k")
-	assert.False(t, ok, "expired entry must be a miss")
-	assert.Equal(t, 0, c.Stats().Size, "expired entry must be deleted, not linger")
 }

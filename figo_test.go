@@ -1,9 +1,11 @@
-package figo
+package figo_test
 
 import (
+	. "github.com/bi0dread/figo/v4"
+	. "github.com/bi0dread/figo/v4/adapters"
+
 	"fmt"
 	"strings"
-	"sync"
 	"testing"
 	"time"
 
@@ -19,13 +21,6 @@ func TestNew(t *testing.T) {
 	assert.NotNil(t, f)
 	assert.Equal(t, 0, f.GetPage().Skip)
 	assert.Equal(t, 20, f.GetPage().Take)
-}
-
-func TestAddBanFields(t *testing.T) {
-	f := New()
-	f.AddIgnoreFields("sensitive_field", "internal_use_only")
-	assert.True(t, f.GetIgnoreFields()["sensitive_field"])
-	assert.True(t, f.GetIgnoreFields()["internal_use_only"])
 }
 
 func TestAddSelectFields(t *testing.T) {
@@ -128,128 +123,11 @@ func TestGormAndRawAdapters(t *testing.T) {
 	assert.Contains(t, rawSql, "WHERE ")
 }
 
-func TestRawAdapterBuild(t *testing.T) {
-	f := New()
-	f.AddFiltersFromString(`(id=1 and vendorId="22") and bank_id=11 or expedition_type=^"%e%" sort=id:desc page=skip:0,take:10`)
-	f.AddIgnoreFields("bank_id")
-	f.Build(RawAdapter{})
-
-	sql, args := BuildRawSelect(f, "test_models")
-	// Precedence gives ((id=1 AND vendor_id=22) AND bank_id=11) OR expedition_type LIKE %e%;
-	// pruning the ignored bank_id from the conjunction must keep the OR:
-	// (id=1 AND vendor_id=22) OR expedition_type LIKE %e%
-	assert.Equal(t, "SELECT * FROM `test_models` WHERE ((`id` = ? AND `vendor_id` = ?) OR `expedition_type` LIKE ?) ORDER BY `id` DESC LIMIT 10", sql)
-	// vendorId="22" is quoted, so it stays the string "22".
-	assert.Equal(t, []any{int64(1), "22", "%e%"}, args)
-}
-
-func TestMongoAdapterBuild(t *testing.T) {
-	f := New()
-	f.AddFiltersFromString(`(id=1 and vendorId="22") and bank_id=11 or expedition_type=^"%e%" sort=id:desc page=skip:0,take:10`)
-	f.AddIgnoreFields("bank_id")
-	f.Build(nil)
-
-	// Filter
-	filter, _ := BuildMongoFilter(f)
-
-	// Precedence gives ((id=1 AND vendor_id=22) AND bank_id=11) OR expedition_type LIKE %e%;
-	// pruning the ignored bank_id from the conjunction must keep the OR.
-	// This creates a top-level $or with two items:
-	// 1. A nested $and with id and vendor_id
-	// 2. expedition_type with regex
-	orVal, ok := filter["$or"].([]bson.M)
-	assert.True(t, ok)
-	assert.Len(t, orVal, 2)
-
-	// First item should be a nested $and with id and vendor_id
-	firstItem, ok := orVal[0]["$and"].([]bson.M)
-	assert.True(t, ok)
-	assert.Len(t, firstItem, 2)
-
-	// Verify id and vendor_id are present
-	var hasID, hasVendor bool
-	for _, m := range firstItem {
-		if v, ok := m["id"]; ok && v == int64(1) {
-			hasID = true
-		}
-		if v, ok := m["vendor_id"]; ok && v == "22" { // quoted literal stays a string
-			hasVendor = true
-		}
-	}
-	assert.True(t, hasID)
-	assert.True(t, hasVendor)
-
-	// Second item should be expedition_type with regex
-	secondItem := orVal[1]
-	if rv, ok := secondItem["expedition_type"].(primitive.Regex); ok {
-		assert.NotEmpty(t, rv.Pattern)
-	} else {
-		t.Fatalf("expedition_type regex not found in filter")
-	}
-
-	// Options
-	opts := BuildMongoFindOptions(f)
-	if opts.Limit == nil || *opts.Limit != int64(10) {
-		t.Fatalf("limit not set to 10")
-	}
-	if opts.Skip != nil {
-		t.Fatalf("skip should be nil for 0")
-	}
-	if sd, ok := opts.Sort.(bson.D); ok {
-		assert.Len(t, sd, 1)
-		assert.Equal(t, "id", sd[0].Key)
-		assert.Equal(t, -1, sd[0].Value)
-	} else {
-		t.Fatalf("sort not set as bson.D")
-	}
-
-	// Preloads to joins
-	f2 := New()
-	f2.AddFiltersFromString(`load=[TestInner1:id="3" or name="test1" | TestInner2:id=4]`)
-	f2.Build(nil)
-	joins := map[string]MongoJoin{
-		"TestInner1": {From: "testinner1", LocalField: "id", ForeignField: "XX", As: "TestInner1"},
-		"TestInner2": {From: "testinner2", LocalField: "id", ForeignField: "XX", As: "TestInner2"},
-	}
-	pipe, _ := BuildMongoAggregatePipeline(f2, joins)
-	// Expect at least two $lookup stages
-	lookupCount := 0
-	matchQualified := 0
-	for _, stage := range pipe {
-		var lookupVal any
-		var matchVal any
-		for _, e := range stage { // stage is a bson.D
-			switch e.Key {
-			case "$lookup":
-				lookupVal = e.Value
-			case "$match":
-				matchVal = e.Value
-			}
-		}
-		if lookupVal != nil {
-			lookupCount++
-		}
-		if matchVal != nil {
-			if mm, ok := matchVal.(bson.M); ok {
-				// look for qualified keys
-				for k := range mm {
-					if strings.HasPrefix(k, "TestInner1.") || strings.HasPrefix(k, "TestInner2.") {
-						matchQualified++
-						break
-					}
-				}
-			}
-		}
-	}
-	assert.Equal(t, 2, lookupCount)
-	assert.True(t, matchQualified >= 1)
-}
-
 func TestPageValidation(t *testing.T) {
-	p := Page{Skip: -1, Take: 30}
-	p.validate()
-	assert.Equal(t, 0, p.Skip)
-	assert.Equal(t, 30, p.Take)
+	// Negative skip/take are clamped by the public setter.
+	f := New()
+	f.SetPage(-1, 30)
+	assert.Equal(t, Page{Skip: 0, Take: 30}, f.GetPage())
 }
 
 func TestRawSelectFieldsColumns(t *testing.T) {
@@ -1220,120 +1098,6 @@ func TestMissingScenarios(t *testing.T) {
 
 // ===== NEW FEATURE TESTS =====
 
-// Test Security Features
-func TestFieldWhitelist(t *testing.T) {
-	t.Run("FieldWhitelistEnabled", func(t *testing.T) {
-		f := New()
-		f.SetAllowedFields("id", "name", "email")
-		f.EnableFieldWhitelist()
-
-		// Test allowed fields
-		assert.True(t, f.IsFieldAllowed("id"))
-		assert.True(t, f.IsFieldAllowed("name"))
-		assert.True(t, f.IsFieldAllowed("email"))
-
-		// Test disallowed fields
-		assert.False(t, f.IsFieldAllowed("password"))
-		assert.False(t, f.IsFieldAllowed("secret"))
-
-		// Test with DSL
-		f.AddFiltersFromString(`id=1 and name="test" and password="secret"`)
-		f.Build(RawAdapter{})
-		clauses := f.GetClauses()
-		// Should only have clauses for allowed fields
-		assert.Len(t, clauses, 1) // Only the AndExpr.Expr with id and name
-	})
-
-	t.Run("FieldWhitelistDisabled", func(t *testing.T) {
-		f := New()
-		f.SetAllowedFields("id", "name")
-		// Don't enable whitelist
-
-		// All fields should be allowed when whitelist is disabled
-		assert.True(t, f.IsFieldAllowed("password"))
-		assert.True(t, f.IsFieldAllowed("secret"))
-	})
-
-	t.Run("FieldWhitelistWithDSL", func(t *testing.T) {
-		f := New()
-		f.SetAllowedFields("id", "name")
-		f.EnableFieldWhitelist()
-
-		f.AddFiltersFromString(`id=1 and name="test" and password="secret"`)
-		f.Build(RawAdapter{})
-
-		// Should filter out disallowed fields
-		clauses := f.GetClauses()
-		assert.Len(t, clauses, 1) // Only allowed fields remain
-	})
-}
-
-func TestQueryLimitsBasic(t *testing.T) {
-	t.Run("DefaultLimits", func(t *testing.T) {
-		f := New()
-		limits := f.GetQueryLimits()
-
-		assert.Equal(t, 10, limits.MaxNestingDepth)
-		assert.Equal(t, 50, limits.MaxFieldCount)
-		assert.Equal(t, 100, limits.MaxParameterCount)
-		assert.Equal(t, 200, limits.MaxExpressionCount)
-	})
-
-	t.Run("CustomLimits", func(t *testing.T) {
-		f := New()
-		f.SetQueryLimits(QueryLimits{
-			MaxNestingDepth:    5,
-			MaxFieldCount:      10,
-			MaxParameterCount:  20,
-			MaxExpressionCount: 5,
-		})
-
-		limits := f.GetQueryLimits()
-		assert.Equal(t, 5, limits.MaxNestingDepth)
-		assert.Equal(t, 10, limits.MaxFieldCount)
-		assert.Equal(t, 20, limits.MaxParameterCount)
-		assert.Equal(t, 5, limits.MaxExpressionCount)
-	})
-}
-
-func TestInputValidation(t *testing.T) {
-	t.Run("ValidInput", func(t *testing.T) {
-		f := New()
-		err := f.AddFiltersFromString(`id=1 and name="test"`)
-		assert.NoError(t, err)
-	})
-
-	t.Run("UnmatchedParentheses", func(t *testing.T) {
-		// Test a case that can't be auto-fixed - multiple nested unmatched parentheses
-		f := New()
-		err := f.AddFiltersFromStringWithRepair(`(id=1 and name="test" and (age > 25 and (status = "active"`, false)
-		// This should fail as it's too complex to auto-fix
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "unmatched")
-	})
-
-	t.Run("UnmatchedQuotes", func(t *testing.T) {
-		// Test a case that can't be auto-fixed - quotes in the middle of expression
-		f := New()
-		err := f.AddFiltersFromStringWithRepair(`id=1 and name="test and age > 25 and status = "active"`, false)
-		// This should fail as it's too complex to auto-fix
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "unmatched")
-	})
-
-	t.Run("EmptyInput", func(t *testing.T) {
-		f := New()
-		err := f.AddFiltersFromString("")
-		assert.NoError(t, err)
-	})
-
-	t.Run("WhitespaceOnly", func(t *testing.T) {
-		f := New()
-		err := f.AddFiltersFromString("   ")
-		assert.NoError(t, err)
-	})
-}
-
 func TestInputRepair(t *testing.T) {
 	t.Run("AutoFixSimpleParentheses", func(t *testing.T) {
 		f := New()
@@ -1457,168 +1221,6 @@ func TestParseErrorBasic(t *testing.T) {
 	})
 }
 
-// Test Performance Features
-func TestCaching(t *testing.T) {
-	t.Run("InMemoryCache", func(t *testing.T) {
-		cache := NewInMemoryCache(CacheConfig{
-			Enabled:         true,
-			MaxSize:         100,
-			TTL:             5 * time.Minute,
-			CleanupInterval: 1 * time.Minute,
-		})
-		defer cache.Close()
-
-		// Test Set and Get
-		cache.Set("key1", "value1", 5*time.Minute)
-		value, found := cache.Get("key1")
-		assert.True(t, found)
-		assert.Equal(t, "value1", value)
-
-		// Test Get non-existent key
-		_, found = cache.Get("nonexistent")
-		assert.False(t, found)
-
-		// Test Set with TTL
-		cache.Set("key2", "value2", 1*time.Second)
-		value, found = cache.Get("key2")
-		assert.True(t, found)
-		assert.Equal(t, "value2", value)
-
-		// Wait for expiration
-		time.Sleep(2 * time.Second)
-		_, found = cache.Get("key2")
-		assert.False(t, found)
-	})
-
-	t.Run("CacheStats", func(t *testing.T) {
-		cache := NewInMemoryCache(CacheConfig{
-			Enabled:         true,
-			MaxSize:         10,
-			TTL:             5 * time.Minute,
-			CleanupInterval: 1 * time.Minute,
-		})
-		defer cache.Close()
-
-		cache.Set("key1", "value1", 5*time.Minute)
-		cache.Set("key2", "value2", 5*time.Minute)
-
-		stats := cache.Stats()
-		assert.Equal(t, int64(0), stats.Hits)   // No hits yet since we haven't retrieved
-		assert.Equal(t, int64(0), stats.Misses) // No misses yet
-		assert.Equal(t, 2, stats.Size)
-	})
-}
-
-func TestBatchProcessor(t *testing.T) {
-	t.Run("SynchronousBatch", func(t *testing.T) {
-		processor := NewInMemoryBatchProcessor(5, 1*time.Second)
-
-		// Create test queries
-		f1 := New()
-		f1.AddFiltersFromString(`id=1`)
-		f1.Build(RawAdapter{})
-
-		f2 := New()
-		f2.AddFiltersFromString(`name="test"`)
-		f2.Build(RawAdapter{})
-
-		f3 := New()
-		f3.AddFiltersFromString(`age>18`)
-		f3.Build(RawAdapter{})
-
-		// Create batch operations
-		operations := []BatchOperation{
-			{ID: "op1", Query: f1, Context: RawContext{Table: "test"}, Type: "sql"},
-			{ID: "op2", Query: f2, Context: RawContext{Table: "test"}, Type: "sql"},
-			{ID: "op3", Query: f3, Context: RawContext{Table: "test"}, Type: "sql"},
-		}
-
-		// Process batch
-		results := processor.Process(operations)
-
-		// Verify results
-		assert.Len(t, results, 3)
-
-		for i, result := range results {
-			assert.True(t, result.Success)
-			assert.NoError(t, result.Error)
-			assert.Equal(t, operations[i].ID, result.ID)
-			assert.NotNil(t, result.Result)
-		}
-	})
-
-	t.Run("AsynchronousBatch", func(t *testing.T) {
-		processor := NewInMemoryBatchProcessor(2, 1*time.Second)
-
-		// Create test queries
-		f1 := New()
-		f1.AddFiltersFromString(`id=1`)
-		f1.Build(RawAdapter{})
-
-		f2 := New()
-		f2.AddFiltersFromString(`name="test"`)
-		f2.Build(RawAdapter{})
-
-		// Create batch operations
-		operations := []BatchOperation{
-			{ID: "op1", Query: f1, Context: RawContext{Table: "test"}, Type: "sql"},
-			{ID: "op2", Query: f2, Context: RawContext{Table: "test"}, Type: "sql"},
-		}
-
-		// Process async
-		resultChan := processor.ProcessAsync(operations)
-
-		// Collect results
-		var results []BatchResult
-		for result := range resultChan {
-			results = append(results, result)
-		}
-
-		// Verify results
-		assert.Len(t, results, 2)
-
-		for _, result := range results {
-			assert.True(t, result.Success)
-			assert.NoError(t, result.Error)
-			assert.NotNil(t, result.Result)
-		}
-	})
-}
-
-func TestPerformanceMonitor(t *testing.T) {
-	t.Run("PerformanceMonitoring", func(t *testing.T) {
-		monitor := NewPerformanceMonitor(true)
-
-		// Record some queries
-		monitor.RecordQuery(100*time.Millisecond, true, nil)
-		monitor.RecordQuery(200*time.Millisecond, false, nil)
-		monitor.RecordQuery(150*time.Millisecond, true, nil)
-
-		// Get metrics
-		metrics := monitor.GetMetrics()
-		assert.Equal(t, int64(3), metrics.QueryCount)
-		assert.Equal(t, int64(2), metrics.CacheHits)
-		assert.Equal(t, int64(1), metrics.CacheMisses)
-		assert.True(t, metrics.AverageLatency > 0)
-		assert.True(t, metrics.TotalLatency > 0)
-	})
-
-	t.Run("PerformanceReset", func(t *testing.T) {
-		monitor := NewPerformanceMonitor(true)
-
-		monitor.RecordQuery(100*time.Millisecond, true, nil)
-		monitor.RecordQuery(200*time.Millisecond, false, nil)
-
-		metrics := monitor.GetMetrics()
-		assert.Equal(t, int64(2), metrics.QueryCount)
-
-		monitor.Reset()
-		metrics = monitor.GetMetrics()
-		assert.Equal(t, int64(0), metrics.QueryCount)
-	})
-}
-
-// Test Advanced Operators (Basic functionality)
 func TestAdvancedOperatorsBasic(t *testing.T) {
 	t.Run("JsonPathExpr", func(t *testing.T) {
 		f := New()
@@ -1738,100 +1340,6 @@ func TestAdvancedOperatorsBasic(t *testing.T) {
 	})
 }
 
-// Test Validation System (Basic functionality)
-func TestValidationSystemBasic(t *testing.T) {
-	t.Run("ValidationManager", func(t *testing.T) {
-		manager := NewValidationManager()
-
-		// Test rule addition
-		rule := ValidationRule{
-			Field:   "email",
-			Rule:    "email",
-			Message: "Invalid email format",
-		}
-		manager.AddRule(rule)
-
-		// Test validator registration
-		validator := EmailValidator{}
-		manager.RegisterValidator(validator)
-
-		// Test validation
-		err := manager.Validate("email", "invalid-email")
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "Invalid email format")
-
-		err = manager.Validate("email", "valid@example.com")
-		assert.NoError(t, err)
-	})
-
-	t.Run("BuiltInValidators", func(t *testing.T) {
-		// Test RequiredValidator
-		required := RequiredValidator{}
-		err := required.Validate("name", "required", "")
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "is required")
-
-		err = required.Validate("name", "required", "john")
-		assert.NoError(t, err)
-
-		// Test MinLengthValidator
-		minLength := MinLengthValidator{}
-		err = minLength.Validate("name", "min_length", "ab")
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "at least 3 characters")
-
-		err = minLength.Validate("name", "min_length", "john")
-		assert.NoError(t, err)
-
-		// Test EmailValidator
-		email := EmailValidator{}
-		err = email.Validate("email", "email", "invalid")
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "must be a valid email")
-
-		err = email.Validate("email", "email", "test@example.com")
-		assert.NoError(t, err)
-	})
-
-	t.Run("FigoValidationIntegration", func(t *testing.T) {
-		f := New()
-
-		// Test validation manager setup
-		manager := NewValidationManager()
-		manager.RegisterValidator(EmailValidator{})
-		manager.RegisterValidator(RequiredValidator{})
-
-		manager.AddRule(ValidationRule{
-			Field:   "email",
-			Rule:    "email",
-			Message: "Invalid email format",
-		})
-
-		f.SetValidationManager(manager)
-
-		// Test field validation
-		err := f.ValidateField("email", "invalid-email")
-		assert.Error(t, err)
-
-		err = f.ValidateField("email", "valid@example.com")
-		assert.NoError(t, err)
-
-		// Test validation rule addition
-		f.AddValidationRule(ValidationRule{
-			Field:   "name",
-			Rule:    "required",
-			Message: "Name is required",
-		})
-
-		err = f.ValidateField("name", "")
-		assert.Error(t, err)
-
-		err = f.ValidateField("name", "john")
-		assert.NoError(t, err)
-	})
-}
-
-// Test Plugin System (Basic functionality)
 func TestPluginSystemBasic(t *testing.T) {
 	t.Run("PluginManager", func(t *testing.T) {
 		manager := NewPluginManager()
@@ -1938,105 +1446,6 @@ func (p *TestPluginBasic) AfterParse(f Figo, input string) error {
 	return nil
 }
 
-// Test Concurrency Safety
-func TestConcurrencySafety(t *testing.T) {
-	t.Run("ConcurrentAccess", func(t *testing.T) {
-		f := New()
-		var wg sync.WaitGroup
-		numGoroutines := 10
-
-		// Test concurrent field operations
-		for i := 0; i < numGoroutines; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				f.AddIgnoreFields(fmt.Sprintf("field_%d", id))
-				f.AddSelectFields(fmt.Sprintf("select_%d", id))
-				f.SetAllowedFields(fmt.Sprintf("allowed_%d", id))
-				f.GetIgnoreFields()
-				f.GetSelectFields()
-				f.GetAllowedFields()
-			}(i)
-		}
-
-		wg.Wait()
-
-		// Verify no race conditions occurred
-		ignoreFields := f.GetIgnoreFields()
-		selectFields := f.GetSelectFields()
-		allowedFields := f.GetAllowedFields()
-
-		assert.NotNil(t, ignoreFields)
-		assert.NotNil(t, selectFields)
-		assert.NotNil(t, allowedFields)
-	})
-
-	t.Run("ConcurrentBuild", func(t *testing.T) {
-		f := New()
-		var wg sync.WaitGroup
-		numGoroutines := 5
-
-		for i := 0; i < numGoroutines; i++ {
-			wg.Add(1)
-			go func(id int) {
-				defer wg.Done()
-				f.AddFiltersFromString(fmt.Sprintf("id=%d", id))
-				f.Build(RawAdapter{})
-				f.GetClauses()
-			}(i)
-		}
-
-		wg.Wait()
-
-		// Should not panic and should have some clauses
-		clauses := f.GetClauses()
-		assert.NotNil(t, clauses)
-	})
-}
-
-// Test Memory Management
-func TestMemoryManagement(t *testing.T) {
-	t.Run("CacheMemoryLeak", func(t *testing.T) {
-		cache := NewInMemoryCache(CacheConfig{
-			MaxSize:         10,
-			TTL:             100 * time.Millisecond,
-			CleanupInterval: 50 * time.Millisecond,
-		})
-
-		// Add items
-		for i := 0; i < 20; i++ {
-			cache.Set(fmt.Sprintf("key_%d", i), fmt.Sprintf("value_%d", i), 100*time.Millisecond)
-		}
-
-		// Wait for cleanup
-		time.Sleep(200 * time.Millisecond)
-
-		// Close cache to stop goroutine
-		cache.Close()
-
-		// Should not have memory leaks
-		stats := cache.Stats()
-		assert.True(t, stats.Size <= 10) // Should be limited by MaxSize
-	})
-
-	t.Run("LargeDataSet", func(t *testing.T) {
-		f := New()
-
-		// Add many filters
-		for i := 0; i < 1000; i++ {
-			f.AddFilter(EqExpr{
-				Field: fmt.Sprintf("field_%d", i),
-				Value: fmt.Sprintf("value_%d", i),
-			})
-		}
-
-		f.Build(RawAdapter{})
-		clauses := f.GetClauses()
-		assert.Len(t, clauses, 1000)
-	})
-}
-
-// Test Error Recovery
 func TestErrorRecovery(t *testing.T) {
 	t.Run("MalformedInputRecovery", func(t *testing.T) {
 		f := New()
@@ -2169,45 +1578,10 @@ func TestGetFinalExprDebug(t *testing.T) {
 	}
 }
 
-func TestBackwardCompatibilityBasic(t *testing.T) {
-	t.Run("ExistingFunctionalityUnchanged", func(t *testing.T) {
-		// Test that existing functionality still works
-		f := New()
-
-		// Test basic functionality
-		f.AddFiltersFromString(`id=1 and name="test"`)
-		f.Build(RawAdapter{})
-
-		clauses := f.GetClauses()
-		assert.Len(t, clauses, 1) // Should be a single AndExpr.Expr clause
-
-		// Test that new features are optional
-		assert.True(t, f.IsFieldAllowed("any_field")) // Should return true when whitelist is disabled
-		limits := f.GetQueryLimits()
-		assert.Equal(t, 10, limits.MaxNestingDepth) // Should have default limits
-	})
-
-	t.Run("LegacyAPI", func(t *testing.T) {
-		f := New()
-
-		// Test legacy methods still work
-		f.AddIgnoreFields("field1", "field2")
-		f.AddSelectFields("field3", "field4")
-
-		ignoreFields := f.GetIgnoreFields()
-		selectFields := f.GetSelectFields()
-
-		assert.True(t, ignoreFields["field1"])
-		assert.True(t, ignoreFields["field2"])
-		assert.True(t, selectFields["field3"])
-		assert.True(t, selectFields["field4"])
-	})
-}
-
 func TestSortFieldNameFix(t *testing.T) {
 	t.Run("SnakeCaseNamingStrategy", func(t *testing.T) {
 		f := New()
-		f.SetNamingStrategy(NAMING_STRATEGY_SNAKE_CASE)
+		f.SetNamingFunc(SnakeCaseNaming)
 
 		// Test the DSL parsing with sort
 		err := f.AddFiltersFromString("sort=barcode:desc page=skip:0,take:10")
@@ -2239,7 +1613,7 @@ func TestSortFieldNameFix(t *testing.T) {
 
 	t.Run("NoChangeNamingStrategy", func(t *testing.T) {
 		f := New()
-		f.SetNamingStrategy(NAMING_STRATEGY_NO_CHANGE)
+		f.SetNamingFunc(NoChangeNaming)
 
 		err := f.AddFiltersFromString("sort=barcode:desc page=skip:0,take:10")
 		if err != nil {
@@ -2262,7 +1636,7 @@ func TestSortFieldNameFix(t *testing.T) {
 
 	t.Run("ComplexSortExpression", func(t *testing.T) {
 		f := New()
-		f.SetNamingStrategy(NAMING_STRATEGY_SNAKE_CASE)
+		f.SetNamingFunc(SnakeCaseNaming)
 
 		err := f.AddFiltersFromString("id>0 sort=name:asc,age:desc,created_at:desc page=skip:5,take:20")
 		if err != nil {
@@ -2313,7 +1687,7 @@ func TestGormGetSqlStringWithConditionTypes(t *testing.T) {
 		}
 
 		f := New()
-		f.SetNamingStrategy(NAMING_STRATEGY_SNAKE_CASE)
+		f.SetNamingFunc(SnakeCaseNaming)
 
 		// Test the DSL parsing with sort
 		err = f.AddFiltersFromString("sort=barcode:desc page=skip:0,take:10")
@@ -2365,7 +1739,7 @@ func TestGormSortFieldNameFix(t *testing.T) {
 		}
 
 		f := New()
-		f.SetNamingStrategy(NAMING_STRATEGY_SNAKE_CASE)
+		f.SetNamingFunc(SnakeCaseNaming)
 
 		// Test the DSL parsing with sort
 		err = f.AddFiltersFromString("sort=barcode:desc page=skip:0,take:10")
@@ -2411,7 +1785,7 @@ func TestGormSortFieldNameFix(t *testing.T) {
 		}
 
 		f := New()
-		f.SetNamingStrategy(NAMING_STRATEGY_NO_CHANGE)
+		f.SetNamingFunc(NoChangeNaming)
 
 		err = f.AddFiltersFromString("sort=barcode:desc page=skip:0,take:10")
 		if err != nil {
@@ -2451,7 +1825,7 @@ func TestGormSortFieldNameFix(t *testing.T) {
 		}
 
 		f := New()
-		f.SetNamingStrategy(NAMING_STRATEGY_SNAKE_CASE)
+		f.SetNamingFunc(SnakeCaseNaming)
 
 		err = f.AddFiltersFromString("id>0 sort=name:asc,age:desc,created_at:desc page=skip:5,take:20")
 		if err != nil {
@@ -2827,31 +2201,31 @@ func TestSortPageComprehensive(t *testing.T) {
 		}
 	})
 
-	t.Run("NamingStrategySortPage", func(t *testing.T) {
+	t.Run("NamingFuncSortPage", func(t *testing.T) {
 		testCases := []struct {
-			name           string
-			namingStrategy NamingStrategy
-			dsl            string
-			expectField    string
+			name        string
+			namingFunc  NamingFunc
+			dsl         string
+			expectField string
 		}{
 			{
-				name:           "SnakeCase",
-				namingStrategy: NAMING_STRATEGY_SNAKE_CASE,
-				dsl:            "sort=userName:desc page=skip:0,take:10",
-				expectField:    "user_name", // Should be converted to snake_case
+				name:        "SnakeCase",
+				namingFunc:  SnakeCaseNaming,
+				dsl:         "sort=userName:desc page=skip:0,take:10",
+				expectField: "user_name", // Should be converted to snake_case
 			},
 			{
-				name:           "NoChange",
-				namingStrategy: NAMING_STRATEGY_NO_CHANGE,
-				dsl:            "sort=userName:desc page=skip:0,take:10",
-				expectField:    "userName", // Should remain unchanged
+				name:        "NoChange",
+				namingFunc:  NoChangeNaming,
+				dsl:         "sort=userName:desc page=skip:0,take:10",
+				expectField: "userName", // Should remain unchanged
 			},
 		}
 
 		for _, tc := range testCases {
 			t.Run(tc.name, func(t *testing.T) {
 				f := New()
-				f.SetNamingStrategy(tc.namingStrategy)
+				f.SetNamingFunc(tc.namingFunc)
 
 				err := f.AddFiltersFromString(tc.dsl)
 				if err != nil {
