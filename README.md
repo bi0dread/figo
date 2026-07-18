@@ -864,6 +864,13 @@ Partial / not yet wired (defined in the API but not auto-invoked or without adap
 - `CustomExpr` — its handler emits SQL fragments, so the Mongo and Elasticsearch adapters reject it with an "unsupported expression" error.
 
 
+## Playground
+
+Try the DSL in the browser — a drag-and-drop query builder that generates figo DSL live:
+**<https://bi0dread.github.io/figo/>** (source in [playground/](playground/)).
+
+<iframe src="https://bi0dread.github.io/figo/" width="100%" height="640" style="border: 1px solid #30363d; border-radius: 8px;" title="figo playground"></iframe>
+
 ## License
 
 BSD 2-Clause. See [LICENSE](LICENSE).
