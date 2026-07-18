@@ -8,17 +8,16 @@ on:
       - ".github/workflows/deploy-playground.yml"
   workflow_dispatch:
 
+# Pages serves the gh-pages branch; the deploy step pushes the built site there.
 permissions:
-  contents: read
-  pages: write
-  id-token: write
+  contents: write
 
 concurrency:
   group: pages
   cancel-in-progress: true
 
 jobs:
-  build:
+  deploy:
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -30,20 +29,10 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: playground/package-lock.json
-      - uses: actions/configure-pages@v5
       - run: npm ci
       # serve under https://<owner>.github.io/<repo>/
       - run: npm run build -- --base="/${{ github.event.repository.name }}/"
-      - uses: actions/upload-pages-artifact@v3
+      - uses: peaceiris/actions-gh-pages@v4
         with:
-          path: playground/dist
-
-  deploy:
-    needs: build
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    steps:
-      - id: deployment
-        uses: actions/deploy-pages@v4
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: playground/dist
