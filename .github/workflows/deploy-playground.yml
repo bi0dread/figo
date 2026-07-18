@@ -31,8 +31,6 @@ jobs:
           cache: npm
           cache-dependency-path: playground/package-lock.json
       - uses: actions/configure-pages@v5
-        with:
-          enablement: true
       - run: npm ci
       # serve under https://<owner>.github.io/<repo>/
       - run: npm run build -- --base="/${{ github.event.repository.name }}/"
