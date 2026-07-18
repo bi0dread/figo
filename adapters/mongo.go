@@ -21,11 +21,30 @@ type MongoJoin struct {
 	As           string // output array field name
 }
 
+// earthRadiusKm is the equatorial radius MongoDB documents for converting a
+// $centerSphere radius from distance to radians.
+const earthRadiusKm = 6378.1
+
+// geoDistanceKm normalizes a GeoDistanceExpr distance to kilometers. An empty
+// unit defaults to kilometers.
+func geoDistanceKm(distance float64, unit string) (float64, error) {
+	switch strings.ToLower(strings.TrimSpace(unit)) {
+	case "", "km", "kilometers":
+		return distance, nil
+	case "m", "meters":
+		return distance / 1000, nil
+	case "mi", "miles":
+		return distance * 1.609344, nil
+	default:
+		return 0, fmt.Errorf("figo: unsupported geo distance unit %q", unit)
+	}
+}
+
 // BuildMongoFilter converts the built figo expressions into a MongoDB filter.
 // It returns an error if a clause uses an expression type the MongoDB adapter
 // does not support (rather than silently dropping the condition).
 func BuildMongoFilter(f figo.Figo) (bson.M, error) {
-	return buildMongoFilterFromExprs(f.GetClauses())
+	return buildMongoFilterFromExprs(f.GetClauses(), mongoAdapterOf(f).render(""))
 }
 
 // BuildMongoFindOptions produces FindOptions including sort, limit/skip
@@ -72,10 +91,14 @@ func BuildMongoFindOptions(f figo.Figo) *options.FindOptions {
 // The pipeline begins with an optional $match for root filters, followed by $lookup for each preload,
 // and optional $match stages to filter the joined arrays.
 func BuildMongoAggregatePipeline(f figo.Figo, joins map[string]MongoJoin) (mongo.Pipeline, error) {
+	return mongoAggregatePipeline(f, joins, mongoAdapterOf(f))
+}
+
+func mongoAggregatePipeline(f figo.Figo, joins map[string]MongoJoin, a MongoAdapter) (mongo.Pipeline, error) {
 	pipeline := mongo.Pipeline{}
 
 	// root filter
-	rootMatch, err := BuildMongoFilter(f)
+	rootMatch, err := buildMongoFilterFromExprs(f.GetClauses(), a.render(""))
 	if err != nil {
 		return nil, err
 	}
@@ -100,7 +123,7 @@ func BuildMongoAggregatePipeline(f figo.Figo, joins map[string]MongoJoin) (mongo
 
 		// if there are filters for the joined docs, add a match on as.field
 		if len(exprs) > 0 {
-			m, err := buildMongoFilterFromExprsQualified(exprs, j.As)
+			m, err := buildMongoFilterFromExprs(exprs, a.render(j.As))
 			if err != nil {
 				return nil, err
 			}
@@ -113,13 +136,80 @@ func BuildMongoAggregatePipeline(f figo.Figo, joins map[string]MongoJoin) (mongo
 	return pipeline, nil
 }
 
+// mongoRender carries per-build rendering context: an optional field qualifier
+// (set for $lookup sub-document matches, where "field" becomes "As.field") and
+// the set of fields whose hex-string values convert to ObjectIDs.
+type mongoRender struct {
+	qualifier string
+	oidFields map[string]bool
+}
+
+// key qualifies a field name for the current match context.
+func (rc mongoRender) key(field string) string {
+	if rc.qualifier == "" {
+		return field
+	}
+	return rc.qualifier + "." + field
+}
+
+// value converts a hex-string value to primitive.ObjectID for configured
+// reference fields (matched on the unqualified field name). Anything that is
+// not a valid ObjectID hex string passes through unchanged, so mistyped ids
+// simply match nothing instead of erroring.
+func (rc mongoRender) value(field string, v any) any {
+	if !rc.oidFields[field] {
+		return v
+	}
+	if s, ok := v.(string); ok {
+		if oid, err := primitive.ObjectIDFromHex(s); err == nil {
+			return oid
+		}
+	}
+	return v
+}
+
+// values renders an $in/$nin operand list. A nil slice must become a real
+// (possibly empty) array: nil marshals to BSON null and MongoDB rejects the
+// query at runtime ("$in needs an array"); an empty array is valid and matches
+// nothing ($in) / everything ($nin).
+func (rc mongoRender) values(field string, vals []any) []any {
+	if vals == nil {
+		return []any{}
+	}
+	if !rc.oidFields[field] {
+		return vals
+	}
+	out := make([]any, len(vals))
+	for i, v := range vals {
+		out[i] = rc.value(field, v)
+	}
+	return out
+}
+
+// mongoAdapterOf returns the MongoAdapter configured on the figo instance (via
+// Build or SetAdapterObject). A figo built with a different or nil adapter
+// gets the zero-value MongoAdapter defaults.
+func mongoAdapterOf(f figo.Figo) MongoAdapter {
+	if f != nil {
+		switch t := f.GetAdapterObject().(type) {
+		case MongoAdapter:
+			return t
+		case *MongoAdapter:
+			if t != nil {
+				return *t
+			}
+		}
+	}
+	return MongoAdapter{}
+}
+
 // Helper: convert a list of figo.Expr to a bson.M filter
-func buildMongoFilterFromExprs(exprs []figo.Expr) (bson.M, error) {
+func buildMongoFilterFromExprs(exprs []figo.Expr, rc mongoRender) (bson.M, error) {
 	if len(exprs) == 0 {
 		return bson.M{}, nil
 	}
 	// If multiple top-level expressions exist, combine with $and
-	parts, err := mongoOperands(exprs, "")
+	parts, err := mongoOperands(exprs, rc)
 	if err != nil {
 		return nil, err
 	}
@@ -132,40 +222,14 @@ func buildMongoFilterFromExprs(exprs []figo.Expr) (bson.M, error) {
 	return bson.M{"$and": parts}, nil
 }
 
-func buildMongoFilterFromExprsQualified(exprs []figo.Expr, qualifier string) (bson.M, error) {
-	if len(exprs) == 0 {
-		return bson.M{}, nil
-	}
-	parts, err := mongoOperands(exprs, qualifier)
-	if err != nil {
-		return nil, err
-	}
-	if len(parts) == 0 {
-		return bson.M{}, nil
-	}
-	if len(parts) == 1 {
-		return parts[0], nil
-	}
-	return bson.M{"$and": parts}, nil
-}
-
-// mongoOperands renders a set of operands, propagating the first error. An empty
-// qualifier selects the unqualified mongoExpr; a non-empty one qualifies fields.
-func mongoOperands(ops []figo.Expr, qualifier string) ([]bson.M, error) {
+// mongoOperands renders a set of operands, propagating the first error.
+func mongoOperands(ops []figo.Expr, rc mongoRender) ([]bson.M, error) {
 	var parts []bson.M
 	for _, op := range ops {
 		if op == nil {
 			continue
 		}
-		var (
-			m   bson.M
-			err error
-		)
-		if qualifier == "" {
-			m, err = mongoExpr(op)
-		} else {
-			m, err = mongoExprQualified(op, qualifier)
-		}
+		m, err := mongoExpr(op, rc)
 		if err != nil {
 			return nil, err
 		}
@@ -177,56 +241,89 @@ func mongoOperands(ops []figo.Expr, qualifier string) ([]bson.M, error) {
 }
 
 // Translate figo.Expr to MongoDB filter fragment
-func mongoExpr(e figo.Expr) (bson.M, error) {
+func mongoExpr(e figo.Expr, rc mongoRender) (bson.M, error) {
 	switch x := e.(type) {
 	case figo.EqExpr:
-		return bson.M{x.Field: x.Value}, nil
+		return bson.M{rc.key(x.Field): rc.value(x.Field, x.Value)}, nil
 	case figo.GteExpr:
-		return bson.M{x.Field: bson.M{"$gte": x.Value}}, nil
+		return bson.M{rc.key(x.Field): bson.M{"$gte": rc.value(x.Field, x.Value)}}, nil
 	case figo.GtExpr:
-		return bson.M{x.Field: bson.M{"$gt": x.Value}}, nil
+		return bson.M{rc.key(x.Field): bson.M{"$gt": rc.value(x.Field, x.Value)}}, nil
 	case figo.LtExpr:
-		return bson.M{x.Field: bson.M{"$lt": x.Value}}, nil
+		return bson.M{rc.key(x.Field): bson.M{"$lt": rc.value(x.Field, x.Value)}}, nil
 	case figo.LteExpr:
-		return bson.M{x.Field: bson.M{"$lte": x.Value}}, nil
+		return bson.M{rc.key(x.Field): bson.M{"$lte": rc.value(x.Field, x.Value)}}, nil
 	case figo.NeqExpr:
-		return bson.M{x.Field: bson.M{"$ne": x.Value}}, nil
+		return bson.M{rc.key(x.Field): bson.M{"$ne": rc.value(x.Field, x.Value)}}, nil
 	case figo.LikeExpr:
-		return bson.M{x.Field: primitive.Regex{Pattern: likeToRegexPattern(x.Value)}}, nil
+		return bson.M{rc.key(x.Field): primitive.Regex{Pattern: likeToRegexPattern(x.Value)}}, nil
 	case figo.RegexExpr:
 		re, ok := mongoRawRegex(x.Value)
 		if !ok {
 			return nil, fmt.Errorf("figo: invalid regex value %v for field %q", x.Value, x.Field)
 		}
-		return bson.M{x.Field: re}, nil
+		return bson.M{rc.key(x.Field): re}, nil
 	case figo.ILikeExpr:
-		return bson.M{x.Field: primitive.Regex{Pattern: likeToRegexPattern(x.Value), Options: "i"}}, nil
+		return bson.M{rc.key(x.Field): primitive.Regex{Pattern: likeToRegexPattern(x.Value), Options: "i"}}, nil
 	case figo.IsNullExpr:
 		// Match both explicit null and missing (SQL IS NULL semantics), not just
 		// missing as {$exists:false} would.
-		return bson.M{x.Field: nil}, nil
+		return bson.M{rc.key(x.Field): nil}, nil
 	case figo.NotNullExpr:
-		return bson.M{x.Field: bson.M{"$ne": nil}}, nil
+		return bson.M{rc.key(x.Field): bson.M{"$ne": nil}}, nil
 	case figo.InExpr:
-		return bson.M{x.Field: bson.M{"$in": nonNilValues(x.Values)}}, nil
+		return bson.M{rc.key(x.Field): bson.M{"$in": rc.values(x.Field, x.Values)}}, nil
 	case figo.NotInExpr:
-		return bson.M{x.Field: bson.M{"$nin": nonNilValues(x.Values)}}, nil
+		return bson.M{rc.key(x.Field): bson.M{"$nin": rc.values(x.Field, x.Values)}}, nil
 	case figo.BetweenExpr:
-		return bson.M{x.Field: bson.M{"$gte": x.Low, "$lte": x.High}}, nil
+		return bson.M{rc.key(x.Field): bson.M{"$gte": rc.value(x.Field, x.Low), "$lte": rc.value(x.Field, x.High)}}, nil
+	case figo.JsonPathExpr:
+		return mongoJSONPath(x, rc)
+	case figo.ArrayContainsExpr:
+		if len(x.Values) == 0 {
+			// Requiring no elements is vacuously true. Mongo's {$all: []} matches
+			// NOTHING, so an empty predicate is the correct rendering.
+			return bson.M{}, nil
+		}
+		return bson.M{rc.key(x.Field): bson.M{"$all": rc.values(x.Field, x.Values)}}, nil
+	case figo.ArrayOverlapsExpr:
+		// intersect-ANY: the array field shares at least one element with Values.
+		return bson.M{rc.key(x.Field): bson.M{"$in": rc.values(x.Field, x.Values)}}, nil
+	case figo.FullTextSearchExpr:
+		// $text is only legal at the top level of a query; inside a $lookup
+		// match it would produce a pipeline MongoDB rejects at runtime.
+		if rc.qualifier != "" {
+			return nil, fmt.Errorf("figo: full-text search ($text) is not supported inside the %q preload match for the MongoDB adapter", rc.qualifier)
+		}
+		txt := bson.M{"$search": x.Query}
+		if x.Language != "" {
+			txt["$language"] = x.Language
+		}
+		return bson.M{"$text": txt}, nil
+	case figo.GeoDistanceExpr:
+		km, err := geoDistanceKm(x.Distance, x.Unit)
+		if err != nil {
+			return nil, err
+		}
+		// $centerSphere takes [lng, lat] (longitude FIRST) and a radius in
+		// radians (distance / Earth radius).
+		return bson.M{rc.key(x.Field): bson.M{"$geoWithin": bson.M{
+			"$centerSphere": []any{[]float64{x.Longitude, x.Latitude}, km / earthRadiusKm},
+		}}}, nil
 	case figo.AndExpr:
-		parts, err := mongoOperands(x.Operands, "")
+		parts, err := mongoOperands(x.Operands, rc)
 		if err != nil {
 			return nil, err
 		}
 		return logicalBSON("$and", parts), nil
 	case figo.OrExpr:
-		parts, err := mongoOperands(x.Operands, "")
+		parts, err := mongoOperands(x.Operands, rc)
 		if err != nil {
 			return nil, err
 		}
 		return logicalBSON("$or", parts), nil
 	case figo.NotExpr:
-		parts, err := mongoOperands(x.Operands, "")
+		parts, err := mongoOperands(x.Operands, rc)
 		if err != nil {
 			return nil, err
 		}
@@ -238,19 +335,34 @@ func mongoExpr(e figo.Expr) (bson.M, error) {
 	}
 }
 
-// logicalBSON wraps rendered operands under a logical operator, avoiding an
-// invalid "{$and: null}" (Mongo rejects an empty/nil operand array).
-// nonNilValues guarantees $in/$nin receive a real (possibly empty) array. A
-// nil slice marshals to BSON null and MongoDB rejects the query at runtime
-// ("$in needs an array"); an empty array is valid and matches nothing
-// ($in) / everything ($nin).
-func nonNilValues(values []any) []any {
-	if values == nil {
-		return []any{}
+// mongoJSONPath renders a JSON path predicate as a dotted-path match: Mongo
+// addresses nested documents natively, so path $.user.name on field "data"
+// becomes "data.user.name".
+func mongoJSONPath(x figo.JsonPathExpr, rc mongoRender) (bson.M, error) {
+	path := rc.key(x.Field) + "." + strings.TrimPrefix(x.Path, "$.")
+	switch x.Op {
+	case "", "=", "==", "contains":
+		// Mongo equality already has contains semantics on array fields.
+		return bson.M{path: x.Value}, nil
+	case "!=":
+		return bson.M{path: bson.M{"$ne": x.Value}}, nil
+	case ">":
+		return bson.M{path: bson.M{"$gt": x.Value}}, nil
+	case ">=":
+		return bson.M{path: bson.M{"$gte": x.Value}}, nil
+	case "<":
+		return bson.M{path: bson.M{"$lt": x.Value}}, nil
+	case "<=":
+		return bson.M{path: bson.M{"$lte": x.Value}}, nil
+	case "exists":
+		return bson.M{path: bson.M{"$exists": true}}, nil
+	default:
+		return nil, fmt.Errorf("figo: unsupported JSON path op %q for the MongoDB adapter", x.Op)
 	}
-	return values
 }
 
+// logicalBSON wraps rendered operands under a logical operator, avoiding an
+// invalid "{$and: null}" (Mongo rejects an empty/nil operand array).
 func logicalBSON(op string, parts []bson.M) bson.M {
 	if len(parts) == 0 {
 		// Empty $or is a false disjunction and must match NOTHING; returning {}
@@ -264,66 +376,6 @@ func logicalBSON(op string, parts []bson.M) bson.M {
 		return bson.M{}
 	}
 	return bson.M{op: parts}
-}
-
-func mongoExprQualified(e figo.Expr, qualifier string) (bson.M, error) {
-	q := func(field string) string { return qualifier + "." + field }
-	switch x := e.(type) {
-	case figo.EqExpr:
-		return bson.M{q(x.Field): x.Value}, nil
-	case figo.GteExpr:
-		return bson.M{q(x.Field): bson.M{"$gte": x.Value}}, nil
-	case figo.GtExpr:
-		return bson.M{q(x.Field): bson.M{"$gt": x.Value}}, nil
-	case figo.LtExpr:
-		return bson.M{q(x.Field): bson.M{"$lt": x.Value}}, nil
-	case figo.LteExpr:
-		return bson.M{q(x.Field): bson.M{"$lte": x.Value}}, nil
-	case figo.NeqExpr:
-		return bson.M{q(x.Field): bson.M{"$ne": x.Value}}, nil
-	case figo.LikeExpr:
-		return bson.M{q(x.Field): primitive.Regex{Pattern: likeToRegexPattern(x.Value)}}, nil
-	case figo.RegexExpr:
-		re, ok := mongoRawRegex(x.Value)
-		if !ok {
-			return nil, fmt.Errorf("figo: invalid regex value %v for field %q", x.Value, x.Field)
-		}
-		return bson.M{q(x.Field): re}, nil
-	case figo.ILikeExpr:
-		return bson.M{q(x.Field): primitive.Regex{Pattern: likeToRegexPattern(x.Value), Options: "i"}}, nil
-	case figo.IsNullExpr:
-		return bson.M{q(x.Field): nil}, nil
-	case figo.NotNullExpr:
-		return bson.M{q(x.Field): bson.M{"$ne": nil}}, nil
-	case figo.InExpr:
-		return bson.M{q(x.Field): bson.M{"$in": nonNilValues(x.Values)}}, nil
-	case figo.NotInExpr:
-		return bson.M{q(x.Field): bson.M{"$nin": nonNilValues(x.Values)}}, nil
-	case figo.BetweenExpr:
-		return bson.M{q(x.Field): bson.M{"$gte": x.Low, "$lte": x.High}}, nil
-	case figo.AndExpr:
-		parts, err := mongoOperands(x.Operands, qualifier)
-		if err != nil {
-			return nil, err
-		}
-		return logicalBSON("$and", parts), nil
-	case figo.OrExpr:
-		parts, err := mongoOperands(x.Operands, qualifier)
-		if err != nil {
-			return nil, err
-		}
-		return logicalBSON("$or", parts), nil
-	case figo.NotExpr:
-		parts, err := mongoOperands(x.Operands, qualifier)
-		if err != nil {
-			return nil, err
-		}
-		return logicalBSON("$nor", parts), nil
-	case figo.OrderBy:
-		return bson.M{}, nil
-	default:
-		return nil, fmt.Errorf("figo: unsupported expression type %T for the MongoDB adapter", e)
-	}
 }
 
 // likeToRegexPattern converts a SQL LIKE pattern into an anchored regex pattern
@@ -392,8 +444,35 @@ func AdapterMongoGetAggregate(f figo.Figo, joins map[string]MongoJoin) (mongo.Pi
 	return pipeline, opts, nil
 }
 
-// MongoAdapter exists for interface parity; it doesn't render SQL strings.
-type MongoAdapter struct{}
+// MongoAdapter renders figo queries as MongoDB filters and pipelines; it
+// doesn't render SQL strings.
+//
+// ObjectIDFields lists the fields whose valid 24-character hex string values
+// are converted to primitive.ObjectID at render time — without it, the common
+// DSL lookup `_id="507f..."` compares a string against real ObjectIDs and
+// never matches. nil (the zero value) converts just "_id"; an explicit empty
+// slice disables conversion entirely.
+type MongoAdapter struct {
+	ObjectIDFields []string
+}
+
+// objectIDFieldSet resolves the ObjectIDFields config into a lookup set,
+// applying the nil-means-default-"_id" rule.
+func (a MongoAdapter) objectIDFieldSet() map[string]bool {
+	if a.ObjectIDFields == nil {
+		return map[string]bool{"_id": true}
+	}
+	set := make(map[string]bool, len(a.ObjectIDFields))
+	for _, f := range a.ObjectIDFields {
+		set[f] = true
+	}
+	return set
+}
+
+// render builds the rendering context for this adapter's configuration.
+func (a MongoAdapter) render(qualifier string) mongoRender {
+	return mongoRender{qualifier: qualifier, oidFields: a.objectIDFieldSet()}
+}
 
 func (MongoAdapter) GetSqlString(f figo.Figo, ctx any, conditionType ...string) (string, bool) {
 	// Mongo adapter doesn't produce SQL strings; return false
@@ -420,7 +499,7 @@ type MongoAggregateQuery struct {
 
 func (MongoAggregateQuery) IsQuery() {}
 
-func (MongoAdapter) GetQuery(f figo.Figo, ctx any, conditionType ...string) (figo.Query, bool) {
+func (a MongoAdapter) GetQuery(f figo.Figo, ctx any, conditionType ...string) (figo.Query, bool) {
 	if f == nil {
 		return nil, false
 	}
@@ -438,17 +517,19 @@ func (MongoAdapter) GetQuery(f figo.Figo, ctx any, conditionType ...string) (fig
 		if j, ok := ctx.(map[string]MongoJoin); ok {
 			joins = j
 		}
-		pipe, opts, err := AdapterMongoGetAggregate(f, joins)
+		// Render with the receiver's configuration, so a directly-invoked
+		// adapter wins over whatever f has stored.
+		pipe, err := mongoAggregatePipeline(f, joins, a)
 		if err != nil {
 			// An unsupported expression must not be silently dropped — fail the
 			// query build rather than returning a partial pipeline.
 			return nil, false
 		}
-		return MongoAggregateQuery{Pipeline: pipe, Options: opts}, true
+		return MongoAggregateQuery{Pipeline: pipe, Options: options.Aggregate()}, true
 	}
-	filter, opts, err := AdapterMongoGetFind(f)
+	filter, err := buildMongoFilterFromExprs(f.GetClauses(), a.render(""))
 	if err != nil {
 		return nil, false
 	}
-	return MongoFindQuery{Filter: filter, Options: opts}, true
+	return MongoFindQuery{Filter: filter, Options: BuildMongoFindOptions(f)}, true
 }

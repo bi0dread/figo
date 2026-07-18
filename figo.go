@@ -43,14 +43,19 @@ type NamingFunc func(field string) string
 
 // SnakeCaseNaming is the default NamingFunc: userName -> user_name.
 var SnakeCaseNaming NamingFunc = func(field string) string {
+	// stringy drops leading underscores ("_id" -> "id"), which would silently
+	// break fields like Mongo's canonical _id — split them off and restore
+	// them after conversion.
+	trimmed := strings.TrimLeft(field, "_")
+	prefix := field[:len(field)-len(trimmed)]
 	// Use stringy to convert to snake_case, but handle edge cases: if stringy
 	// returns an empty string, fall back to the original name rather than
 	// silently dropping the column.
-	result := stringy.New(field).SnakeCase("?", "").ToLower()
+	result := stringy.New(trimmed).SnakeCase("?", "").ToLower()
 	if result == "" {
 		return field
 	}
-	return result
+	return prefix + result
 }
 
 // NoChangeNaming leaves field names exactly as written in the DSL.

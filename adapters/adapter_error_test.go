@@ -8,9 +8,10 @@ import (
 	"github.com/stretchr/testify/assert"
 )
 
-// A representative expression type neither the Mongo nor ES adapter implements.
+// A representative expression type neither the Mongo nor ES adapter implements
+// (CustomExpr handlers emit SQL fragments, which have no document-store form).
 func unsupportedExpr() Expr {
-	return GeoDistanceExpr{Field: "loc", Latitude: 1, Longitude: 2, Distance: 5, Unit: "km"}
+	return CustomExpr{Field: "loc", Operator: "custom_op", Value: 5}
 }
 
 // #4: an unsupported/advanced expression must fail loudly, never be silently

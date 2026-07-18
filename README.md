@@ -905,9 +905,15 @@ Runnable usage examples live in [examples/example_usage.go](examples/example_usa
 
 Fully wired end-to-end: the DSL and all operators above, the four adapters (raw SQL with MySQL/PostgreSQL/SQLite dialects), select-field control, naming funcs, pagination/sort/preloads, the `Explain`/`Clone`/`Walk` AST tools, the full plugin hook surface (parse, expression-filter, clause-finalizer, and query hooks), and the eight built-in plugins: `SyntaxPlugin` (validation & repair), `FieldsPlugin` (ignore/whitelist), `LimitsPlugin` (complexity limits), `ValidationPlugin` (value rules), `ScopePlugin` (mandatory filters), `CachePlugin`, `MetricsPlugin`, and `AuditPlugin`.
 
+Advanced expression types (programmatic `AddFilter` only — no DSL syntax) render on the document-store adapters:
+
+- **MongoDB**: `JsonPathExpr` → dotted-path match (`data.user.name`), `ArrayContainsExpr` → `$all`, `ArrayOverlapsExpr` → `$in`, `FullTextSearchExpr` → `$text`/`$search` (top-level only; rejected inside preload matches), `GeoDistanceExpr` → `$geoWithin`/`$centerSphere` with km/m/mi unit conversion to radians. The adapter also converts valid hex-string values to `primitive.ObjectID` on `_id` by default — configure with `MongoAdapter{ObjectIDFields: []string{"_id", "user_id"}}` (an explicit empty slice disables it).
+- **Elasticsearch**: `JsonPathExpr` → dotted-field `term`/`range`/`exists`, `ArrayContainsExpr` → `bool.must` of per-value `term`s, `ArrayOverlapsExpr` → `terms`, `FullTextSearchExpr` → `match` (or `multi_match` when no field is set; `Language` becomes the analyzer), `GeoDistanceExpr` → `geo_distance` with km/m/mi units.
+
 Partial / not yet wired (defined in the API but not auto-invoked or without adapter support):
 
-- Advanced expression types (`JsonPathExpr`, `ArrayContainsExpr`, `ArrayOverlapsExpr`, `FullTextSearchExpr`, `GeoDistanceExpr`, `CustomExpr`) — defined for programmatic `AddFilter`, but adapters return an "unsupported expression" error for them rather than rendering.
+- Advanced expression types on the **SQL adapters** (raw SQL and GORM) — these still return an "unsupported expression" error rather than rendering.
+- `CustomExpr` — its handler emits SQL fragments, so the Mongo and Elasticsearch adapters reject it with an "unsupported expression" error.
 
 ## Contributing
 

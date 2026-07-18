@@ -5,6 +5,7 @@ import (
 
 	"encoding/json"
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -248,6 +249,68 @@ func buildElasticsearchQueryFromExpr(expr figo.Expr) (map[string]interface{}, er
 				x.Field: map[string]interface{}{"gte": x.Low, "lte": x.High},
 			},
 		}, nil
+	case figo.JsonPathExpr:
+		return esJSONPath(x)
+	case figo.ArrayContainsExpr:
+		// contains-ALL: every value must be present, so it needs one term per
+		// value ANDed together — a single `terms` query would be any-match.
+		if len(x.Values) == 0 {
+			// Requiring no elements is vacuously true.
+			return map[string]interface{}{
+				"match_all": map[string]interface{}{},
+			}, nil
+		}
+		must := make([]map[string]interface{}, 0, len(x.Values))
+		for _, v := range x.Values {
+			must = append(must, map[string]interface{}{
+				"term": map[string]interface{}{x.Field: v},
+			})
+		}
+		return map[string]interface{}{
+			"bool": map[string]interface{}{"must": must},
+		}, nil
+	case figo.ArrayOverlapsExpr:
+		// intersect-ANY is exactly ES's terms query.
+		if len(x.Values) == 0 {
+			// Nothing can intersect an empty set — and a nil slice would
+			// marshal to "terms": {field: null}, which ES rejects.
+			return map[string]interface{}{
+				"match_none": map[string]interface{}{},
+			}, nil
+		}
+		return map[string]interface{}{
+			"terms": map[string]interface{}{x.Field: x.Values},
+		}, nil
+	case figo.FullTextSearchExpr:
+		if x.Field == "" {
+			// No target field: search across all fields via multi_match.
+			return map[string]interface{}{
+				"multi_match": map[string]interface{}{"query": x.Query},
+			}, nil
+		}
+		body := map[string]interface{}{"query": x.Query}
+		if x.Language != "" {
+			// The closest ES analogue of Mongo's $text $language is a
+			// language analyzer on the match query.
+			body["analyzer"] = x.Language
+		}
+		return map[string]interface{}{
+			"match": map[string]interface{}{x.Field: body},
+		}, nil
+	case figo.GeoDistanceExpr:
+		unit, err := esGeoUnit(x.Unit)
+		if err != nil {
+			return nil, err
+		}
+		return map[string]interface{}{
+			"geo_distance": map[string]interface{}{
+				"distance": strconv.FormatFloat(x.Distance, 'f', -1, 64) + unit,
+				x.Field: map[string]interface{}{
+					"lat": x.Latitude,
+					"lon": x.Longitude,
+				},
+			},
+		}, nil
 	case figo.AndExpr:
 		must := []map[string]interface{}{}
 		for _, op := range x.Operands {
@@ -313,6 +376,66 @@ func buildElasticsearchQueryFromExpr(expr figo.Expr) (map[string]interface{}, er
 		}, nil
 	default:
 		return nil, fmt.Errorf("figo: unsupported expression type %T for the Elasticsearch adapter", expr)
+	}
+}
+
+// esJSONPath renders a JSON path predicate against the dotted field ES uses
+// for nested object properties: path $.user.name on field "data" queries
+// "data.user.name".
+func esJSONPath(x figo.JsonPathExpr) (map[string]interface{}, error) {
+	field := x.Field + "." + strings.TrimPrefix(x.Path, "$.")
+	switch x.Op {
+	case "", "=", "==", "contains":
+		// ES term queries already match individual elements of array fields,
+		// which covers "contains".
+		return map[string]interface{}{
+			"term": map[string]interface{}{field: x.Value},
+		}, nil
+	case "!=":
+		return map[string]interface{}{
+			"bool": map[string]interface{}{
+				"must_not": map[string]interface{}{
+					"term": map[string]interface{}{field: x.Value},
+				},
+			},
+		}, nil
+	case ">":
+		return map[string]interface{}{
+			"range": map[string]interface{}{field: map[string]interface{}{"gt": x.Value}},
+		}, nil
+	case ">=":
+		return map[string]interface{}{
+			"range": map[string]interface{}{field: map[string]interface{}{"gte": x.Value}},
+		}, nil
+	case "<":
+		return map[string]interface{}{
+			"range": map[string]interface{}{field: map[string]interface{}{"lt": x.Value}},
+		}, nil
+	case "<=":
+		return map[string]interface{}{
+			"range": map[string]interface{}{field: map[string]interface{}{"lte": x.Value}},
+		}, nil
+	case "exists":
+		return map[string]interface{}{
+			"exists": map[string]interface{}{"field": field},
+		}, nil
+	default:
+		return nil, fmt.Errorf("figo: unsupported JSON path op %q for the Elasticsearch adapter", x.Op)
+	}
+}
+
+// esGeoUnit maps a GeoDistanceExpr unit to Elasticsearch's distance suffix.
+// An empty unit defaults to kilometers, matching the Mongo adapter.
+func esGeoUnit(unit string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(unit)) {
+	case "", "km", "kilometers":
+		return "km", nil
+	case "m", "meters":
+		return "m", nil
+	case "mi", "miles":
+		return "mi", nil
+	default:
+		return "", fmt.Errorf("figo: unsupported geo distance unit %q for the Elasticsearch adapter", unit)
 	}
 }
 
