@@ -1,5 +1,7 @@
 # figo playground
 
+**Live demo: <https://bi0dread.github.io/figo/>**
+
 An interactive, drag-and-drop demo of the [figo](https://github.com/bi0dread/figo) DSL, built
 with [React Flow](https://reactflow.dev/). Drag operation blocks onto the canvas, wire them
 into the **Query** node, and the resulting DSL string is generated live.
