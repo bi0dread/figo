@@ -30,79 +30,27 @@ import (
 )
 ```
 
-## What's new in v4 (migrating from v3)
+## Design highlights
 
-v4 is a re-architecture around a small core and an explicit plugin system. The parse → build → render flow is unchanged, but construction, rendering entry points, and every policy feature moved. Skim the bullets for the APIs you use.
+- **Small core, explicit subpackages.** The root package is just parse → build → render plus the plugin SPI; the four adapters and the eight built-in plugins live in the `adapters` and `plugins` subpackages. Custom adapters and plugins build on the same exported interfaces (`Adapter`, `Query` with its exported `IsQuery()` marker, `Plugin`, `ExprFilter`, `ClauseFinalizer`), so third-party backends and policies are first-class.
 
-### Breaking changes
-
-- **Breaking: `New()` no longer takes an adapter.** The adapter now belongs to the render step, not construction — pass it to `Build(adapter)` (or set it with `SetAdapterObject`). This lets one parsed instance be rebuilt against different backends.
+- **The adapter belongs to the render step, not construction.** `figo.New()` takes no arguments; pass the adapter to `Build(adapter)` (or set it earlier with `SetAdapterObject`). One parsed instance can be rebuilt against different backends; `Build(nil)` rebuilds in place with the adapter already set.
 
   ```go
-  // v3
-  f := figo.New(figo.GormAdapter{})
-  f.AddFiltersFromString(`status="active"`)
-  f.Build()
-
-  // v4
   f := figo.New()
   f.AddFiltersFromString(`status="active"`)
   f.Build(adapters.GormAdapter{})
   ```
 
-- **Breaking: `Build` takes exactly one adapter, not a variadic.** The signature is now `Build(adapter Adapter)`. Passing a non-nil adapter selects it; pass `Build(nil)` to rebuild while keeping the adapter set by an earlier `Build`/`SetAdapterObject` (this replaces the old no-argument `Build()`).
+- **Policy is opt-in, per instance.** Nothing polices your queries until you register the plugin for it — `f.RegisterPlugin(plugins.NewFieldsPlugin())` and friends. Field ignore-lists/whitelists (`FieldsPlugin`), complexity limits (`LimitsPlugin`), value validation (`ValidationPlugin`), strict syntax checking or repair (`SyntaxPlugin`), mandatory multi-tenant scopes (`ScopePlugin`), caching (`CachePlugin`), metrics (`MetricsPlugin`), and audit logging (`AuditPlugin`) are all plugins; without registration, no pruning or enforcement happens. Each has a dedicated section below.
 
-  ```go
-  // v3 / early v4: variadic, no-arg rebuild kept the previous adapter
-  f.Build()
+- **Plugin hooks fire automatically.** `BeforeQuery`/`AfterQuery` wrap every `GetSqlString`/`GetQuery` render (a hook error vetoes the render), `ExprFilter` prunes DSL and programmatic filters alike, and `FinalizeClauses` runs on every `Build` — the mechanism behind mandatory scopes.
 
-  // v4: single adapter; use nil to rebuild in place
-  f.Build(nil)
-  ```
+- **Dialect-aware raw SQL.** `RawAdapter{Dialect: adapters.PostgresDialect}` renders `"col"` identifiers, `$1..$N` placeholders, and the `~` regex operator; `adapters.SQLiteDialect` renders `"col"` with `?`; the zero value renders MySQL (backticks, `?`, `REGEXP`). String-literal escaping is per-dialect too (backslash doubling only on MySQL). The GORM adapter's regex operator is configured separately via `SetRegexSQLOperator`.
 
-- **Breaking: the core validation manager is now a plugin.** `NewValidationManager`, `SetValidationManager`, `GetValidationManager`, `AddValidationRule`, `RegisterValidator` and `ValidateField` are removed from `Figo`. Use `NewValidationPlugin()` + `f.RegisterPlugin(vp)` instead — see [Validation](#validation). Rules, validators, and the built-ins (`required`, `min_length`, `email`) are unchanged.
+- **Naming is one function.** Every field name passes through a single `NamingFunc`: `figo.SnakeCaseNaming` by default (leading underscores preserved, so `_id` stays `_id`), `figo.NoChangeNaming` to keep DSL names as written, or your own via `SetNamingFunc`. `figo.ParseValue` is the package-level literal typer the DSL uses for values.
 
-- **Breaking: query caching is now a plugin.** `SetCache`, `GetCache`, `SetCacheConfig`, `GetCacheConfig`, `GetCacheStats`, `ClearCache`, `GetCachedSqlString` and `GetCachedQuery` are removed from `Figo`. Use `NewCachePlugin(config)` and render through it: `cp.GetCachedSqlString(f, ctx)` — see [Caching](#caching). `QueryCache`, `CacheConfig`, `CacheStats` and `NewInMemoryCache` are unchanged, and one plugin can now serve many instances.
-
-- **Breaking: performance monitoring is now a plugin.** `SetPerformanceMonitor`, `GetPerformanceMonitor`, `GetMetrics` and `ResetMetrics` are removed from `Figo`. Use `NewMetricsPlugin(true)` (or a bare `NewPerformanceMonitor`) and attach it to the cache plugin: `cp.SetPerformanceMonitor(mp.PerformanceMonitor)` — see [Performance monitoring](#performance-monitoring). `PerformanceMonitor` and `Metrics` themselves are unchanged.
-
-- **Breaking: field policy (ignore list & whitelist) is now a plugin.** `AddIgnoreFields`, `SetAllowedFields`, `EnableFieldWhitelist`, `DisableFieldWhitelist`, `IsFieldAllowed`, `GetIgnoreFields`, `GetAllowedFields` and `IsFieldWhitelistEnabled` are removed from `Figo`. Use `NewFieldsPlugin()` + `f.RegisterPlugin(fp)` — see [Field safety](#field-safety-ignore-lists--whitelist). Enforcement is unchanged (Build and AddFilter, DSL and programmatic filters alike) via the new `ExprFilter` plugin hook, which custom plugins can implement too. `AddSelectFields` / `GetSelectFields` stay on the instance. **Note:** without a registered `FieldsPlugin`, no ignore/whitelist pruning happens.
-
-- **Breaking: query limits are now a plugin — and actually enforced.** `SetQueryLimits` / `GetQueryLimits` are removed from `Figo` (they stored limits that were never checked). `NewLimitsPlugin(plugins.DefaultQueryLimits())` + `f.RegisterPlugin(lp)` now really enforces nesting/field/parameter/expression limits on every parsed DSL — see [Query complexity limits](#query-complexity-limits).
-
-- **Breaking: naming is a single `NamingFunc` — the strategy enum is gone.** `NamingStrategy`, `NAMING_STRATEGY_*`, `SetNamingStrategy` and `GetNamingStrategy` are removed. The built-ins are now `NamingFunc` values: `figo.SnakeCaseNaming` (still the default) and `figo.NoChangeNaming` — set them with the existing `SetNamingFunc`. `SetNamingFunc(nil)` resets to the default; `GetNamingFunc()` never returns nil.
-
-- **Breaking: `ParseFieldsValue` is now the package-level `figo.ParseValue`.** The method never used any instance state — it's the DSL's literal typer. Replace `f.ParseFieldsValue(s)` with `figo.ParseValue(s)`; the typing rules are identical.
-
-- **Breaking: `AddFiltersFromStringWithRepair` is now the `SyntaxPlugin`.** The method is removed from `Figo`; register `plugins.NewSyntaxPlugin(false)` (validate strictly) or `plugins.NewSyntaxPlugin(true)` (attempt repair first) and use plain `AddFiltersFromString` — see [Input validation & repair](#input-validation--repair). Same checks, same `*ParseError` (now wrapped, so match with `errors.As`).
-
-- **Breaking: `GetExplainedSqlString` is removed.** It was a byte-for-byte duplicate of `GetSqlString` — call that instead (identical output). For a human-readable view of the parsed AST, use `Explain()`.
-
-- **Breaking: batch processing is removed.** `BatchOperation`, `BatchResult`, `BatchProcessor` and `NewInMemoryBatchProcessor` are gone. Rendering a query string is fast, synchronous CPU work — if you need to render many queries concurrently, a few lines of `errgroup`/goroutines over `f.GetSqlString(ctx)` replace the whole feature with better types and real context cancellation.
-
-- **Breaking: the adapters live in the `adapters` subpackage.** `RawAdapter`, `GormAdapter`, `MongoAdapter`, `ElasticsearchAdapter` — plus their helpers and types (`BuildRawWhere`, `BuildRawSelect`, `RawContext`, `BuildMongoFilter`, `MongoJoin`, `BuildElasticsearchQuery`, the `SQLDialect`s, …) — moved from the root package to `github.com/bi0dread/figo/v4/adapters`. The `Adapter` interface, `Query`, and `SQLQuery` stay in the core. As part of this, the `Query` marker method is now exported (`IsQuery()`), which also makes custom third-party `Query` result types possible for the first time. Migration is an import + prefix change: `f.Build(adapters.GormAdapter{})`.
-
-- **Breaking: the built-in plugins live in the `plugins` subpackage.** `ValidationPlugin`, `CachePlugin`, `MetricsPlugin`, `FieldsPlugin`, `LimitsPlugin`, `SyntaxPlugin`, `ScopePlugin`, `AuditPlugin` — plus their types (`ValidationRule`, `CacheConfig`, `QueryLimits`, `PerformanceMonitor`, `InMemoryCache`, …) — moved from the root package to `github.com/bi0dread/figo/v4/plugins`. The plugin *SPI* (`Plugin`, `PluginManager`, `ExprFilter`, `ClauseFinalizer`, `RegisterPlugin`) stays in the core, so custom plugins are unaffected. Migration is an import + prefix change:
-
-  ```go
-  import "github.com/bi0dread/figo/v4/plugins"
-
-  fp := plugins.NewFieldsPlugin() // was: figo.NewFieldsPlugin()
-  f.RegisterPlugin(fp)
-  ```
-
-### New in v4
-
-- **New: `ScopePlugin` and `AuditPlugin`.** Mandatory query scoping (multi-tenant row security, via the new `FinalizeClauses` plugin hook that runs on every Build) and parse/render audit logging — see [Mandatory scopes](#mandatory-scopes-multi-tenant) and [Auditing](#auditing).
-
-- **New: `RawAdapter` is dialect-aware.** `RawAdapter{Dialect: adapters.PostgresDialect}` renders `"col"` identifiers, `$1..$N` placeholders, and the `~` regex operator; `adapters.SQLiteDialect` renders `"col"` with `?`; the zero value keeps the MySQL rendering (backticks, `?`, `REGEXP`) unchanged. String-literal escaping is per-dialect too (backslash doubling only on MySQL). **Behavior note:** the raw adapter's regex operator now comes from the dialect — `SetRegexSQLOperator` only affects the GORM adapter.
-
-- **New: `BeforeQuery` / `AfterQuery` plugin hooks are now auto-invoked** around every `GetSqlString` / `GetQuery` render (previously they existed on the interface but never fired). A hook error vetoes the render — if you have a plugin whose `BeforeQuery` returns errors, it now actually blocks queries.
-
-- **New: `Walk`** — traverse and rewrite the built AST (see [Inspecting & transforming the AST](#inspecting--transforming-the-ast)).
-- **40+ bug fixes** from two deep audits: quote-aware parser tokenizing, exact keyword matching, LIKE/regex translation on Mongo/ES, empty-`<in>` filter-bypass, SQL-injection hardening on identifiers, cache races/LRU/expiry, deterministic SQL output, and Mongo/ES now **error** on unsupported expressions instead of silently dropping them.
-
-Import path changes to `github.com/bi0dread/figo/v4`. The parse/build/render core (`AddFiltersFromString`, `AddFilter`, `Build`, `GetSqlString`, `GetQuery`, paging/sort/selects, `Explain`/`Clone`/`Walk`) is source-compatible with late v3 apart from the bullets above; everything that moved to a plugin needs the one-line registration shown in its section.
+- **Fail-loud rendering.** An expression an adapter can't render is an error, never a silently dropped condition (which would return too many rows — or on a search index, everything). Identifiers are hardened against SQL injection, rendered SQL is deterministic, and empty `<in>` sets can't bypass filters.
 
 ## Table of contents
 
@@ -915,13 +863,6 @@ Partial / not yet wired (defined in the API but not auto-invoked or without adap
 - Advanced expression types on the **SQL adapters** (raw SQL and GORM) — these still return an "unsupported expression" error rather than rendering.
 - `CustomExpr` — its handler emits SQL fragments, so the Mongo and Elasticsearch adapters reject it with an "unsupported expression" error.
 
-## Contributing
-
-Pull requests welcome:
-
-1. Branch off `main` (don't PR against `main` directly from `main`).
-2. Include tests covering your change; keep `go test -race ./...` green.
-3. Update this README when you change behavior or the API.
 
 ## License
 
