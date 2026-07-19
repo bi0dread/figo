@@ -47,3 +47,21 @@ func TestAdapterCanBeSetOnBuild(t *testing.T) {
 		assert.Len(t, f.GetClauses(), 1)
 	})
 }
+
+// GetSort must return a copy (as GetClauses/GetPreloads do) — the internal
+// pointer would let a caller mutate the sort columns while adapters render on
+// other goroutines.
+func TestGetSortReturnsIndependentCopy(t *testing.T) {
+	f := New()
+	f.AddFiltersFromString(`id=1 sort=id:desc`)
+	f.Build(RawAdapter{})
+
+	s := f.GetSort()
+	assert.NotNil(t, s)
+	s.Columns[0].Name = "mutated"
+	s.Columns[0].Desc = false
+
+	fresh := f.GetSort()
+	assert.Equal(t, "id", fresh.Columns[0].Name)
+	assert.True(t, fresh.Columns[0].Desc)
+}

@@ -1664,7 +1664,10 @@ func (f *figo) GetPage() Page {
 func (f *figo) GetSort() *OrderBy {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
-	return f.sort
+	// Return a copy (as GetClauses/GetPreloads do): handing out the internal
+	// pointer would let a caller mutate the sort columns while adapters render
+	// on other goroutines.
+	return cloneOrderBy(f.sort)
 }
 
 func (f *figo) SetPage(skip, take int) {

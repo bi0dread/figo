@@ -105,10 +105,13 @@ func BuildElasticsearchQuery(f figo.Figo) (ElasticsearchQuery, error) {
 		}
 	}
 
-	// Handle field selection
-	if len(f.GetSelectFields()) > 0 {
-		for field := range f.GetSelectFields() {
-			query.Source = append(query.Source, field)
+	// Handle field selection. Names go through the instance's naming func —
+	// the raw/GORM/Mongo adapters all do this, so skipping it here made the
+	// same AddSelectFields project different fields on ES. Keys are sorted so
+	// the rendered _source list is deterministic, not map-iteration order.
+	if sel := f.GetSelectFields(); len(sel) > 0 {
+		for _, field := range sortedKeys(sel) {
+			query.Source = append(query.Source, normalizeColumnName(f, field))
 		}
 	}
 

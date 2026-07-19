@@ -341,8 +341,11 @@ func validateBasicSyntax(expr string) error {
 		{`!=\s*$`, "incomplete not equal expression", "Add value after !="},
 		{`>=\s*$`, "incomplete greater than or equal expression", "Add value after >="},
 		{`<=\s*$`, "incomplete less than or equal expression", "Add value after <="},
-		{`=^\s*$`, "incomplete LIKE expression", "Add value after =^"},
-		{`!=^\s*$`, "incomplete NOT LIKE expression", "Add value after !=^"},
+		// The '^' must be escaped: unescaped it is a start-of-text anchor, so
+		// `=^\s*$` could never match and a trailing LIKE operator slipped
+		// through validation.
+		{`=\^\s*$`, "incomplete LIKE expression", "Add value after =^"},
+		{`!=\^\s*$`, "incomplete NOT LIKE expression", "Add value after !=^"},
 		{`=~\s*$`, "incomplete regex expression", "Add value after =~"},
 		{`!=~\s*$`, "incomplete NOT regex expression", "Add value after !=~"},
 		{`<in>\s*$`, "incomplete IN expression", "Add value list after <in>"},

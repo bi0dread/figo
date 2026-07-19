@@ -125,3 +125,17 @@ func TestGormTakeZeroMeansNoLimit(t *testing.T) {
 	sql := f.GetSqlString(db.Model(&gormRegModel{}))
 	assert.NotContains(t, sql, "LIMIT 0", "take=0 must not become LIMIT 0: %s", sql)
 }
+
+// AddSelectFields names must go through the instance's naming func on the
+// Elasticsearch adapter exactly as they do on the raw/GORM/Mongo adapters
+// (skipping it projected userName on ES but user_name everywhere else), and
+// the rendered _source list must be deterministic, not map-iteration order.
+func TestElasticsearchSourceNormalizedAndDeterministic(t *testing.T) {
+	f := New()
+	f.AddSelectFields("userName", "createdAt", "id")
+	f.Build(ElasticsearchAdapter{})
+
+	q, err := BuildElasticsearchQuery(f)
+	require.NoError(t, err)
+	assert.Equal(t, []string{"created_at", "id", "user_name"}, q.Source)
+}
