@@ -133,8 +133,10 @@ func (p *FieldsPlugin) IsFieldAllowed(field string) bool {
 // FilterExpr implements ExprFilter: it prunes conditions on ignored fields,
 // then (when the whitelist is enabled) conditions on disallowed fields.
 // Expression fields have already been through the instance's naming strategy,
-// so each registered ignore name is matched both verbatim and in its
-// converted form — callers may register either spelling.
+// so each registered ignore AND allowed name is matched both verbatim and in
+// its converted form — callers may register either spelling. (The whitelist
+// previously matched only the converted form, so SetAllowedFields("userName")
+// under snake_case naming pruned the legitimate user_name filter.)
 func (p *FieldsPlugin) FilterExpr(f figo.Figo, e figo.Expr) figo.Expr {
 	p.mu.RLock()
 	ignore := make(map[string]bool, len(p.ignoreFields))
@@ -148,10 +150,11 @@ func (p *FieldsPlugin) FilterExpr(f figo.Figo, e figo.Expr) figo.Expr {
 	whitelist := p.fieldWhitelist
 	p.mu.RUnlock()
 
+	// FilterExpr runs outside f's lock, so reading naming state through the
+	// public getter is safe.
+	fn := f.GetNamingFunc() // never nil: SnakeCaseNaming is the default
+
 	if len(ignore) > 0 {
-		// FilterExpr runs outside f's lock, so reading naming state through
-		// the public getter is safe.
-		fn := f.GetNamingFunc() // never nil: SnakeCaseNaming is the default
 		ignored := make(map[string]bool, len(ignore)*2)
 		for name := range ignore {
 			ignored[name] = true
@@ -163,8 +166,13 @@ func (p *FieldsPlugin) FilterExpr(f figo.Figo, e figo.Expr) figo.Expr {
 	}
 
 	if e != nil && whitelist {
+		allowedConv := make(map[string]bool, len(allowed)*2)
+		for name := range allowed {
+			allowedConv[name] = true
+			allowedConv[fn(name)] = true
+		}
 		e = figo.PruneExprFields(e, func(field string) bool {
-			return allowed[field]
+			return allowedConv[field]
 		})
 	}
 	return e
