@@ -68,12 +68,12 @@ func TestRawAdapterPostgresDialect(t *testing.T) {
 
 	t.Run("BuildRawHelpersNumbered", func(t *testing.T) {
 		f := newPG(`a=1 and b=2 load=[Orders:price>10]`)
-		where, args := BuildRawWhere(f)
+		where, args, _ := BuildRawWhere(f)
 		assert.Contains(t, where, `"a" = $1`)
 		assert.Contains(t, where, `"b" = $2`)
 		assert.Len(t, args, 2)
 
-		pre := BuildRawPreloads(f)
+		pre, _ := BuildRawPreloads(f)
 		assert.Contains(t, pre["Orders"].Where, `"price" > $1`)
 	})
 

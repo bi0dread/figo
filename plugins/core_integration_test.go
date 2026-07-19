@@ -34,7 +34,7 @@ func TestRawAdapterBuild(t *testing.T) {
 	f.AddFiltersFromString(`(id=1 and vendorId="22") and bank_id=11 or expedition_type=^"%e%" sort=id:desc page=skip:0,take:10`)
 	f.Build(RawAdapter{})
 
-	sql, args := BuildRawSelect(f, "test_models")
+	sql, args, _ := BuildRawSelect(f, "test_models")
 	// Precedence gives ((id=1 AND vendor_id=22) AND bank_id=11) OR expedition_type LIKE %e%;
 	// pruning the ignored bank_id from the conjunction must keep the OR:
 	// (id=1 AND vendor_id=22) OR expedition_type LIKE %e%

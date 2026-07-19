@@ -26,7 +26,7 @@ func TestNotExprSemanticsConsistent(t *testing.T) {
 	t.Run("raw", func(t *testing.T) {
 		f := newNot()
 		f.Build(RawAdapter{})
-		sql, args := BuildRawWhere(f)
+		sql, args, _ := BuildRawWhere(f)
 		assert.Equal(t, "NOT ((`a` = ? OR `b` = ?))", sql)
 		assert.Equal(t, []any{int64(1), int64(2)}, args)
 	})
@@ -110,7 +110,7 @@ func TestNamingFuncHonoredByAdapters(t *testing.T) {
 	f.Build(RawAdapter{})
 
 	assert.Equal(t, "userName", normalizeColumnName(f, "userName"))
-	sql, _ := BuildRawWhere(f)
+	sql, _, _ := BuildRawWhere(f)
 	assert.Contains(t, sql, "`userName`")
 }
 

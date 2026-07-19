@@ -27,40 +27,54 @@ type RawPreload struct {
 	Args  []any
 }
 
-// BuildRawPreloads builds WHERE clauses for each preload relationship without any ORM dependency
-func BuildRawPreloads(f figo.Figo) map[string]RawPreload {
+// BuildRawPreloads builds WHERE clauses for each preload relationship without
+// any ORM dependency. An expression the raw adapter cannot render returns an
+// error (and a nil map) instead of silently dropping the condition.
+func BuildRawPreloads(f figo.Figo) (map[string]RawPreload, error) {
 	d := rawDialectOf(f)
 	result := make(map[string]RawPreload)
 	for rel, exprs := range f.GetPreloads() {
-		where, args := buildWhereFromExprs(d, exprs)
+		where, args, err := buildWhereFromExprs(d, exprs)
+		if err != nil {
+			return nil, err
+		}
 		if d.NumberedPlaceholders {
 			where = numberPlaceholders(where)
 		}
 		result[rel] = RawPreload{Where: where, Args: args}
 	}
-	return result
+	return result, nil
 }
 
-// BuildRawWhere builds a SQL WHERE clause (without the leading WHERE keyword) and its args
-func BuildRawWhere(f figo.Figo) (string, []any) {
+// BuildRawWhere builds a SQL WHERE clause (without the leading WHERE keyword)
+// and its args. An expression the raw adapter cannot render returns an error
+// instead of silently dropping the condition (which would widen the result).
+func BuildRawWhere(f figo.Figo) (string, []any, error) {
 	d := rawDialectOf(f)
-	where, args := buildWhereFromExprs(d, f.GetClauses())
+	where, args, err := buildWhereFromExprs(d, f.GetClauses())
+	if err != nil {
+		return "", nil, err
+	}
 	if d.NumberedPlaceholders {
 		where = numberPlaceholders(where)
 	}
-	return where, args
+	return where, args, nil
 }
 
 // BuildRawSelect builds a full SELECT query for the given table and columns.
 // Identifier quoting and placeholder style come from the instance's raw
-// adapter dialect (MySQL backticks and '?' by default).
-func BuildRawSelect(f figo.Figo, table string, columns ...string) (string, []any) {
+// adapter dialect (MySQL backticks and '?' by default). An expression the raw
+// adapter cannot render returns an error instead of silently dropping it.
+func BuildRawSelect(f figo.Figo, table string, columns ...string) (string, []any, error) {
 	d := rawDialectOf(f)
-	sql, args := buildFullSelect(d, f, table, columns...)
+	sql, args, err := buildFullSelect(d, f, table, columns...)
+	if err != nil {
+		return "", nil, err
+	}
 	if d.NumberedPlaceholders {
 		sql = numberPlaceholders(sql)
 	}
-	return sql, args
+	return sql, args, nil
 }
 
 // -- internals --
@@ -68,9 +82,9 @@ func BuildRawSelect(f figo.Figo, table string, columns ...string) (string, []any
 // them ONCE on the fully assembled statement (numbering fragments and then
 // concatenating them would repeat $1).
 
-func buildWhereFromExprs(d *SQLDialect, exprs []figo.Expr) (string, []any) {
+func buildWhereFromExprs(d *SQLDialect, exprs []figo.Expr) (string, []any, error) {
 	if len(exprs) == 0 {
-		return "", nil
+		return "", nil, nil
 	}
 
 	// If multiple top-level expressions exist, combine with AND
@@ -80,191 +94,235 @@ func buildWhereFromExprs(d *SQLDialect, exprs []figo.Expr) (string, []any) {
 		if e == nil {
 			continue
 		}
-		p, a := exprToSQL(d, e)
+		p, a, err := exprToSQL(d, e)
+		if err != nil {
+			return "", nil, err
+		}
 		if p != "" {
 			parts = append(parts, p)
 			args = append(args, a...)
 		}
 	}
-	return strings.Join(parts, " AND "), args
+	return strings.Join(parts, " AND "), args, nil
 }
 
-func exprToSQL(d *SQLDialect, e figo.Expr) (string, []any) {
+// errUnsupportedExpr builds the failure for an expression the raw adapter has
+// no rendering for. Failing (instead of returning "") is deliberate: dropping
+// a predicate silently widens the result set — a filter/authorization bypass.
+func errUnsupportedExpr(e figo.Expr) error {
+	return fmt.Errorf("raw adapter: unsupported expression type %T (rendered by the MongoDB/Elasticsearch adapters only)", e)
+}
+
+func exprToSQL(d *SQLDialect, e figo.Expr) (string, []any, error) {
 	switch x := e.(type) {
 	case figo.EqExpr:
-		return fmt.Sprintf("%s = ?", d.quoteIdent(x.Field)), []any{x.Value}
+		return fmt.Sprintf("%s = ?", d.quoteIdent(x.Field)), []any{x.Value}, nil
 	case figo.GteExpr:
-		return fmt.Sprintf("%s >= ?", d.quoteIdent(x.Field)), []any{x.Value}
+		return fmt.Sprintf("%s >= ?", d.quoteIdent(x.Field)), []any{x.Value}, nil
 	case figo.GtExpr:
-		return fmt.Sprintf("%s > ?", d.quoteIdent(x.Field)), []any{x.Value}
+		return fmt.Sprintf("%s > ?", d.quoteIdent(x.Field)), []any{x.Value}, nil
 	case figo.LtExpr:
-		return fmt.Sprintf("%s < ?", d.quoteIdent(x.Field)), []any{x.Value}
+		return fmt.Sprintf("%s < ?", d.quoteIdent(x.Field)), []any{x.Value}, nil
 	case figo.LteExpr:
-		return fmt.Sprintf("%s <= ?", d.quoteIdent(x.Field)), []any{x.Value}
+		return fmt.Sprintf("%s <= ?", d.quoteIdent(x.Field)), []any{x.Value}, nil
 	case figo.NeqExpr:
-		return fmt.Sprintf("%s != ?", d.quoteIdent(x.Field)), []any{x.Value}
+		return fmt.Sprintf("%s != ?", d.quoteIdent(x.Field)), []any{x.Value}, nil
 	case figo.LikeExpr:
-		return fmt.Sprintf("%s LIKE ?", d.quoteIdent(x.Field)), []any{x.Value}
+		return fmt.Sprintf("%s LIKE ?", d.quoteIdent(x.Field)), []any{x.Value}, nil
 	case figo.RegexExpr:
 		// The operator comes from the dialect: REGEXP (MySQL/SQLite), ~ (Postgres).
-		return fmt.Sprintf("%s %s ?", d.quoteIdent(x.Field), d.RegexOperator), []any{x.Value}
+		return fmt.Sprintf("%s %s ?", d.quoteIdent(x.Field), d.RegexOperator), []any{x.Value}, nil
 	case figo.ILikeExpr:
-		return fmt.Sprintf("LOWER(%s) LIKE LOWER(?)", d.quoteIdent(x.Field)), []any{x.Value}
+		return fmt.Sprintf("LOWER(%s) LIKE LOWER(?)", d.quoteIdent(x.Field)), []any{x.Value}, nil
 	case figo.IsNullExpr:
-		return fmt.Sprintf("%s IS NULL", d.quoteIdent(x.Field)), nil
+		return fmt.Sprintf("%s IS NULL", d.quoteIdent(x.Field)), nil, nil
 	case figo.NotNullExpr:
-		return fmt.Sprintf("%s IS NOT NULL", d.quoteIdent(x.Field)), nil
+		return fmt.Sprintf("%s IS NOT NULL", d.quoteIdent(x.Field)), nil, nil
 	case figo.InExpr:
 		if len(x.Values) == 0 {
 			// An empty IN set matches nothing. Returning "" would drop the whole
 			// predicate (WHERE disappears), turning a match-nothing filter into a
 			// match-everything one — a filter/authorization bypass.
-			return "1=0", nil
+			return "1=0", nil, nil
 		}
 		placeholders := strings.Repeat("?,", len(x.Values))
 		placeholders = placeholders[:len(placeholders)-1]
-		return fmt.Sprintf("%s IN (%s)", d.quoteIdent(x.Field), placeholders), append([]any{}, x.Values...)
+		return fmt.Sprintf("%s IN (%s)", d.quoteIdent(x.Field), placeholders), append([]any{}, x.Values...), nil
 	case figo.NotInExpr:
 		if len(x.Values) == 0 {
 			// "NOT IN (empty set)" is true for every row.
-			return "1=1", nil
+			return "1=1", nil, nil
 		}
 		placeholders := strings.Repeat("?,", len(x.Values))
 		placeholders = placeholders[:len(placeholders)-1]
-		return fmt.Sprintf("%s NOT IN (%s)", d.quoteIdent(x.Field), placeholders), append([]any{}, x.Values...)
+		return fmt.Sprintf("%s NOT IN (%s)", d.quoteIdent(x.Field), placeholders), append([]any{}, x.Values...), nil
 	case figo.BetweenExpr:
-		return fmt.Sprintf("%s BETWEEN ? AND ?", d.quoteIdent(x.Field)), []any{x.Low, x.High}
+		return fmt.Sprintf("%s BETWEEN ? AND ?", d.quoteIdent(x.Field)), []any{x.Low, x.High}, nil
 	case figo.AndExpr:
 		return joinGroup(d, "AND", x.Operands)
 	case figo.OrExpr:
 		return joinGroup(d, "OR", x.Operands)
 	case figo.NotExpr:
 		if len(x.Operands) == 0 {
-			return "", nil
+			return "", nil, nil
 		}
 		// figo.NotExpr means "none of the operands match": NOT(a OR b), matching
 		// Mongo's $nor and GORM's clause.Not. Joining with AND here rendered
 		// NOT(a AND b), which matches rows the other adapters exclude.
-		inner, args := joinGroup(d, "OR", x.Operands)
-		if inner == "" {
-			return "", nil
+		inner, args, err := joinGroup(d, "OR", x.Operands)
+		if err != nil {
+			return "", nil, err
 		}
-		return fmt.Sprintf("NOT (%s)", inner), args
+		if inner == "" {
+			return "", nil, nil
+		}
+		return fmt.Sprintf("NOT (%s)", inner), args, nil
+	case figo.CustomExpr:
+		// The handler owns the fragment: it receives the field verbatim
+		// (unquoted) and returns SQL with '?' placeholders plus bind args.
+		if x.Handler == nil {
+			return "", nil, fmt.Errorf("raw adapter: CustomExpr on field %q has no handler", x.Field)
+		}
+		frag, args, err := x.Handler(x.Field, x.Operator, x.Value)
+		if err != nil {
+			return "", nil, fmt.Errorf("raw adapter: CustomExpr handler for field %q: %w", x.Field, err)
+		}
+		return frag, args, nil
 	case figo.OrderBy:
 		// handled separately in buildOrderBy
-		return "", nil
+		return "", nil, nil
 	default:
-		return "", nil
+		return "", nil, errUnsupportedExpr(e)
 	}
 }
 
-func exprToSQLQualified(d *SQLDialect, e figo.Expr, qualifier string) (string, []any) {
+func exprToSQLQualified(d *SQLDialect, e figo.Expr, qualifier string) (string, []any, error) {
 	// Qualify column references with the given table name
 	qcol := func(field string) string { return d.quoteIdent(qualifier) + "." + d.quoteIdent(field) }
 	switch x := e.(type) {
 	case figo.EqExpr:
-		return fmt.Sprintf("%s = ?", qcol(x.Field)), []any{x.Value}
+		return fmt.Sprintf("%s = ?", qcol(x.Field)), []any{x.Value}, nil
 	case figo.GteExpr:
-		return fmt.Sprintf("%s >= ?", qcol(x.Field)), []any{x.Value}
+		return fmt.Sprintf("%s >= ?", qcol(x.Field)), []any{x.Value}, nil
 	case figo.GtExpr:
-		return fmt.Sprintf("%s > ?", qcol(x.Field)), []any{x.Value}
+		return fmt.Sprintf("%s > ?", qcol(x.Field)), []any{x.Value}, nil
 	case figo.LtExpr:
-		return fmt.Sprintf("%s < ?", qcol(x.Field)), []any{x.Value}
+		return fmt.Sprintf("%s < ?", qcol(x.Field)), []any{x.Value}, nil
 	case figo.LteExpr:
-		return fmt.Sprintf("%s <= ?", qcol(x.Field)), []any{x.Value}
+		return fmt.Sprintf("%s <= ?", qcol(x.Field)), []any{x.Value}, nil
 	case figo.NeqExpr:
-		return fmt.Sprintf("%s != ?", qcol(x.Field)), []any{x.Value}
+		return fmt.Sprintf("%s != ?", qcol(x.Field)), []any{x.Value}, nil
 	case figo.LikeExpr:
-		return fmt.Sprintf("%s LIKE ?", qcol(x.Field)), []any{x.Value}
+		return fmt.Sprintf("%s LIKE ?", qcol(x.Field)), []any{x.Value}, nil
 	case figo.RegexExpr:
-		return fmt.Sprintf("%s %s ?", qcol(x.Field), d.RegexOperator), []any{x.Value}
+		return fmt.Sprintf("%s %s ?", qcol(x.Field), d.RegexOperator), []any{x.Value}, nil
 	case figo.ILikeExpr:
-		return fmt.Sprintf("LOWER(%s) LIKE LOWER(?)", qcol(x.Field)), []any{x.Value}
+		return fmt.Sprintf("LOWER(%s) LIKE LOWER(?)", qcol(x.Field)), []any{x.Value}, nil
 	case figo.IsNullExpr:
-		return fmt.Sprintf("%s IS NULL", qcol(x.Field)), nil
+		return fmt.Sprintf("%s IS NULL", qcol(x.Field)), nil, nil
 	case figo.NotNullExpr:
-		return fmt.Sprintf("%s IS NOT NULL", qcol(x.Field)), nil
+		return fmt.Sprintf("%s IS NOT NULL", qcol(x.Field)), nil, nil
 	case figo.InExpr:
 		if len(x.Values) == 0 {
 			// Empty IN set matches nothing; see exprToSQL for rationale.
-			return "1=0", nil
+			return "1=0", nil, nil
 		}
 		placeholders := strings.Repeat("?,", len(x.Values))
 		placeholders = placeholders[:len(placeholders)-1]
-		return fmt.Sprintf("%s IN (%s)", qcol(x.Field), placeholders), append([]any{}, x.Values...)
+		return fmt.Sprintf("%s IN (%s)", qcol(x.Field), placeholders), append([]any{}, x.Values...), nil
 	case figo.NotInExpr:
 		if len(x.Values) == 0 {
 			// "NOT IN (empty set)" is true for every row.
-			return "1=1", nil
+			return "1=1", nil, nil
 		}
 		placeholders := strings.Repeat("?,", len(x.Values))
 		placeholders = placeholders[:len(placeholders)-1]
-		return fmt.Sprintf("%s NOT IN (%s)", qcol(x.Field), placeholders), append([]any{}, x.Values...)
+		return fmt.Sprintf("%s NOT IN (%s)", qcol(x.Field), placeholders), append([]any{}, x.Values...), nil
 	case figo.BetweenExpr:
-		return fmt.Sprintf("%s BETWEEN ? AND ?", qcol(x.Field)), []any{x.Low, x.High}
+		return fmt.Sprintf("%s BETWEEN ? AND ?", qcol(x.Field)), []any{x.Low, x.High}, nil
 	case figo.AndExpr:
 		return joinGroupQualified(d, "AND", x.Operands, qualifier)
 	case figo.OrExpr:
 		return joinGroupQualified(d, "OR", x.Operands, qualifier)
 	case figo.NotExpr:
 		if len(x.Operands) == 0 {
-			return "", nil
+			return "", nil, nil
 		}
 		// See exprToSQL: figo.NotExpr is NOT(a OR b) across all adapters.
-		inner, args := joinGroupQualified(d, "OR", x.Operands, qualifier)
+		inner, args, err := joinGroupQualified(d, "OR", x.Operands, qualifier)
+		if err != nil {
+			return "", nil, err
+		}
 		if inner == "" {
-			return "", nil
+			return "", nil, nil
 		}
-		return fmt.Sprintf("NOT (%s)", inner), args
+		return fmt.Sprintf("NOT (%s)", inner), args, nil
+	case figo.CustomExpr:
+		// Same contract as exprToSQL: the handler receives the field verbatim
+		// and owns quoting/qualification of its fragment.
+		if x.Handler == nil {
+			return "", nil, fmt.Errorf("raw adapter: CustomExpr on field %q has no handler", x.Field)
+		}
+		frag, args, err := x.Handler(x.Field, x.Operator, x.Value)
+		if err != nil {
+			return "", nil, fmt.Errorf("raw adapter: CustomExpr handler for field %q: %w", x.Field, err)
+		}
+		return frag, args, nil
 	case figo.OrderBy:
-		return "", nil
+		return "", nil, nil
 	default:
-		return "", nil
+		return "", nil, errUnsupportedExpr(e)
 	}
 }
 
-func joinGroup(d *SQLDialect, op string, operands []figo.Expr) (string, []any) {
+func joinGroup(d *SQLDialect, op string, operands []figo.Expr) (string, []any, error) {
 	parts := make([]string, 0, len(operands))
 	args := make([]any, 0)
 	for _, e := range operands {
 		if e == nil {
 			continue
 		}
-		p, a := exprToSQL(d, e)
+		p, a, err := exprToSQL(d, e)
+		if err != nil {
+			return "", nil, err
+		}
 		if p != "" {
 			parts = append(parts, p)
 			args = append(args, a...)
 		}
 	}
 	if len(parts) == 0 {
-		return "", nil
+		return "", nil, nil
 	}
 	if len(parts) == 1 {
-		return parts[0], args
+		return parts[0], args, nil
 	}
-	return "(" + strings.Join(parts, " "+op+" ") + ")", args
+	return "(" + strings.Join(parts, " "+op+" ") + ")", args, nil
 }
 
-func joinGroupQualified(d *SQLDialect, op string, operands []figo.Expr, qualifier string) (string, []any) {
+func joinGroupQualified(d *SQLDialect, op string, operands []figo.Expr, qualifier string) (string, []any, error) {
 	parts := make([]string, 0, len(operands))
 	args := make([]any, 0)
 	for _, e := range operands {
 		if e == nil {
 			continue
 		}
-		p, a := exprToSQLQualified(d, e, qualifier)
+		p, a, err := exprToSQLQualified(d, e, qualifier)
+		if err != nil {
+			return "", nil, err
+		}
 		if p != "" {
 			parts = append(parts, p)
 			args = append(args, a...)
 		}
 	}
 	if len(parts) == 0 {
-		return "", nil
+		return "", nil, nil
 	}
 	if len(parts) == 1 {
-		return parts[0], args
+		return parts[0], args, nil
 	}
-	return "(" + strings.Join(parts, " "+op+" ") + ")", args
+	return "(" + strings.Join(parts, " "+op+" ") + ")", args, nil
 }
 
 func buildOrderBy(d *SQLDialect, f figo.Figo) string {
@@ -312,17 +370,17 @@ type RawContext struct {
 
 // AdapterRawGetSql renders the statement with '?' placeholders regardless of
 // dialect; callers that hand args to a driver convert via the adapter
-// (RawAdapter.GetQuery numbers them for Postgres).
-func AdapterRawGetSql(f figo.Figo, ctx any, conditionType ...string) (string, []any, bool) {
+// (RawAdapter.GetQuery numbers them for Postgres). It errors on a ctx that is
+// neither a table name string nor a RawContext, and on any expression the raw
+// adapter cannot render (nothing is silently dropped).
+func AdapterRawGetSql(f figo.Figo, ctx any, conditionType ...string) (string, []any, error) {
 	switch v := ctx.(type) {
 	case string:
-		sql, args := buildByConditions(f, v, conditionType...)
-		return sql, args, true
+		return buildByConditions(f, v, conditionType...)
 	case RawContext:
-		sql, args := buildByConditions(f, v.Table, conditionType...)
-		return sql, args, true
+		return buildByConditions(f, v.Table, conditionType...)
 	default:
-		return "", nil, false
+		return "", nil, fmt.Errorf("raw adapter: unsupported ctx type %T (want a table name string or RawContext)", ctx)
 	}
 }
 
@@ -347,8 +405,10 @@ func (a RawAdapter) GetSqlString(f figo.Figo, ctx any, conditionType ...string) 
 	if f == nil {
 		return "", false
 	}
-	sql, args, ok := AdapterRawGetSql(f, ctx, conditionType...)
-	if !ok {
+	// A build error fails the render (ok=false) — fail closed rather than
+	// returning SQL that silently omits a predicate.
+	sql, args, err := AdapterRawGetSql(f, ctx, conditionType...)
+	if err != nil {
 		return "", false
 	}
 	// Interpolate literals into the ?-form; numbering never applies here.
@@ -359,8 +419,8 @@ func (a RawAdapter) GetQuery(f figo.Figo, ctx any, conditionType ...string) (fig
 	if f == nil {
 		return nil, false
 	}
-	sql, args, ok := AdapterRawGetSql(f, ctx, conditionType...)
-	if !ok {
+	sql, args, err := AdapterRawGetSql(f, ctx, conditionType...)
+	if err != nil {
 		return nil, false
 	}
 	if a.dialect().NumberedPlaceholders {
@@ -369,7 +429,7 @@ func (a RawAdapter) GetQuery(f figo.Figo, ctx any, conditionType ...string) (fig
 	return figo.SQLQuery{SQL: sql, Args: args}, true
 }
 
-func buildByConditions(f figo.Figo, table string, conditionType ...string) (string, []any) {
+func buildByConditions(f figo.Figo, table string, conditionType ...string) (string, []any, error) {
 	d := rawDialectOf(f)
 
 	// Determine columns from selectFields; default to *
@@ -382,8 +442,14 @@ func buildByConditions(f figo.Figo, table string, conditionType ...string) (stri
 		cols = strings.Join(quoted, ", ")
 	}
 
-	joinSQL, joinArgs := buildJoins(d, f)
-	where, whereArgs := buildWhereFromExprs(d, f.GetClauses())
+	joinSQL, joinArgs, err := buildJoins(d, f)
+	if err != nil {
+		return "", nil, err
+	}
+	where, whereArgs, err := buildWhereFromExprs(d, f.GetClauses())
+	if err != nil {
+		return "", nil, err
+	}
 	orderBy := buildOrderBy(d, f)
 	limitOffset := buildLimitOffset(d, f)
 
@@ -451,13 +517,13 @@ func buildByConditions(f figo.Figo, table string, conditionType ...string) (stri
 	}
 
 	fullSQL := strings.Join(parts, " ")
-	return fullSQL, args
+	return fullSQL, args, nil
 }
 
 // buildFullSelect assembles the complete SELECT in ?-form (numbering, when the
 // dialect requires it, happens at the adapter/helper boundary). Explicit
 // columns are used only when the instance has no select fields.
-func buildFullSelect(d *SQLDialect, f figo.Figo, table string, columns ...string) (string, []any) {
+func buildFullSelect(d *SQLDialect, f figo.Figo, table string, columns ...string) (string, []any, error) {
 	cols := columnsOnly(f, d)
 	if cols == "*" && len(columns) > 0 {
 		quoted := make([]string, 0, len(columns))
@@ -467,8 +533,14 @@ func buildFullSelect(d *SQLDialect, f figo.Figo, table string, columns ...string
 		cols = strings.Join(quoted, ", ")
 	}
 
-	joinSQL, joinArgs := buildJoins(d, f)
-	where, whereArgs := buildWhereFromExprs(d, f.GetClauses())
+	joinSQL, joinArgs, err := buildJoins(d, f)
+	if err != nil {
+		return "", nil, err
+	}
+	where, whereArgs, err := buildWhereFromExprs(d, f.GetClauses())
+	if err != nil {
+		return "", nil, err
+	}
 	orderBy := buildOrderBy(d, f)
 	limitOffset := buildLimitOffset(d, f)
 
@@ -487,7 +559,7 @@ func buildFullSelect(d *SQLDialect, f figo.Figo, table string, columns ...string
 	}
 	args := append([]any{}, joinArgs...)
 	args = append(args, whereArgs...)
-	return query, args
+	return query, args, nil
 }
 
 // columnsOnly renders the SELECT column list from the instance's selects.
@@ -519,10 +591,10 @@ func normalizeConditionType(s string) string {
 // buildJoins constructs INNER JOIN clauses for all preloads with ON conditions
 // derived from each preload's expression. Since schema metadata is unavailable,
 // the ON clause uses the preload's filters only (equivalent to ON 1=1 AND (...)).
-func buildJoins(d *SQLDialect, f figo.Figo) (string, []any) {
+func buildJoins(d *SQLDialect, f figo.Figo) (string, []any, error) {
 	pre := f.GetPreloads()
 	if len(pre) == 0 {
-		return "", nil
+		return "", nil, nil
 	}
 	tables := make([]string, 0, len(pre))
 	for table := range pre {
@@ -533,7 +605,10 @@ func buildJoins(d *SQLDialect, f figo.Figo) (string, []any) {
 	parts := make([]string, 0, len(pre))
 	args := make([]any, 0)
 	for _, table := range tables {
-		onSQL, onArgs := buildWhereFromExprsQualified(d, pre[table], table)
+		onSQL, onArgs, err := buildWhereFromExprsQualified(d, pre[table], table)
+		if err != nil {
+			return "", nil, err
+		}
 		if onSQL == "" {
 			parts = append(parts, fmt.Sprintf("JOIN %s ON 1=1", d.quoteIdent(table)))
 			continue
@@ -541,12 +616,12 @@ func buildJoins(d *SQLDialect, f figo.Figo) (string, []any) {
 		parts = append(parts, fmt.Sprintf("JOIN %s ON %s", d.quoteIdent(table), onSQL))
 		args = append(args, onArgs...)
 	}
-	return strings.Join(parts, " "), args
+	return strings.Join(parts, " "), args, nil
 }
 
-func buildWhereFromExprsQualified(d *SQLDialect, exprs []figo.Expr, qualifier string) (string, []any) {
+func buildWhereFromExprsQualified(d *SQLDialect, exprs []figo.Expr, qualifier string) (string, []any, error) {
 	if len(exprs) == 0 {
-		return "", nil
+		return "", nil, nil
 	}
 	parts := make([]string, 0, len(exprs))
 	args := make([]any, 0)
@@ -554,13 +629,16 @@ func buildWhereFromExprsQualified(d *SQLDialect, exprs []figo.Expr, qualifier st
 		if e == nil {
 			continue
 		}
-		p, a := exprToSQLQualified(d, e, qualifier)
+		p, a, err := exprToSQLQualified(d, e, qualifier)
+		if err != nil {
+			return "", nil, err
+		}
 		if p != "" {
 			parts = append(parts, p)
 			args = append(args, a...)
 		}
 	}
-	return strings.Join(parts, " AND "), args
+	return strings.Join(parts, " AND "), args, nil
 }
 
 // expandPlaceholders replaces '?' with SQL literals derived from args in order.

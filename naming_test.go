@@ -17,7 +17,7 @@ func TestCustomNamingFunc(t *testing.T) {
 		f.SetNamingFunc(func(field string) string { return "t_" + strings.ToUpper(field) })
 		f.AddFiltersFromString(`userId=1 and status="x"`)
 		f.Build(RawAdapter{})
-		where, _ := BuildRawWhere(f)
+		where, _, _ := BuildRawWhere(f)
 		assert.Contains(t, where, "`t_USERID`")
 		assert.Contains(t, where, "`t_STATUS`")
 		assert.NotContains(t, where, "user_id") // snake_case did not run
@@ -29,7 +29,7 @@ func TestCustomNamingFunc(t *testing.T) {
 		f.SetNamingFunc(nil) // reset to the default (SnakeCaseNaming)
 		f.AddFiltersFromString(`userId=1`)
 		f.Build(RawAdapter{})
-		where, _ := BuildRawWhere(f)
+		where, _, _ := BuildRawWhere(f)
 		assert.Contains(t, where, "`user_id`")
 	})
 
@@ -47,7 +47,7 @@ func TestNoChangeNamingLeavesNameUnchanged(t *testing.T) {
 	f.SetNamingFunc(NoChangeNaming)
 	f.AddFiltersFromString(`userId=1`)
 	f.Build(RawAdapter{})
-	where, _ := BuildRawWhere(f)
+	where, _, _ := BuildRawWhere(f)
 	assert.Contains(t, where, "`userId`")
 }
 
@@ -62,6 +62,6 @@ func TestCloneCarriesNamingFunc(t *testing.T) {
 	c.AddFiltersFromString(`name="x"`)
 	c.Build(nil)
 
-	where, _ := BuildRawWhere(c)
+	where, _, _ := BuildRawWhere(c)
 	assert.Contains(t, where, "`c_name`", "clone should apply the inherited naming func")
 }

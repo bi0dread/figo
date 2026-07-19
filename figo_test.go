@@ -238,7 +238,7 @@ func TestRawNewOperations(t *testing.T) {
 	f.AddFilter(NotInExpr{Field: "status", Values: []any{"x", "y"}})
 	f.Build(RawAdapter{})
 
-	where, args := BuildRawWhere(f)
+	where, args, _ := BuildRawWhere(f)
 	assert.Contains(t, where, "`id` IN (")
 	assert.Contains(t, where, "LOWER(`name`) LIKE LOWER(?)")
 	assert.Contains(t, where, "`price` BETWEEN ? AND ?")
@@ -358,7 +358,7 @@ func TestFieldNameWithUnderscoresAllAdapters(t *testing.T) {
 	f2 := New()
 	f2.AddFiltersFromString(dsl)
 	f2.Build(RawAdapter{})
-	sql2, args := BuildRawSelect(f2, "test_table")
+	sql2, args, _ := BuildRawSelect(f2, "test_table")
 	assert.Contains(t, sql2, "`user_profile_id` > ?")
 	assert.Contains(t, sql2, "`account_balance` < ?")
 	assert.Equal(t, []any{int64(100), int64(500)}, args)
@@ -381,7 +381,7 @@ func TestTokenCombinationSafety(t *testing.T) {
 	f1 := New()
 	f1.AddFiltersFromString(`name > "test" and age < 25`)
 	f1.Build(RawAdapter{})
-	sql1, _ := BuildRawSelect(f1, "users")
+	sql1, _, _ := BuildRawSelect(f1, "users")
 	assert.Contains(t, sql1, "`name` > ?")
 	assert.Contains(t, sql1, "`age` < ?")
 
@@ -389,14 +389,14 @@ func TestTokenCombinationSafety(t *testing.T) {
 	f2 := New()
 	f2.AddFiltersFromString(`field_with_underscores > 100`)
 	f2.Build(RawAdapter{})
-	sql2, _ := BuildRawSelect(f2, "test")
+	sql2, _, _ := BuildRawSelect(f2, "test")
 	assert.Contains(t, sql2, "`field_with_underscores` > ?")
 
 	// Test 3: Logical operators should not be combined
 	f3 := New()
 	f3.AddFiltersFromString(`name = "test" and status = "active"`)
 	f3.Build(RawAdapter{})
-	sql3, _ := BuildRawSelect(f3, "users")
+	sql3, _, _ := BuildRawSelect(f3, "users")
 	assert.Contains(t, sql3, "`name` = ?")
 	assert.Contains(t, sql3, "`status` = ?")
 	assert.Contains(t, sql3, "AND")
@@ -405,7 +405,7 @@ func TestTokenCombinationSafety(t *testing.T) {
 	f4 := New()
 	f4.AddFiltersFromString(`name = "test" sort=id:desc page=skip:0,take:10`)
 	f4.Build(RawAdapter{})
-	sql4, _ := BuildRawSelect(f4, "users")
+	sql4, _, _ := BuildRawSelect(f4, "users")
 	assert.Contains(t, sql4, "`name` = ?")
 	assert.Contains(t, sql4, "ORDER BY")
 	assert.Contains(t, sql4, "LIMIT 10")
@@ -414,7 +414,7 @@ func TestTokenCombinationSafety(t *testing.T) {
 	f5 := New()
 	f5.AddFiltersFromString(`(name > "a" and age < 30) or (status = "active" and score > 80)`)
 	f5.Build(RawAdapter{})
-	sql5, _ := BuildRawSelect(f5, "users")
+	sql5, _, _ := BuildRawSelect(f5, "users")
 	assert.Contains(t, sql5, "`name` > ?")
 	assert.Contains(t, sql5, "`age` < ?")
 	assert.Contains(t, sql5, "`status` = ?")
@@ -424,7 +424,7 @@ func TestTokenCombinationSafety(t *testing.T) {
 	f6 := New()
 	f6.AddFiltersFromString(`name = "John Doe" and city = "New York"`)
 	f6.Build(RawAdapter{})
-	sql6, args6 := BuildRawSelect(f6, "users")
+	sql6, args6, _ := BuildRawSelect(f6, "users")
 	assert.Contains(t, sql6, "`name` = ?")
 	assert.Contains(t, sql6, "`city` = ?")
 	assert.Equal(t, []any{"John Doe", "New York"}, args6)
@@ -433,7 +433,7 @@ func TestTokenCombinationSafety(t *testing.T) {
 	f7 := New()
 	f7.AddFiltersFromString(`id > 100 and price < 50.99`)
 	f7.Build(RawAdapter{})
-	sql7, args7 := BuildRawSelect(f7, "products")
+	sql7, args7, _ := BuildRawSelect(f7, "products")
 	assert.Contains(t, sql7, "`id` > ?")
 	assert.Contains(t, sql7, "`price` < ?")
 	assert.Equal(t, []any{int64(100), 50.99}, args7)
@@ -442,7 +442,7 @@ func TestTokenCombinationSafety(t *testing.T) {
 	f8 := New()
 	f8.AddFiltersFromString(`x > 1 and y < 2`)
 	f8.Build(RawAdapter{})
-	sql8, _ := BuildRawSelect(f8, "test")
+	sql8, _, _ := BuildRawSelect(f8, "test")
 	assert.Contains(t, sql8, "`x` > ?")
 	assert.Contains(t, sql8, "`y` < ?")
 
@@ -450,7 +450,7 @@ func TestTokenCombinationSafety(t *testing.T) {
 	f9 := New()
 	f9.AddFiltersFromString(`name = "'; DROP TABLE users; --"`)
 	f9.Build(RawAdapter{})
-	sql9, args9 := BuildRawSelect(f9, "users")
+	sql9, args9, _ := BuildRawSelect(f9, "users")
 	assert.Contains(t, sql9, "`name` = ?")
 	assert.Equal(t, []any{"'; DROP TABLE users; --"}, args9)
 
@@ -463,7 +463,7 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	f1 := New()
 	f1.AddFiltersFromString(`((name > "a" and age < 30) or (status = "active" and score > 80)) and (deleted_at <null> or updated_at > "2023-01-01")`)
 	f1.Build(RawAdapter{})
-	sql1, _ := BuildRawSelect(f1, "users")
+	sql1, _, _ := BuildRawSelect(f1, "users")
 	assert.Contains(t, sql1, "`name` > ?")
 	assert.Contains(t, sql1, "`age` < ?")
 	assert.Contains(t, sql1, "`status` = ?")
@@ -475,7 +475,7 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	f2 := New()
 	f2.AddFiltersFromString(`id > 100 and name = "test" and price < 99.99 and active = true and created_at > "2023-01-01"`)
 	f2.Build(RawAdapter{})
-	sql2, args2 := BuildRawSelect(f2, "products")
+	sql2, args2, _ := BuildRawSelect(f2, "products")
 	assert.Contains(t, sql2, "`id` > ?")
 	assert.Contains(t, sql2, "`name` = ?")
 	assert.Contains(t, sql2, "`price` < ?")
@@ -498,7 +498,7 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	f3 := New()
 	f3.AddFiltersFromString(`user_id > 1 and user_name = "john" and user_email_address =^ "%@gmail.com" and user_created_at > "2023-01-01"`)
 	f3.Build(RawAdapter{})
-	sql3, _ := BuildRawSelect(f3, "users")
+	sql3, _, _ := BuildRawSelect(f3, "users")
 	assert.Contains(t, sql3, "`user_id` > ?")
 	assert.Contains(t, sql3, "`user_name` = ?")
 	assert.Contains(t, sql3, "`user_email_address` LIKE ?")
@@ -508,7 +508,7 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	f4 := New()
 	f4.AddFiltersFromString(`name = "O'Connor" and description =^ "%test%" and category = "electronics & gadgets"`)
 	f4.Build(RawAdapter{})
-	sql4, args4 := BuildRawSelect(f4, "products")
+	sql4, args4, _ := BuildRawSelect(f4, "products")
 	assert.Contains(t, sql4, "`name` = ?")
 	assert.Contains(t, sql4, "`description` LIKE ?")
 	assert.Contains(t, sql4, "`category` = ?")
@@ -518,7 +518,7 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	f5 := New()
 	f5.AddFiltersFromString(`id = 0 and price = 0.0 and discount = -10.5 and quantity >= 1`)
 	f5.Build(RawAdapter{})
-	sql5, args5 := BuildRawSelect(f5, "products")
+	sql5, args5, _ := BuildRawSelect(f5, "products")
 	assert.Contains(t, sql5, "`id` = ?")
 	assert.Contains(t, sql5, "`price` = ?")
 	assert.Contains(t, sql5, "`discount` = ?")
@@ -531,7 +531,7 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	f6 := New()
 	f6.AddFiltersFromString(`name =^ "%test%" and id <in> [1,2,3,4,5] and status <nin> ["inactive","deleted"] and price <bet> (10..100)`)
 	f6.Build(RawAdapter{})
-	sql6, _ := BuildRawSelect(f6, "products")
+	sql6, _, _ := BuildRawSelect(f6, "products")
 	assert.Contains(t, sql6, "`name` LIKE ?")
 	assert.Contains(t, sql6, "`id` IN (?,?,?,?,?)")
 	// Both quoted list elements must survive (this used to collapse to one).
@@ -542,7 +542,7 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	f7 := New()
 	f7.AddFiltersFromString(`deleted_at <null> and updated_at <notnull> and description <null>`)
 	f7.Build(RawAdapter{})
-	sql7, _ := BuildRawSelect(f7, "products")
+	sql7, _, _ := BuildRawSelect(f7, "products")
 	assert.Contains(t, sql7, "`deleted_at` IS NULL")
 	assert.Contains(t, sql7, "`updated_at` IS NOT NULL")
 	assert.Contains(t, sql7, "`description` IS NULL")
@@ -551,7 +551,7 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	f8 := New()
 	f8.AddFiltersFromString(`email =~ "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$" and phone =~ "^\\+?[1-9]\\d{1,14}$"`)
 	f8.Build(RawAdapter{})
-	sql8, _ := BuildRawSelect(f8, "users")
+	sql8, _, _ := BuildRawSelect(f8, "users")
 	assert.Contains(t, sql8, "`email` REGEXP ?")
 	assert.Contains(t, sql8, "`phone` REGEXP ?")
 
@@ -559,7 +559,7 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	f9 := New()
 	f9.AddFiltersFromString(`name > "a" and age < 100 sort=name:asc,age:desc page=skip:10,take:20`)
 	f9.Build(RawAdapter{})
-	sql9, _ := BuildRawSelect(f9, "users")
+	sql9, _, _ := BuildRawSelect(f9, "users")
 	assert.Contains(t, sql9, "`name` > ?")
 	assert.Contains(t, sql9, "`age` < ?")
 	assert.Contains(t, sql9, "ORDER BY `name` ASC, `age` DESC")
@@ -570,7 +570,7 @@ func TestComprehensiveBugPrevention(t *testing.T) {
 	f10 := New()
 	f10.AddFiltersFromString(`very_long_field_name_with_many_underscores_and_numbers_123 > 100`)
 	f10.Build(RawAdapter{})
-	sql10, _ := BuildRawSelect(f10, "test")
+	sql10, _, _ := BuildRawSelect(f10, "test")
 	assert.Contains(t, sql10, "`very_long_field_name_with_many_underscores_and_numbers_123` > ?")
 }
 
@@ -597,7 +597,7 @@ func TestAdapterConsistency(t *testing.T) {
 	f2 := New()
 	f2.AddFiltersFromString(dsl)
 	f2.Build(RawAdapter{})
-	sql2, args2 := BuildRawSelect(f2, "test_table")
+	sql2, args2, _ := BuildRawSelect(f2, "test_table")
 
 	// MongoDB Adapter
 	f3 := New()
@@ -631,7 +631,7 @@ func TestErrorHandling(t *testing.T) {
 	f1 := New()
 	f1.AddFiltersFromString("")
 	f1.Build(RawAdapter{})
-	sql1, args1 := BuildRawSelect(f1, "test")
+	sql1, args1, _ := BuildRawSelect(f1, "test")
 	assert.Contains(t, sql1, "SELECT * FROM `test`")
 	assert.Empty(t, args1)
 
@@ -639,7 +639,7 @@ func TestErrorHandling(t *testing.T) {
 	f2 := New()
 	f2.AddFiltersFromString("   ")
 	f2.Build(RawAdapter{})
-	sql2, args2 := BuildRawSelect(f2, "test")
+	sql2, args2, _ := BuildRawSelect(f2, "test")
 	assert.Contains(t, sql2, "SELECT * FROM `test`")
 	assert.Empty(t, args2)
 
@@ -647,7 +647,7 @@ func TestErrorHandling(t *testing.T) {
 	f3 := New()
 	f3.AddFiltersFromString(`name = and age > 25`) // Missing value after =
 	f3.Build(RawAdapter{})
-	sql3, _ := BuildRawSelect(f3, "test")
+	sql3, _, _ := BuildRawSelect(f3, "test")
 	// Should handle gracefully without panicking
 	assert.NotNil(t, sql3)
 
@@ -655,7 +655,7 @@ func TestErrorHandling(t *testing.T) {
 	f4 := New()
 	f4.AddFiltersFromString(`(name = "test" and age > 25`) // Missing closing parenthesis
 	f4.Build(RawAdapter{})
-	sql4, _ := BuildRawSelect(f4, "test")
+	sql4, _, _ := BuildRawSelect(f4, "test")
 	// Should handle gracefully
 	assert.NotNil(t, sql4)
 }
@@ -671,7 +671,7 @@ func TestComplexFiltersWithParentheses(t *testing.T) {
 	f1 := New()
 	f1.AddFiltersFromString(dsl)
 	f1.Build(RawAdapter{})
-	sql1, args1 := BuildRawSelect(f1, "users")
+	sql1, args1, _ := BuildRawSelect(f1, "users")
 
 	fmt.Printf("Raw SQL: %s\n", sql1)
 	fmt.Printf("Raw Args: %v\n", args1)
@@ -810,7 +810,7 @@ func TestComplexFiltersWithAllOperators(t *testing.T) {
 			f := New()
 			f.AddFiltersFromString(tt.dsl)
 			f.Build(RawAdapter{})
-			sql, _ := BuildRawSelect(f, "test")
+			sql, _, _ := BuildRawSelect(f, "test")
 
 			// Debug output for NOT operator test
 			if tt.expected == "NOT" {
@@ -1014,7 +1014,7 @@ func TestMissingScenarios(t *testing.T) {
 	f1 := New()
 	f1.AddFiltersFromString(`price <bet> (10..20)`)
 	f1.Build(RawAdapter{})
-	sql1, args1 := BuildRawSelect(f1, "products")
+	sql1, args1, _ := BuildRawSelect(f1, "products")
 	assert.Contains(t, sql1, "`price` BETWEEN ? AND ?")
 	assert.Equal(t, []any{int64(10), int64(20)}, args1)
 
@@ -1022,7 +1022,7 @@ func TestMissingScenarios(t *testing.T) {
 	f2 := New()
 	f2.AddFiltersFromString(`id > 0 load=[User:name="john" and age>18 | Profile:bio=^"%developer%" | Posts:title=^"%golang%" and published=true]`)
 	f2.Build(RawAdapter{})
-	sql2, _ := BuildRawSelect(f2, "users")
+	sql2, _, _ := BuildRawSelect(f2, "users")
 	assert.Contains(t, sql2, "`id` > ?")
 	// Note: LOAD operations are handled by adapters, not in raw SQL
 
@@ -1030,7 +1030,7 @@ func TestMissingScenarios(t *testing.T) {
 	f3 := New()
 	f3.AddFiltersFromString(`name = "José María" and description =^ "%café%" and category = "electronics & gadgets"`)
 	f3.Build(RawAdapter{})
-	sql3, args3 := BuildRawSelect(f3, "products")
+	sql3, args3, _ := BuildRawSelect(f3, "products")
 	assert.Contains(t, sql3, "`name` = ?")
 	assert.Contains(t, sql3, "`description` LIKE ?")
 	assert.Contains(t, sql3, "`category` = ?")
@@ -1040,7 +1040,7 @@ func TestMissingScenarios(t *testing.T) {
 	f4 := New()
 	f4.AddFiltersFromString(`name = "" and description <null> and status = "active"`)
 	f4.Build(RawAdapter{})
-	sql4, args4 := BuildRawSelect(f4, "products")
+	sql4, args4, _ := BuildRawSelect(f4, "products")
 	assert.Contains(t, sql4, "`name` = ?")
 	assert.Contains(t, sql4, "`description` IS NULL")
 	assert.Contains(t, sql4, "`status` = ?")
@@ -1050,7 +1050,7 @@ func TestMissingScenarios(t *testing.T) {
 	f5 := New()
 	f5.AddFiltersFromString(`id = 0 and price = 0.0 and active = false and count = -1`)
 	f5.Build(RawAdapter{})
-	sql5, args5 := BuildRawSelect(f5, "products")
+	sql5, args5, _ := BuildRawSelect(f5, "products")
 	assert.Contains(t, sql5, "`id` = ?")
 	assert.Contains(t, sql5, "`price` = ?")
 	assert.Contains(t, sql5, "`active` = ?")
@@ -1062,7 +1062,7 @@ func TestMissingScenarios(t *testing.T) {
 	f6 := New()
 	f6.AddFiltersFromString(`(id > 100 and name =^ "%test%") or (status = "active" and price < 50.0) and not (deleted = true)`)
 	f6.Build(RawAdapter{})
-	sql6, _ := BuildRawSelect(f6, "products")
+	sql6, _, _ := BuildRawSelect(f6, "products")
 
 	// For now, just check that we get some SQL output and NOT operation
 	assert.NotEmpty(t, sql6)
@@ -1072,7 +1072,7 @@ func TestMissingScenarios(t *testing.T) {
 	f7 := New()
 	f7.AddFiltersFromString(`very_long_field_name_with_many_underscores_and_numbers_123 > 100 and another_very_long_field_name = "test"`)
 	f7.Build(RawAdapter{})
-	sql7, _ := BuildRawSelect(f7, "test")
+	sql7, _, _ := BuildRawSelect(f7, "test")
 	assert.Contains(t, sql7, "`very_long_field_name_with_many_underscores_and_numbers_123` > ?")
 	assert.Contains(t, sql7, "`another_very_long_field_name` = ?")
 
@@ -1080,7 +1080,7 @@ func TestMissingScenarios(t *testing.T) {
 	f8 := New()
 	f8.AddFiltersFromString(`id = 1 and name =^ "%test%" and age > 18 and score >= 80 and price < 100 and discount <= 50 and status != "inactive" and category <in> ["electronics","books"] and tags <nin> ["old","deprecated"] and created_at <bet> "2023-01-01".."2023-12-31" and deleted_at <null> and updated_at <notnull> and email =~ "^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$"`)
 	f8.Build(RawAdapter{})
-	sql8, _ := BuildRawSelect(f8, "products")
+	sql8, _, _ := BuildRawSelect(f8, "products")
 	assert.Contains(t, sql8, "`id` = ?")
 	assert.Contains(t, sql8, "`name` LIKE ?")
 	assert.Contains(t, sql8, "`age` > ?")
@@ -1156,7 +1156,7 @@ func TestDebugParsing(t *testing.T) {
 		}
 
 		// Test SQL generation
-		sql, args := BuildRawSelect(f, "test")
+		sql, args, _ := BuildRawSelect(f, "test")
 		fmt.Printf("SQL: %s\n", sql)
 		fmt.Printf("Args: %v\n", args)
 
@@ -1187,7 +1187,7 @@ func TestDebugParsing(t *testing.T) {
 		}
 
 		// Test SQL generation
-		sql, args := BuildRawSelect(f, "test_models")
+		sql, args, _ := BuildRawSelect(f, "test_models")
 		fmt.Printf("SQL: %s\n", sql)
 		fmt.Printf("Args: %v\n", args)
 

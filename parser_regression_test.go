@@ -17,7 +17,11 @@ func whereFor(t *testing.T, dsl string) (string, []any) {
 		t.Fatalf("AddFiltersFromString(%q): %v", dsl, err)
 	}
 	f.Build(RawAdapter{})
-	return BuildRawWhere(f)
+	where, args, err := BuildRawWhere(f)
+	if err != nil {
+		t.Fatalf("BuildRawWhere(%q): %v", dsl, err)
+	}
+	return where, args
 }
 
 // TestNotIsNotDropped guards against a regression where a leading NOT applied to

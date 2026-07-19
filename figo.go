@@ -1,6 +1,7 @@
 package figo
 
 import (
+	"errors"
 	"fmt"
 	"strconv"
 	"strings"
@@ -448,7 +449,11 @@ type GeoDistanceExpr struct {
 	Unit      string  // "km", "miles", "meters"
 }
 
-// CustomExpr represents custom operations
+// CustomExpr represents custom operations. The SQL adapters (raw and GORM)
+// invoke Handler with the Field exactly as held here (unquoted, not renamed),
+// the Operator and the Value; it returns a SQL fragment with '?' placeholders
+// plus its bind args. The handler owns identifier quoting/naming. The MongoDB
+// and Elasticsearch adapters reject CustomExpr — its output is a SQL fragment.
 type CustomExpr struct {
 	Field    string
 	Operator string
@@ -487,6 +492,7 @@ type Figo interface {
 	GetSqlString(ctx any, conditionType ...string) string
 	GetQuery(ctx any, conditionType ...string) Query
 	Build(adapter Adapter)
+	BuildE(adapter Adapter) error
 	Explain() string
 	Clone() Figo
 	Walk(visit func(Expr))
@@ -567,7 +573,20 @@ func isSafeLookaheadValue(v string) bool {
 	return v != "and" && v != "or" && v != "not"
 }
 
-func (f *figo) parseDSL(expr string) *Node {
+// addDiag records a parse diagnostic. diags may be nil (diagnostics are then
+// discarded), which keeps every parse path identical whether the caller wants
+// them (BuildE) or not (Build).
+func addDiag(diags *[]error, format string, args ...any) {
+	if diags != nil {
+		*diags = append(*diags, fmt.Errorf(format, args...))
+	}
+}
+
+// parseDSL scans the DSL into the Node tree. Malformed constructs are skipped
+// (never fatal) exactly as they always were; each skip is additionally
+// recorded into diags so BuildE can report what the built query does NOT
+// include.
+func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 	root := &Node{Value: "root", Expression: make([]Expr, 0)}
 	stack := []*Node{root}
 	current := root
@@ -713,6 +732,7 @@ func (f *figo) parseDSL(expr string) *Node {
 						v := strings.TrimSpace(expr[i:k])
 						labelIndex := strings.Index(v, loadLabel)
 						if labelIndex == -1 {
+							addDiag(diags, "malformed load= directive %q (expected load=[Relation:filter])", v)
 							i = k
 							continue
 						}
@@ -722,11 +742,13 @@ func (f *figo) parseDSL(expr string) *Node {
 						start := labelIndex + len(loadLabel)
 						end := len(v) - 1
 						if bracketCount != 0 || !strings.HasSuffix(v, "]") || start > end {
+							addDiag(diags, "unclosed load= directive %q", v)
 							i = k
 							continue
 						}
 						content := v[start:end]
 						if content == "" {
+							addDiag(diags, "empty load= directive")
 							i = k
 							continue
 						}
@@ -735,13 +757,16 @@ func (f *figo) parseDSL(expr string) *Node {
 						for _, l := range loadSplit {
 							colonIndex := strings.Index(l, ":")
 							if colonIndex == -1 {
+								if strings.TrimSpace(l) != "" {
+									addDiag(diags, "malformed load= segment %q (missing ':' between relation and filter)", l)
+								}
 								continue
 							}
 							rawTable := l[:colonIndex]
 							table := strings.TrimSpace(rawTable)
 							loadContent := strings.TrimSpace(l[colonIndex+1:])
 
-							loadRootNode := f.parseDSL(loadContent)
+							loadRootNode := f.parseDSL(loadContent, diags)
 							expressionParser(loadRootNode)
 							loadExpr := getFinalExpr(*loadRootNode)
 							if loadExpr != nil {
@@ -762,6 +787,9 @@ func (f *figo) parseDSL(expr string) *Node {
 						for _, s := range pageContent {
 							pageSplit := strings.Split(s, ":")
 							if len(pageSplit) != 2 {
+								if strings.TrimSpace(s) != "" {
+									addDiag(diags, "malformed page= segment %q (expected skip:N or take:N)", s)
+								}
 								continue
 							}
 
@@ -776,9 +804,13 @@ func (f *figo) parseDSL(expr string) *Node {
 									f.page.Skip = int(parseInt)
 								case "take":
 									f.page.Take = int(parseInt)
+								default:
+									addDiag(diags, "unknown page= key %q (expected skip or take)", field)
 								}
 
 								f.page.validate()
+							} else {
+								addDiag(diags, "invalid page= value %q for %q (expected an integer)", value, field)
 							}
 
 						}
@@ -800,12 +832,18 @@ func (f *figo) parseDSL(expr string) *Node {
 						for _, s := range sortContent {
 							sortSplit := strings.Split(s, ":")
 							if len(sortSplit) != 2 {
+								if strings.TrimSpace(s) != "" {
+									addDiag(diags, "malformed sort= segment %q (expected field:asc or field:desc)", s)
+								}
 								continue
 							}
 
 							field := sortSplit[0]
 							value := sortSplit[1]
 
+							if dir := strings.ToLower(value); dir != "asc" && dir != "desc" {
+								addDiag(diags, "invalid sort direction %q for field %q (expected asc or desc)", value, field)
+							}
 							c = append(c, OrderByColumn{
 								Name: f.parsFieldsName(field),
 								Desc: strings.ToLower(value) == "desc",
@@ -990,8 +1028,12 @@ func (f *figo) parseDSL(expr string) *Node {
 					// "not" (e.g. name="and") must stay an ordinary value and
 					// must never overwrite the node's operator.
 					if operator == "" {
+						addDiag(diags, "unrecognized token %q (no operator found)", combinedToken)
 						i = j
 						continue
+					}
+					if field == "" {
+						addDiag(diags, "operator %q with no field name (token %q)", operator, combinedToken)
 					}
 
 					// Ignore-field filtering happens on the built expression
@@ -1004,7 +1046,11 @@ func (f *figo) parseDSL(expr string) *Node {
 					// ("0123" became int64 123), nulls and dates.
 					convertedField := f.parsFieldsName(field)
 					newNode := &Node{Operator: operator, Value: valueStr, Field: convertedField, Parent: current, Expression: make([]Expr, 0)}
-					newNode.Expression = append(newNode.Expression, getClausesFromOperation(operator, convertedField, valueStr))
+					clauseExpr := getClausesFromOperation(operator, convertedField, valueStr)
+					if clauseExpr == nil {
+						addDiag(diags, "invalid value %q for operator %q on field %q", valueStr, operator, field)
+					}
+					newNode.Expression = append(newNode.Expression, clauseExpr)
 					current.Children = append(current.Children, newNode)
 					i = j
 				}
@@ -1572,8 +1618,13 @@ func (f *figo) AddFiltersFromString(input string) error {
 		}
 	}
 
-	// Update DSL string (replace existing) - protected by mutex
+	// Update DSL string (replace existing) - protected by mutex. The previous
+	// DSL is kept for rollback: AfterParse hooks (LimitsPlugin, Validation-
+	// Plugin) inspect the committed DSL via Clone+Build, so the new value must
+	// be visible while they run — but a rejected DSL must not stay armed for a
+	// later Build when the caller ignores the returned error.
 	f.mu.Lock()
+	prevDSL := f.dsl
 	f.dsl = input
 	f.mu.Unlock()
 
@@ -1581,6 +1632,9 @@ func (f *figo) AddFiltersFromString(input string) error {
 	if pm != nil {
 		err := pm.ExecuteAfterParse(f, input)
 		if err != nil {
+			f.mu.Lock()
+			f.dsl = prevDSL
+			f.mu.Unlock()
 			return fmt.Errorf("plugin AfterParse error: %w", err)
 		}
 	}
@@ -1811,7 +1865,21 @@ func (f *figo) GetDSL() string {
 // Build parses the DSL into the internal clause tree. The adapter is optional
 // here: pass it to Build(GormAdapter{}) to set (or override) the adapter that
 // GetSqlString/GetQuery will use, or set it earlier via New / SetAdapterObject.
+// Malformed DSL constructs are skipped silently; BuildE is the same operation
+// with those skips reported.
 func (f *figo) Build(adapter Adapter) {
+	_ = f.BuildE(adapter)
+}
+
+// BuildE parses exactly like Build and additionally reports everything the
+// parser had to drop: unrecognized tokens, operators with no field, invalid
+// operator values (e.g. a <bet> range without ".."), and malformed
+// sort=/page=/load= directives. The clause tree is still built from whatever
+// DID parse — identical to Build — so a non-nil error means the built query
+// does not express all of the input. Callers validating user-supplied DSL
+// should treat a non-nil error as a rejection rather than running the
+// (broader) query that remains.
+func (f *figo) BuildE(adapter Adapter) error {
 	f.mu.Lock()
 
 	// A non-nil adapter selects/replaces the adapter; passing nil rebuilds
@@ -1826,7 +1894,7 @@ func (f *figo) Build(adapter Adapter) {
 		// Even with no DSL, clause finalizers must run (a ScopePlugin's
 		// mandatory filter applies to unfiltered queries too).
 		f.finalizeClauses()
-		return
+		return nil
 	}
 
 	// Clear all DSL-derived state before rebuilding so Build is idempotent:
@@ -1837,7 +1905,8 @@ func (f *figo) Build(adapter Adapter) {
 	f.preloads = make(map[string][]Expr)
 	f.sort = nil
 
-	root := f.parseDSL(f.dsl)
+	var diags []error
+	root := f.parseDSL(f.dsl, &diags)
 	expressionParser(root)
 
 	finalExpr := getFinalExpr(*root)
@@ -1881,6 +1950,8 @@ func (f *figo) Build(adapter Adapter) {
 	f.mu.Unlock()
 
 	f.finalizeClauses()
+
+	return errors.Join(diags...)
 }
 
 // finalizeClauses runs registered ClauseFinalizer plugins over the top-level

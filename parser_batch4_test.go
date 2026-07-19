@@ -41,7 +41,7 @@ func TestKeywordPrefixedFieldsAreFilters(t *testing.T) {
 	f := New()
 	f.AddFiltersFromString(`id=1 sort=id:desc page=skip:5,take:10`)
 	f.Build(RawAdapter{})
-	where, _ := BuildRawWhere(f)
+	where, _, _ := BuildRawWhere(f)
 	assert.Equal(t, "`id` = ?", where)
 	assert.NotNil(t, f.GetSort())
 	assert.Equal(t, Page{Skip: 5, Take: 10}, f.GetPage())

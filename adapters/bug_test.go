@@ -14,7 +14,7 @@ func TestBugFixes(t *testing.T) {
 		f.AddFiltersFromString(`(name = "test" and age > 25))`) // Extra closing parenthesis
 		f.Build(RawAdapter{})
 		// Should not panic
-		sql, _ := BuildRawSelect(f, "test")
+		sql, _, _ := BuildRawSelect(f, "test")
 		if sql == "" {
 			t.Error("Expected SQL to be generated")
 		}
@@ -26,7 +26,7 @@ func TestBugFixes(t *testing.T) {
 		f.AddFiltersFromString(`load=[User:name="test" | Profile:bio="dev"`) // Missing closing bracket
 		f.Build(RawAdapter{})
 		// Should not panic
-		sql, _ := BuildRawSelect(f, "test")
+		sql, _, _ := BuildRawSelect(f, "test")
 		if sql == "" {
 			t.Error("Expected SQL to be generated")
 		}
@@ -38,7 +38,7 @@ func TestBugFixes(t *testing.T) {
 		f.AddFiltersFromString(`load=[]`) // Empty load
 		f.Build(RawAdapter{})
 		// Should not panic
-		sql, _ := BuildRawSelect(f, "test")
+		sql, _, _ := BuildRawSelect(f, "test")
 		if sql == "" {
 			t.Error("Expected SQL to be generated")
 		}
@@ -50,7 +50,7 @@ func TestBugFixes(t *testing.T) {
 		f.AddFiltersFromString(`load=[User name="test" | Profile bio="dev"]`) // Missing colons
 		f.Build(RawAdapter{})
 		// Should not panic
-		sql, _ := BuildRawSelect(f, "test")
+		sql, _, _ := BuildRawSelect(f, "test")
 		if sql == "" {
 			t.Error("Expected SQL to be generated")
 		}
@@ -62,7 +62,7 @@ func TestBugFixes(t *testing.T) {
 		f.AddFiltersFromString(`((name = "test" and age > 25) or (status = "active" and score > 80)) and (deleted_at <null> or updated_at > "2023-01-01") and load=[User:name="test" | Profile:bio="dev"`) // Missing closing bracket
 		f.Build(RawAdapter{})
 		// Should not panic
-		sql, _ := BuildRawSelect(f, "test")
+		sql, _, _ := BuildRawSelect(f, "test")
 		if sql == "" {
 			t.Error("Expected SQL to be generated")
 		}
@@ -74,7 +74,7 @@ func TestBugFixes(t *testing.T) {
 		f.AddFiltersFromString(``) // Empty string
 		f.Build(RawAdapter{})
 		// Should not panic
-		sql, _ := BuildRawSelect(f, "test")
+		sql, _, _ := BuildRawSelect(f, "test")
 		if sql == "" {
 			t.Error("Expected SQL to be generated")
 		}
@@ -86,7 +86,7 @@ func TestBugFixes(t *testing.T) {
 		f.AddFiltersFromString(`   `) // Only whitespace
 		f.Build(RawAdapter{})
 		// Should not panic
-		sql, _ := BuildRawSelect(f, "test")
+		sql, _, _ := BuildRawSelect(f, "test")
 		if sql == "" {
 			t.Error("Expected SQL to be generated")
 		}
@@ -98,7 +98,7 @@ func TestBugFixes(t *testing.T) {
 		f.AddFiltersFromString(`((()))`) // Only parentheses
 		f.Build(RawAdapter{})
 		// Should not panic
-		sql, _ := BuildRawSelect(f, "test")
+		sql, _, _ := BuildRawSelect(f, "test")
 		if sql == "" {
 			t.Error("Expected SQL to be generated")
 		}
@@ -110,7 +110,7 @@ func TestBugFixes(t *testing.T) {
 		f.AddFiltersFromString(`name = and age > 25`) // Missing value after =
 		f.Build(RawAdapter{})
 		// Should not panic
-		sql, _ := BuildRawSelect(f, "test")
+		sql, _, _ := BuildRawSelect(f, "test")
 		if sql == "" {
 			t.Error("Expected SQL to be generated")
 		}
@@ -122,7 +122,7 @@ func TestBugFixes(t *testing.T) {
 		f.AddFiltersFromString(`name = "test and age > 25`) // Missing closing quote
 		f.Build(RawAdapter{})
 		// Should not panic
-		sql, _ := BuildRawSelect(f, "test")
+		sql, _, _ := BuildRawSelect(f, "test")
 		if sql == "" {
 			t.Error("Expected SQL to be generated")
 		}

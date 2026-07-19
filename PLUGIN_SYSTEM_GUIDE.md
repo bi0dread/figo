@@ -34,7 +34,7 @@ type Plugin interface {
 ### 3. AfterParse Hook
 - **When**: Called after DSL string is parsed
 - **Purpose**: Post-process the parsed expressions
-- **Return**: Error if processing fails
+- **Return**: Error if processing fails. An error also rolls the instance's DSL back to its previous value, so a rejected DSL can never be built later by a caller that ignored the error.
 - **Example**: Validate parsed expressions, add metadata
 
 ### 4. BeforeQuery Hook

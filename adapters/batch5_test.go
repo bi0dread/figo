@@ -50,7 +50,7 @@ func TestOffsetWithoutLimitIncludesLimit(t *testing.T) {
 	f := New()
 	f.SetPage(5, 0) // skip 5, take 0
 	f.Build(RawAdapter{})
-	sql, _ := BuildRawSelect(f, "t")
+	sql, _, _ := BuildRawSelect(f, "t")
 	assert.Contains(t, sql, "OFFSET 5")
 	assert.Contains(t, sql, "LIMIT", "bare OFFSET is invalid on MySQL/SQLite")
 }
@@ -61,7 +61,7 @@ func TestDeterministicColumnAndJoinOrder(t *testing.T) {
 		f := New()
 		f.AddSelectFields("zeta", "alpha", "mu")
 		f.Build(RawAdapter{})
-		sql, _ := BuildRawSelect(f, "t")
+		sql, _, _ := BuildRawSelect(f, "t")
 		return sql
 	}
 	first := build()

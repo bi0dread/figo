@@ -94,15 +94,17 @@ A `Figo` instance is a mutable filter builder. The lifecycle is always:
 
 1. **`figo.New()`** — construct an instance (no adapter argument).
 2. **`AddFiltersFromString(dsl)`** — hand it a DSL string. This stores the DSL; it does **not** parse yet. Calling it again **replaces** the previous DSL.
-3. **`Build(adapter)`** — parse the DSL into an AST and select the adapter. `Build` is idempotent: calling it again rebuilds cleanly (clauses, preloads, and sort are reset from the DSL each time).
+3. **`Build(adapter)`** — parse the DSL into an AST and select the adapter. `Build` is idempotent: calling it again rebuilds cleanly (clauses, preloads, and sort are reset from the DSL each time). Malformed constructs are skipped, never fatal; **`BuildE(adapter)`** is the same operation but returns an error describing everything the parser had to drop (unrecognized tokens, invalid operator values, malformed `sort=`/`page=`/`load=` directives). For user-supplied DSL, prefer `BuildE` and treat a non-nil error as a rejection — the built query does not express all of the input.
 4. **`GetSqlString` / `GetQuery`** (or an adapter helper like `BuildRawSelect`) — render the query.
 
 ```go
 f := figo.New()
 f.AddFiltersFromString(`status="active" and age>18`)
-f.Build(adapters.RawAdapter{})
+if err := f.BuildE(adapters.RawAdapter{}); err != nil {
+    // some of the DSL didn't parse — reject rather than run a broader query
+}
 
-where, args := adapters.BuildRawWhere(f)
+where, args, err := adapters.BuildRawWhere(f)
 // where: "(`status` = ? AND `age` > ?)"
 // args:  []any{"active", int64(18)}
 ```
@@ -277,7 +279,7 @@ f.AddFilter(figo.EqExpr{Field: "status", Value: "active"})
 f.AddFilter(figo.BetweenExpr{Field: "age", Low: int64(18), High: int64(65)})
 f.Build(adapters.RawAdapter{})
 
-where, args := adapters.BuildRawWhere(f)
+where, args, err := adapters.BuildRawWhere(f)
 // where: "`status` = ? AND `age` BETWEEN ? AND ?"
 // args:  []any{"active", int64(18), int64(65)}
 ```
@@ -336,7 +338,7 @@ f := figo.New()
 f.AddFiltersFromString(`name="x"`)
 f.Build(adapters.RawAdapter{})
 f.AddFilter(figo.InExpr{Field: "role", Values: []any{"admin", "mod"}})
-where, _ := adapters.BuildRawWhere(f)     // "`name` = ? AND `role` IN (?,?)"
+where, _, _ := adapters.BuildRawWhere(f)  // "`name` = ? AND `role` IN (?,?)"
 ```
 
 `AddFilter` clauses are still subject to a registered `FieldsPlugin`'s [ignore list and whitelist](#field-safety-ignore-lists--whitelist) — a disallowed or ignored field is pruned just as it would be from DSL input.
@@ -378,6 +380,8 @@ q := f.GetQuery(db.Model(&User{})).(figo.SQLQuery)
 
 `ApplyGorm` sets limit/offset, select fields, preloads, where clauses, and sort. A `*gorm.DB` that already carries a caller scope (e.g. a tenant filter `db.Where("org_id = ?", id)`) keeps that scope — figo's filters are applied **on top of** it, not instead of it.
 
+If the AST contains an expression the GORM adapter cannot render (the Mongo/ES-only advanced types, or a `CustomExpr` without a handler), `ApplyGorm` records the error on the `*gorm.DB` via `AddError` instead of silently dropping the condition — GORM's callbacks are guarded by `db.Error == nil`, so the widened query never executes and `Find(...).Error` reports the cause. `GetSqlString`/`GetQuery` fail the render the same way.
+
 ### Raw SQL adapter
 
 Dialect-aware: the zero value targets MySQL (backtick identifiers, `?` placeholders, `REGEXP`); set `Dialect` for PostgreSQL (`"col"`, `$1..$N`, `~`) or SQLite (`"col"`, `?`, `REGEXP`).
@@ -400,15 +404,15 @@ f.Build(adapters.RawAdapter{Dialect: &pg})
 f.Build(adapters.RawAdapter{})
 
 // Full SELECT
-sql, args := adapters.BuildRawSelect(f, "users")
+sql, args, err := adapters.BuildRawSelect(f, "users")
 // sql:  "SELECT * FROM `users` WHERE (`id` = ? AND `name` = ?) ORDER BY `id` DESC LIMIT 20"
 // args: []any{int64(1), "test"}
 
 // Explicit column list (used when no AddSelectFields were set)
-sql, args = adapters.BuildRawSelect(f, "users", "id", "name")
+sql, args, err = adapters.BuildRawSelect(f, "users", "id", "name")
 
 // Just the WHERE fragment
-where, whereArgs := adapters.BuildRawWhere(f)
+where, whereArgs, err := adapters.BuildRawWhere(f)
 
 // Or via the generic API with a table name / RawContext
 sql = f.GetSqlString("users")
@@ -418,14 +422,14 @@ q := f.GetQuery(adapters.RawContext{Table: "users"}).(figo.SQLQuery) // q.SQL + 
 
 With no `conditionType` arguments you get the full SELECT; otherwise only the named segments are emitted, in the order you list them. Recognized segment keywords (case-insensitive): `SELECT`, `FROM`, `JOIN`, `WHERE`, `ORDER BY` / `SORT`, `LIMIT`, `OFFSET`, `PAGE` (LIMIT + OFFSET together).
 
-Identifiers are quote-escaped per dialect — embedded quote runes are doubled (values are always parameterized) — so field/table names can't break out of quoting. The `Build*` helpers (`BuildRawWhere`, `BuildRawSelect`, `BuildRawPreloads`) pick up the dialect from the instance's adapter, including `$N` numbering on Postgres.
+Identifiers are quote-escaped per dialect — embedded quote runes are doubled (values are always parameterized) — so field/table names can't break out of quoting. The `Build*` helpers (`BuildRawWhere`, `BuildRawSelect`, `BuildRawPreloads`) pick up the dialect from the instance's adapter, including `$N` numbering on Postgres. They return an error for any expression the raw adapter cannot render (e.g. the Mongo/ES-only advanced expression types) instead of silently dropping the condition; the `RawAdapter` methods likewise fail (`ok=false`) rather than emit SQL that omits a predicate.
 
 `load=` preloads render into the full SELECT as `JOIN <table> ON <filter>` clauses (deterministic table order). If you'd rather run your own join/second-query logic, the same preload filters are exposed as rendered `WHERE` fragments:
 
 ```go
 f.AddFiltersFromString(`id>0 load=[Orders:total>100]`)
 f.Build(adapters.RawAdapter{})
-preloads := adapters.BuildRawPreloads(f)          // map[string]RawPreload
+preloads, err := adapters.BuildRawPreloads(f)     // map[string]RawPreload
 // preloads["Orders"] == RawPreload{Where: "`total` > ?", Args: []any{int64(100)}}
 ```
 
@@ -515,6 +519,7 @@ func (MyQuery) IsQuery() {}
 AddFiltersFromString(dsl string) error
 AddFilter(exp Expr)                 // add a programmatic AST node
 Build(adapter Adapter)              // pass nil to rebuild with the current adapter
+BuildE(adapter Adapter) error       // Build + an error for everything the parser dropped
 GetClauses() []Expr
 GetPreloads() map[string][]Expr
 GetDSL() string
@@ -595,6 +600,8 @@ f.Build(adapters.RawAdapter{})
 
 // Also on the plugin: DisableFieldWhitelist(), IsFieldAllowed(field), IsFieldWhitelistEnabled(), GetAllowedFields()
 ```
+
+Like ignore names, whitelist names match both the raw and naming-converted spelling — `SetAllowedFields("userName")` allows the parsed `user_name` field under the default snake_case strategy.
 
 **Select fields** — restrict returned columns (SQL `SELECT`, ES `_source`). Selects are projection state consumed by the adapters, so they stay on the instance itself:
 
@@ -759,7 +766,7 @@ f.UnregisterPlugin("my-plugin")
 
 All hooks fire automatically:
 
-- `BeforeParse` / `AfterParse` inside `AddFiltersFromString` (`BeforeParse` can rewrite the DSL; an `AfterParse` error fails the call).
+- `BeforeParse` / `AfterParse` inside `AddFiltersFromString` (`BeforeParse` can rewrite the DSL; an `AfterParse` error fails the call **and rolls the instance's DSL back to the previous value** — a rejected DSL is never left armed for a later `Build`, even if the caller ignores the error).
 - `FilterExpr` (optional) on every expression entering the clause tree — `Build` and `AddFilter` alike.
 - `FinalizeClauses` (optional) once at the end of every `Build`, even one with no filters.
 - `BeforeQuery` / `AfterQuery` around every `GetSqlString` / `GetQuery` render. A `BeforeQuery` error vetoes the render (`""` / `nil` is returned); an `AfterQuery` error vetoes the rendered result the same way — useful for authorization, auditing, and logging. On the cached paths (`CachePlugin.GetCached*`) they fire on misses, when a render actually happens, not on hits.
@@ -858,10 +865,11 @@ Advanced expression types (programmatic `AddFilter` only — no DSL syntax) rend
 - **MongoDB**: `JsonPathExpr` → dotted-path match (`data.user.name`), `ArrayContainsExpr` → `$all`, `ArrayOverlapsExpr` → `$in`, `FullTextSearchExpr` → `$text`/`$search` (top-level only; rejected inside preload matches), `GeoDistanceExpr` → `$geoWithin`/`$centerSphere` with km/m/mi unit conversion to radians. The adapter also converts valid hex-string values to `primitive.ObjectID` on `_id` by default — configure with `MongoAdapter{ObjectIDFields: []string{"_id", "user_id"}}` (an explicit empty slice disables it).
 - **Elasticsearch**: `JsonPathExpr` → dotted-field `term`/`range`/`exists`, `ArrayContainsExpr` → `bool.must` of per-value `term`s, `ArrayOverlapsExpr` → `terms`, `FullTextSearchExpr` → `match` (or `multi_match` when no field is set; `Language` becomes the analyzer), `GeoDistanceExpr` → `geo_distance` with km/m/mi units.
 
-Partial / not yet wired (defined in the API but not auto-invoked or without adapter support):
+`CustomExpr` renders on the **SQL adapters** (raw SQL and GORM): its handler receives the field verbatim plus the operator and value, and returns a SQL fragment with `?` placeholders and bind args. The Mongo and Elasticsearch adapters reject it — its output is a SQL fragment.
 
-- Advanced expression types on the **SQL adapters** (raw SQL and GORM) — these still return an "unsupported expression" error rather than rendering.
-- `CustomExpr` — its handler emits SQL fragments, so the Mongo and Elasticsearch adapters reject it with an "unsupported expression" error.
+Partial / not yet wired (defined in the API but without adapter support):
+
+- Advanced expression types on the **SQL adapters** (raw SQL and GORM) — these return an "unsupported expression" error rather than rendering. Nothing is silently dropped: the raw `Build*` helpers return the error, `RawAdapter` fails the render (`ok=false`), and `ApplyGorm` records it on the `*gorm.DB` so the query never executes.
 
 
 ## Playground

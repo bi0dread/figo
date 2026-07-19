@@ -20,7 +20,7 @@ func TestScopePlugin(t *testing.T) {
 		require.NoError(t, f.AddFiltersFromString(`name="x"`))
 		f.Build(RawAdapter{})
 
-		where, args := BuildRawWhere(f)
+		where, args, _ := BuildRawWhere(f)
 		assert.Contains(t, where, "`name` = ?")
 		assert.Contains(t, where, "`tenant_id` = ?")
 		assert.Contains(t, args, int64(42))
@@ -32,7 +32,7 @@ func TestScopePlugin(t *testing.T) {
 		require.NoError(t, f.RegisterPlugin(NewScopePlugin(scope)))
 		f.Build(RawAdapter{})
 
-		where, args := BuildRawWhere(f)
+		where, args, _ := BuildRawWhere(f)
 		assert.Equal(t, "`tenant_id` = ?", where)
 		assert.Equal(t, []any{int64(42)}, args)
 	})
@@ -45,7 +45,7 @@ func TestScopePlugin(t *testing.T) {
 		f.Build(nil)
 		f.Build(nil)
 
-		_, args := BuildRawWhere(f)
+		_, args, _ := BuildRawWhere(f)
 		assert.Len(t, args, 2, "rebuilds must not accumulate scope copies")
 
 		// Empty-DSL rebuilds keep existing clauses; still no duplicates.
@@ -67,7 +67,7 @@ func TestScopePlugin(t *testing.T) {
 		require.NoError(t, f.AddFiltersFromString(`name="x" and tenant_id=999`))
 		f.Build(RawAdapter{})
 
-		where, args := BuildRawWhere(f)
+		where, args, _ := BuildRawWhere(f)
 		// The caller's own tenant_id=999 is pruned by the whitelist; the
 		// server-side scope (injected after pruning) survives.
 		assert.Contains(t, where, "`tenant_id` = ?")

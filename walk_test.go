@@ -21,7 +21,7 @@ func TestWalkMutatesFieldInPlace(t *testing.T) {
 		}
 	})
 
-	where, _ := BuildRawWhere(f)
+	where, _, _ := BuildRawWhere(f)
 	assert.Contains(t, where, "`users.first_name`")
 	assert.NotContains(t, where, "`first_name` =")
 	// The other node is untouched.
@@ -44,7 +44,7 @@ func TestWalkNodeFieldHelpers(t *testing.T) {
 	})
 	assert.Equal(t, 4, renamed, "every field-bearing node should be reachable and renamed")
 
-	where, _ := BuildRawWhere(f)
+	where, _, _ := BuildRawWhere(f)
 	assert.NotContains(t, where, "`first_name`")
 	assert.Contains(t, where, "`users.first_name`")
 }
@@ -62,10 +62,10 @@ func TestWalkReachesNestedAndPreloads(t *testing.T) {
 	})
 
 	// Root clause updated.
-	where, _ := BuildRawWhere(f)
+	where, _, _ := BuildRawWhere(f)
 	assert.Contains(t, where, "`u.first_name`")
 	// Preload clause updated too.
-	pre := BuildRawPreloads(f)
+	pre, _ := BuildRawPreloads(f)
 	po, ok := pre["orders"]
 	assert.True(t, ok)
 	assert.Contains(t, po.Where, "`u.first_name`")

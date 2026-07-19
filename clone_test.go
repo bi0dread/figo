@@ -18,8 +18,8 @@ func TestCloneProducesEqualQuery(t *testing.T) {
 
 	// Same rendered output.
 	assert.Equal(t, f.Explain(), c.Explain())
-	fw, fa := BuildRawWhere(f)
-	cw, ca := BuildRawWhere(c)
+	fw, fa, _ := BuildRawWhere(f)
+	cw, ca, _ := BuildRawWhere(c)
 	assert.Equal(t, fw, cw)
 	assert.Equal(t, fa, ca)
 	assert.Equal(t, f.GetPage(), c.GetPage())

@@ -29,7 +29,7 @@ func TestRegr_SpacedOperatorWithSpecialFieldNames(t *testing.T) {
 		f := New()
 		require.NoError(t, f.AddFiltersFromString(tc.dsl))
 		f.Build(RawAdapter{})
-		where, args := BuildRawWhere(f)
+		where, args, _ := BuildRawWhere(f)
 		assert.Equal(t, tc.wantCol, where, "dsl=%q", tc.dsl)
 		assert.Equal(t, tc.wantArgs, args, "dsl=%q", tc.dsl)
 		assert.NotContains(t, where, "`` ", "empty column leaked for %q", tc.dsl)
@@ -39,7 +39,7 @@ func TestRegr_SpacedOperatorWithSpecialFieldNames(t *testing.T) {
 	f := New()
 	require.NoError(t, f.AddFiltersFromString(`a.b <bet> (1..2)`))
 	f.Build(RawAdapter{})
-	where, args := BuildRawWhere(f)
+	where, args, _ := BuildRawWhere(f)
 	assert.Equal(t, "`a_b` BETWEEN ? AND ?", where)
 	assert.Equal(t, []any{int64(1), int64(2)}, args)
 }
