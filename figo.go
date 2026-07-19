@@ -7,6 +7,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"unicode"
 
 	"github.com/gobeam/stringy"
 )
@@ -1090,15 +1091,16 @@ func isSimpleFieldName(token string) bool {
 		return false
 	}
 
-	// Must contain only field-name characters. Besides [A-Za-z0-9_] this allows
-	// '.', '-' and '$' so qualified/kebab/Mongo-style names (user.age, user-name,
-	// price$) are recognized as fields — without this, such a name followed by a
-	// *spaced* operator ("user.age > 5") failed to combine and emitted a predicate
-	// on an empty column. Operator characters (= > < ! ^ ~) are already rejected
-	// by the guard above, so widening here can't swallow an operator token.
+	// Must contain only field-name characters: any Unicode letter or digit
+	// (not just ASCII — an ASCII-only check made a non-Latin name followed by
+	// a *spaced* operator, e.g. `سن > 5`, fail to combine and emit a predicate
+	// on an empty column), plus '_', '.', '-' and '$' so qualified/kebab/
+	// Mongo-style names (user.age, user-name, price$) are recognized as fields.
+	// Operator characters (= > < ! ^ ~) are already rejected by the guard
+	// above, so widening here can't swallow an operator token.
 	for _, char := range token {
-		if !((char >= 'a' && char <= 'z') || (char >= 'A' && char <= 'Z') ||
-			(char >= '0' && char <= '9') || char == '_' || char == '.' || char == '-' || char == '$') {
+		if !(unicode.IsLetter(char) || unicode.IsDigit(char) ||
+			char == '_' || char == '.' || char == '-' || char == '$') {
 			return false
 		}
 	}
@@ -1414,108 +1416,93 @@ func buildExpressionTreeWithPrecedence(children []*Node) Expr {
 	return processWithPrecedence(items)
 }
 
-// processWithPrecedence processes expressions with proper operator precedence
+// processWithPrecedence reduces the interleaved expression/operator sequence
+// with NOT > AND > OR precedence. Every pass works POSITIONALLY on the item
+// sequence itself — the previous implementation split items into parallel
+// expressions[]/operators[] slices and paired them by index, which drifts one
+// slot whenever a connector is implicit: "a=1 not b=2" negated a instead of b,
+// and "a=1 b=2 or c=3" attached the OR to (a,b) instead of (b,c).
 func processWithPrecedence(items []interface{}) Expr {
 	if len(items) == 0 {
 		return nil
 	}
 
-	// Convert to a more manageable structure
-	var expressions []Expr
-	var operators []Operation
-
+	// First pass: NOT (highest precedence, unary prefix). A NOT wraps the NEXT
+	// expression in source order; consecutive NOTs stack ("not not a=1").
+	// A trailing NOT with no operand is dropped.
+	resolved := make([]interface{}, 0, len(items))
+	pendingNots := 0
 	for _, item := range items {
 		switch v := item.(type) {
-		case Expr:
-			expressions = append(expressions, v)
 		case Operation:
-			operators = append(operators, v)
-		}
-	}
-
-	if len(expressions) == 0 {
-		return nil
-	}
-
-	// Process operators in precedence order: NOT > AND > OR
-	// We need to handle this more carefully to respect the tree structure
-
-	// First pass: Handle NOT operators (highest precedence, unary prefix).
-	// This must run BEFORE the single-expression short-circuit below, otherwise
-	// a leading NOT applied to a single operand ("not a=1") or to a parenthesized
-	// group ("not (a=1 or b=2)") is silently dropped, inverting query semantics.
-	for i := 0; i < len(operators); i++ {
-		if operators[i] == OperationNot {
-			// Find the next expression to negate
-			if i < len(expressions) {
-				expressions[i] = NotExpr{Operands: []Expr{expressions[i]}}
-				// Remove the NOT operator
-				operators = append(operators[:i], operators[i+1:]...)
-				i-- // Adjust index
+			if v == OperationNot {
+				pendingNots++
+			} else {
+				resolved = append(resolved, v)
 			}
-		}
-	}
-
-	// If only one expression remains (after applying any NOT), return it
-	if len(expressions) == 1 {
-		return expressions[0]
-	}
-
-	// Second pass: Handle AND operators (medium precedence)
-	// Process AND operators from left to right
-	for i := 0; i < len(operators); i++ {
-		if operators[i] == OperationAnd {
-			// Find the expressions to combine
-			left := i
-			right := i + 1
-
-			if left < len(expressions) && right < len(expressions) {
-				// Create AND expression
-				andExpr := AndExpr{Operands: []Expr{expressions[left], expressions[right]}}
-
-				// Replace the two expressions with the combined one
-				expressions = append(expressions[:left], append([]Expr{andExpr}, expressions[right+1:]...)...)
-
-				// Remove the AND operator
-				operators = append(operators[:i], operators[i+1:]...)
-				i-- // Adjust index
+		case Expr:
+			e := v
+			for ; pendingNots > 0; pendingNots-- {
+				e = NotExpr{Operands: []Expr{e}}
 			}
+			resolved = append(resolved, e)
 		}
 	}
 
-	// Third pass: Handle OR operators (lowest precedence)
-	// Process OR operators from left to right
-	for i := 0; i < len(operators); i++ {
-		if operators[i] == OperationOr {
-			// Find the expressions to combine
-			left := i
-			right := i + 1
-
-			if left < len(expressions) && right < len(expressions) {
-				// Create OR expression
-				orExpr := OrExpr{Operands: []Expr{expressions[left], expressions[right]}}
-
-				// Replace the two expressions with the combined one
-				expressions = append(expressions[:left], append([]Expr{orExpr}, expressions[right+1:]...)...)
-
-				// Remove the OR operator
-				operators = append(operators[:i], operators[i+1:]...)
-				i-- // Adjust index
-			}
-		}
-	}
+	// Second and third passes: the binary connectors, in precedence order.
+	resolved = reduceBinary(resolved, OperationAnd)
+	resolved = reduceBinary(resolved, OperationOr)
 
 	// Any expressions still left are adjacent with no logical operator between
 	// them (e.g. "a=1 b=2", or a filter following a load=/sort=/page= segment
 	// that emits no connector). Combine them with an implicit AND instead of
 	// silently dropping all but the first.
+	var expressions []Expr
+	for _, item := range resolved {
+		if e, ok := item.(Expr); ok {
+			expressions = append(expressions, e)
+		}
+	}
+	if len(expressions) == 0 {
+		return nil
+	}
 	if len(expressions) == 1 {
 		return expressions[0]
 	}
-	if len(expressions) > 1 {
-		return AndExpr{Operands: expressions}
+	return AndExpr{Operands: expressions}
+}
+
+// reduceBinary combines every "expr op expr" triple for one connector,
+// left-associatively, preserving source positions. A dangling connector with
+// no expression on one side (leading/trailing/doubled "and"/"or") is dropped
+// rather than pairing two unrelated expressions.
+func reduceBinary(items []interface{}, op Operation) []interface{} {
+	out := make([]interface{}, 0, len(items))
+	for i := 0; i < len(items); i++ {
+		o, isOp := items[i].(Operation)
+		if !isOp || o != op {
+			out = append(out, items[i])
+			continue
+		}
+
+		var left, right Expr
+		var lok, rok bool
+		if len(out) > 0 {
+			left, lok = out[len(out)-1].(Expr)
+		}
+		if i+1 < len(items) {
+			right, rok = items[i+1].(Expr)
+		}
+		if lok && rok {
+			if op == OperationAnd {
+				out[len(out)-1] = AndExpr{Operands: []Expr{left, right}}
+			} else {
+				out[len(out)-1] = OrExpr{Operands: []Expr{left, right}}
+			}
+			i++ // the right operand is consumed
+		}
 	}
-	return nil
+	return out
 }
 
 func getFinalExpr(node Node) Expr {
