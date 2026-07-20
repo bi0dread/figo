@@ -65,7 +65,8 @@ export function Palette({ onAdd }: Props) {
       ))}
       <div className="palette-help">
         Drag blocks onto the canvas, wire them into the <b>Query</b> node, and the DSL updates
-        live. Inputs merge top&nbsp;→&nbsp;bottom. Backspace deletes a selection.
+        live. Inputs merge top&nbsp;→&nbsp;bottom. Click <b>×</b> on a block or connection to
+        remove it (Backspace works too).
       </div>
     </aside>
   )

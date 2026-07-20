@@ -225,12 +225,52 @@ body,
 }
 
 .node-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
   font-size: 10px;
   font-weight: 700;
   text-transform: uppercase;
   letter-spacing: 1.1px;
   padding: 6px 10px 4px;
   border-bottom: 1px solid var(--border);
+}
+
+/* remove-node button */
+
+.node-del {
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  margin: -2px -4px -2px 0;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  border-radius: 4px;
+  color: var(--muted);
+  font-size: 13px;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.node-del:hover {
+  background: rgba(248, 113, 113, 0.15);
+  color: var(--c-not);
+}
+
+.node-logic {
+  position: relative;
+}
+
+.node-logic .node-del {
+  position: absolute;
+  top: 3px;
+  right: 4px;
+  margin: 0;
 }
 
 .node-condition .node-head {
@@ -369,6 +409,38 @@ body,
 
 .react-flow__handle.connectingto {
   background: var(--c-load);
+}
+
+/* remove-connection pip on edges */
+
+.edge-del {
+  position: absolute;
+  pointer-events: all;
+  width: 15px;
+  height: 15px;
+  padding: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--card);
+  border: 1px solid var(--card-border);
+  border-radius: 50%;
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0.75;
+  transition:
+    opacity 0.12s,
+    border-color 0.12s,
+    color 0.12s;
+}
+
+.edge-del:hover {
+  opacity: 1;
+  border-color: var(--c-not);
+  color: var(--c-not);
+  background: rgba(248, 113, 113, 0.12);
 }
 
 /* ---------- DSL panel ---------- */
