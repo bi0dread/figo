@@ -19,6 +19,22 @@ export const OPERATORS: { value: string; label: string }[] = [
   { value: '<notnull>', label: '<notnull>  is not null' },
 ]
 
+function DeleteButton({ id }: { id: string }) {
+  const { deleteElements } = useReactFlow()
+  return (
+    <button
+      className="node-del nodrag"
+      title="Remove"
+      onClick={(e) => {
+        e.stopPropagation()
+        deleteElements({ nodes: [{ id }] })
+      }}
+    >
+      ×
+    </button>
+  )
+}
+
 function valuePlaceholder(op: string): string {
   if (op === '<in>' || op === '<nin>') return 'a, b, c'
   if (op === '=^' || op === '!=^' || op === '.=^') return '%pattern%'
@@ -33,7 +49,10 @@ export function ConditionNode({ id, data }: NodeProps) {
   const isRange = op === '<bet>'
   return (
     <div className="node node-condition">
-      <div className="node-head">Condition</div>
+      <div className="node-head">
+        Condition
+        <DeleteButton id={id} />
+      </div>
       <div className="node-body">
         <input
           className="nodrag"
@@ -83,10 +102,11 @@ export function ConditionNode({ id, data }: NodeProps) {
   )
 }
 
-export function LogicNode({ data }: NodeProps) {
+export function LogicNode({ id, data }: NodeProps) {
   const kind = String(data.kind ?? 'and')
   return (
     <div className={`node node-logic node-logic-${kind}`}>
+      <DeleteButton id={id} />
       <Handle type="target" position={Position.Left} id="in" />
       <div className="logic-label">{kind}</div>
       <div className="logic-hint">
@@ -101,7 +121,10 @@ export function SortNode({ id, data }: NodeProps) {
   const { updateNodeData } = useReactFlow()
   return (
     <div className="node node-sort">
-      <div className="node-head">Sort</div>
+      <div className="node-head">
+        Sort
+        <DeleteButton id={id} />
+      </div>
       <div className="node-body row">
         <input
           className="nodrag"
@@ -127,7 +150,10 @@ export function PageNode({ id, data }: NodeProps) {
   const { updateNodeData } = useReactFlow()
   return (
     <div className="node node-page">
-      <div className="node-head">Page</div>
+      <div className="node-head">
+        Page
+        <DeleteButton id={id} />
+      </div>
       <div className="node-body row">
         <label>
           skip
@@ -159,7 +185,10 @@ export function LoadNode({ id, data }: NodeProps) {
   const { updateNodeData } = useReactFlow()
   return (
     <div className="node node-load">
-      <div className="node-head">Load (preload)</div>
+      <div className="node-head">
+        Load (preload)
+        <DeleteButton id={id} />
+      </div>
       <div className="node-body">
         <input
           className="nodrag"

@@ -15,6 +15,7 @@ import {
   type IsValidConnection,
 } from '@xyflow/react'
 import { nodeTypes } from './nodes'
+import { edgeTypes } from './edges'
 import { Palette, type PaletteItem } from './Palette'
 import { DslPanel } from './DslPanel'
 import { generateDsl, type AppNode } from './dsl'
@@ -73,6 +74,7 @@ function mkEdge(source: string, target: string, targetHandle: string, kind: Kind
     source,
     target,
     targetHandle,
+    type: 'pip',
     style: { stroke: EDGE_COLORS[kind], strokeWidth: 1.6 },
   }
 }
@@ -210,7 +212,7 @@ function Flow() {
           )
         }
         return addEdge(
-          { ...conn, style: { stroke: EDGE_COLORS[kind], strokeWidth: 1.6 } },
+          { ...conn, type: 'pip', style: { stroke: EDGE_COLORS[kind], strokeWidth: 1.6 } },
           next,
         )
       })
@@ -288,6 +290,7 @@ function Flow() {
             nodes={displayNodes}
             edges={edges}
             nodeTypes={nodeTypes}
+            edgeTypes={edgeTypes}
             onNodesChange={onNodesChange}
             onEdgesChange={onEdgesChange}
             onConnect={onConnect}
