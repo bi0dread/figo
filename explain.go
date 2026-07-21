@@ -14,7 +14,7 @@ import (
 // Example:
 //
 //	f.AddFiltersFromString(`id=1 and (age>20 or active=true)`)
-//	f.Build()
+//	f.Build(nil)
 //	fmt.Println(f.Explain())
 //
 //	AND

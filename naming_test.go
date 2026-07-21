@@ -42,6 +42,44 @@ func TestCustomNamingFunc(t *testing.T) {
 	})
 }
 
+// SnakeCaseNaming's conversion contract, pinned against the exact outputs of
+// the gobeam/stringy implementation it replaced: words split at separators
+// and lower→UPPER boundaries only — acronym runs stay glued, digits never
+// open a boundary, separator runs collapse, symbols pass through, leading
+// underscores are preserved.
+func TestSnakeCaseNamingContract(t *testing.T) {
+	cases := map[string]string{
+		"userId":         "user_id",
+		"userName":       "user_name",
+		"userID":         "user_id",
+		"parentID":       "parent_id",
+		"HTTPServer":     "httpserver",
+		"XMLHttpRequest": "xmlhttp_request",
+		"OrderItemsV2":   "order_items_v2",
+		"myURL2Path":     "my_url2path",
+		"USERId":         "userid",
+		"ABC":            "abc",
+		"ID":             "id",
+		"id":             "id",
+		"N":              "n",
+		"user123":        "user123",
+		"a1B2":           "a1b2",
+		"snake_case":     "snake_case",
+		"user__name":     "user_name",
+		"user.age":       "user_age",
+		"user-name":      "user_name",
+		"user name":      "user_name",
+		"price$":         "price$",
+		"_id":            "_id",
+		"__v":            "__v",
+		"سن":             "سن",
+		"émailAddress":   "émail_address",
+	}
+	for in, want := range cases {
+		assert.Equal(t, want, SnakeCaseNaming(in), "input %q", in)
+	}
+}
+
 func TestNoChangeNamingLeavesNameUnchanged(t *testing.T) {
 	f := New()
 	f.SetNamingFunc(NoChangeNaming)

@@ -89,11 +89,11 @@ func TestBuildStaysSilentAndIdenticalToBuildE(t *testing.T) {
 // rejected DSL armed for a later Build.
 type afterParseRejector struct{}
 
-func (afterParseRejector) Name() string                                { return "after-parse-rejector" }
-func (afterParseRejector) Version() string                             { return "1.0.0" }
-func (afterParseRejector) Initialize(Figo) error                       { return nil }
-func (afterParseRejector) BeforeQuery(Figo, any) error                 { return nil }
-func (afterParseRejector) AfterQuery(Figo, any, interface{}) error     { return nil }
+func (afterParseRejector) Name() string                                   { return "after-parse-rejector" }
+func (afterParseRejector) Version() string                                { return "1.0.0" }
+func (afterParseRejector) Initialize(Figo) error                          { return nil }
+func (afterParseRejector) BeforeQuery(Figo, any) error                    { return nil }
+func (afterParseRejector) AfterQuery(Figo, any, interface{}) error        { return nil }
 func (afterParseRejector) BeforeParse(_ Figo, dsl string) (string, error) { return dsl, nil }
 func (afterParseRejector) AfterParse(_ Figo, dsl string) error {
 	if strings.Contains(dsl, "reject") {

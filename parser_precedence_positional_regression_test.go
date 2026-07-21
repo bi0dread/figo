@@ -60,36 +60,44 @@ func TestNotBindingWithExplicitConnectorsUnchanged(t *testing.T) {
 }
 
 // The same index drift mispaired binary connectors when an implicit AND was
-// present: "a=1 b=2 or c=3" attached the OR to (a,b). An explicit connector
-// must pair the expressions at its source position; only the leftover
-// adjacent expressions combine under the implicit AND, last.
-func TestExplicitConnectorPairsAtSourcePosition(t *testing.T) {
+// present: "a=1 b=2 or c=3" attached the OR to (a,b) instead of (b,c). The
+// implicit AND is now inserted BEFORE the binary reduction passes, so
+// adjacency binds exactly like a written "and" — the implicit and explicit
+// forms build identical trees. (Previously the implicit join ran after OR
+// reduction, silently making adjacency bind looser than or.)
+func TestImplicitAndBindsLikeExplicitAnd(t *testing.T) {
 	t.Run("implicit then or", func(t *testing.T) {
-		and, ok := buildOnePositional(t, `a=1 b=2 or c=3`).(AndExpr)
+		or, ok := buildOnePositional(t, `a=1 b=2 or c=3`).(OrExpr)
 		require.True(t, ok)
-		require.Len(t, and.Operands, 2)
-		assert.Equal(t, EqExpr{Field: "a", Value: int64(1)}, and.Operands[0])
-		assert.Equal(t, OrExpr{Operands: []Expr{
+		require.Len(t, or.Operands, 2)
+		assert.Equal(t, AndExpr{Operands: []Expr{
+			EqExpr{Field: "a", Value: int64(1)},
 			EqExpr{Field: "b", Value: int64(2)},
-			EqExpr{Field: "c", Value: int64(3)},
-		}}, and.Operands[1])
+		}}, or.Operands[0])
+		assert.Equal(t, EqExpr{Field: "c", Value: int64(3)}, or.Operands[1])
 	})
 
 	t.Run("or then implicit", func(t *testing.T) {
-		and, ok := buildOnePositional(t, `a=1 or b=2 c=3`).(AndExpr)
+		or, ok := buildOnePositional(t, `a=1 or b=2 c=3`).(OrExpr)
 		require.True(t, ok)
-		require.Len(t, and.Operands, 2)
-		assert.Equal(t, OrExpr{Operands: []Expr{
-			EqExpr{Field: "a", Value: int64(1)},
+		require.Len(t, or.Operands, 2)
+		assert.Equal(t, EqExpr{Field: "a", Value: int64(1)}, or.Operands[0])
+		assert.Equal(t, AndExpr{Operands: []Expr{
 			EqExpr{Field: "b", Value: int64(2)},
-		}}, and.Operands[0])
-		assert.Equal(t, EqExpr{Field: "c", Value: int64(3)}, and.Operands[1])
+			EqExpr{Field: "c", Value: int64(3)},
+		}}, or.Operands[1])
+	})
+
+	t.Run("implicit equals explicit", func(t *testing.T) {
+		implicit := buildOnePositional(t, `a=1 b=2 or c=3`)
+		explicit := buildOnePositional(t, `a=1 and b=2 or c=3`)
+		assert.Equal(t, explicit, implicit)
 	})
 }
 
 // isSimpleFieldName was ASCII-only, so a non-Latin field name followed by a
 // SPACED operator failed to combine and emitted a predicate on an empty
-// column (`سن > 5` rendered "`` > ''"). Any Unicode letter/digit is a valid
+// column (`سن > 5` rendered "“ > ”"). Any Unicode letter/digit is a valid
 // field-name character; the unspaced form already worked and must keep working.
 func TestUnicodeFieldNamesWithSpacedOperator(t *testing.T) {
 	t.Run("arabic spaced", func(t *testing.T) {

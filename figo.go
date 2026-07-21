@@ -9,8 +9,6 @@ import (
 	"sync/atomic"
 	"time"
 	"unicode"
-
-	"github.com/gobeam/stringy"
 )
 
 // Global configuration
@@ -45,24 +43,58 @@ type NamingFunc func(field string) string
 
 // SnakeCaseNaming is the default NamingFunc: userName -> user_name.
 var SnakeCaseNaming NamingFunc = func(field string) string {
-	// stringy drops leading underscores ("_id" -> "id"), which would silently
-	// break fields like Mongo's canonical _id — split them off and restore
-	// them after conversion.
+	// snakeCaseWords treats leading underscores as separators and drops them
+	// ("_id" -> "id"), which would silently break fields like Mongo's
+	// canonical _id — split them off and restore them after conversion.
 	trimmed := strings.TrimLeft(field, "_")
 	prefix := field[:len(field)-len(trimmed)]
-	// Use stringy to convert to snake_case, but handle edge cases: if stringy
-	// returns an empty string, fall back to the original name rather than
-	// silently dropping the column.
-	result := stringy.New(trimmed).SnakeCase("?", "").ToLower()
+	// If conversion yields an empty string (a name of only separator runes),
+	// fall back to the original name rather than silently dropping the column.
+	result := snakeCaseWords(trimmed)
 	if result == "" {
 		return field
 	}
 	return prefix + result
 }
 
+// snakeCaseWords converts a name to snake_case: words split at separator
+// runes ('_', '-', '.', ' ') and at a lower→UPPER case boundary, then join
+// with '_' lowercased. It replicates the exact conversion previously
+// delegated to github.com/gobeam/stringy (figo's only use of the module):
+// acronym runs stay glued ("userID" -> "user_id", "HTTPServer" ->
+// "httpserver"), digits never open a boundary ("myURL2Path" ->
+// "my_url2path"), separator runs collapse ("user__name" -> "user_name"),
+// and non-separator symbols pass through ("price$" -> "price$").
+func snakeCaseWords(s string) string {
+	var b strings.Builder
+	b.Grow(len(s) + 4)
+	prevLower := false
+	wordStarted := false
+	pendingSep := false
+	for _, r := range s {
+		if r == '_' || r == '-' || r == '.' || r == ' ' {
+			pendingSep = wordStarted // collapse runs; leading separators drop
+			prevLower = false
+			continue
+		}
+		if wordStarted && (pendingSep || (prevLower && unicode.IsUpper(r))) {
+			b.WriteByte('_')
+		}
+		pendingSep = false
+		wordStarted = true
+		prevLower = unicode.IsLower(r)
+		b.WriteRune(unicode.ToLower(r))
+	}
+	return b.String()
+}
+
 // NoChangeNaming leaves field names exactly as written in the DSL.
 var NoChangeNaming NamingFunc = func(field string) string { return field }
 
+// Operation names a DSL operator or directive token. The comparison values
+// (OperationEq, OperationGt, ...) mirror the literal DSL spelling; the
+// bracketed ones (OperationBetween, OperationIn, ...) are the DSL's
+// angle-bracket operators; Sort/Page/Load are the query directives.
 type Operation string
 
 const (
@@ -93,6 +125,8 @@ const (
 
 // AdapterType removed: adapters are selected via Adapter objects
 
+// Page is the pagination state: Skip rows to offset, Take rows to return.
+// Take <= 0 means "no limit" on every adapter (GORM never renders LIMIT 0).
 type Page struct {
 	Skip int
 	Take int
@@ -106,7 +140,7 @@ type Plugin interface {
 	Version() string
 	Initialize(f Figo) error
 	BeforeQuery(f Figo, ctx any) error
-	AfterQuery(f Figo, ctx any, result interface{}) error
+	AfterQuery(f Figo, ctx any, result any) error
 	BeforeParse(f Figo, dsl string) (string, error)
 	AfterParse(f Figo, dsl string) error
 }
@@ -135,9 +169,12 @@ type ClauseFinalizer interface {
 	FinalizeClauses(f Figo, clauses []Expr) []Expr
 }
 
-// PluginManager manages plugins
+// PluginManager manages plugins. Hooks run in REGISTRATION ORDER — the order
+// is part of the contract (iterating the map made every dispatch order random,
+// so two DSL-rewriting plugins composed differently from call to call).
 type PluginManager struct {
 	plugins map[string]Plugin
+	order   []string // registration order; drives ListPlugins and every Execute*
 	mu      sync.RWMutex
 }
 
@@ -167,6 +204,7 @@ func (pm *PluginManager) RegisterPlugin(plugin Plugin) error {
 	}
 
 	pm.plugins[name] = plugin
+	pm.order = append(pm.order, name)
 	return nil
 }
 
@@ -180,6 +218,12 @@ func (pm *PluginManager) UnregisterPlugin(name string) error {
 	}
 
 	delete(pm.plugins, name)
+	for i, n := range pm.order {
+		if n == name {
+			pm.order = append(pm.order[:i], pm.order[i+1:]...)
+			break
+		}
+	}
 	return nil
 }
 
@@ -192,14 +236,15 @@ func (pm *PluginManager) GetPlugin(name string) (Plugin, bool) {
 	return plugin, exists
 }
 
-// ListPlugins returns all registered plugins
+// ListPlugins returns all registered plugins in registration order (the order
+// every hook dispatch uses).
 func (pm *PluginManager) ListPlugins() []Plugin {
 	pm.mu.RLock()
 	defer pm.mu.RUnlock()
 
-	plugins := make([]Plugin, 0, len(pm.plugins))
-	for _, plugin := range pm.plugins {
-		plugins = append(plugins, plugin)
+	plugins := make([]Plugin, 0, len(pm.order))
+	for _, name := range pm.order {
+		plugins = append(plugins, pm.plugins[name])
 	}
 	return plugins
 }
@@ -219,7 +264,7 @@ func (pm *PluginManager) ExecuteBeforeQuery(f Figo, ctx any) error {
 }
 
 // ExecuteAfterQuery executes all plugins' AfterQuery hooks
-func (pm *PluginManager) ExecuteAfterQuery(f Figo, ctx any, result interface{}) error {
+func (pm *PluginManager) ExecuteAfterQuery(f Figo, ctx any, result any) error {
 	for _, plugin := range pm.ListPlugins() {
 		if err := plugin.AfterQuery(f, ctx, result); err != nil {
 			return fmt.Errorf("plugin %s AfterQuery error: %w", plugin.Name(), err)
@@ -297,44 +342,62 @@ func (e *ParseError) Error() string {
 // Expr represents an ORM-agnostic expression node
 type Expr interface{ isExpr() }
 
-// Comparison expressions
+// EqExpr matches rows whose Field equals Value (DSL: field=value).
 type EqExpr struct {
 	Field string
 	Value any
 }
+
+// GteExpr matches rows whose Field is >= Value (DSL: field>=value).
 type GteExpr struct {
 	Field string
 	Value any
 }
+
+// GtExpr matches rows whose Field is > Value (DSL: field>value).
 type GtExpr struct {
 	Field string
 	Value any
 }
+
+// LtExpr matches rows whose Field is < Value (DSL: field<value).
 type LtExpr struct {
 	Field string
 	Value any
 }
+
+// LteExpr matches rows whose Field is <= Value (DSL: field<=value).
 type LteExpr struct {
 	Field string
 	Value any
 }
+
+// NeqExpr matches rows whose Field differs from Value (DSL: field!=value).
 type NeqExpr struct {
 	Field string
 	Value any
 }
+
+// LikeExpr matches Field against a SQL LIKE pattern (DSL: field=^pattern).
+// Mongo renders it as an anchored regex, Elasticsearch as a wildcard query.
 type LikeExpr struct {
 	Field string
 	Value any
 }
 
-// Regex expression
+// RegexExpr matches Field against a regular expression (DSL: field=~pattern),
+// with unanchored "contains" semantics on every adapter.
 type RegexExpr struct {
 	Field string
 	Value any
 }
 
-// Logical expressions
+// AndExpr matches when every operand matches.
 type AndExpr struct{ Operands []Expr }
+
+// OrExpr matches when at least one operand matches. An OrExpr with no
+// renderable operands is a false disjunction: every adapter renders it as
+// match-nothing (it never silently vanishes from the query).
 type OrExpr struct{ Operands []Expr }
 
 // NotExpr matches when NONE of its operands match: NOT(a OR b). All adapters
@@ -343,12 +406,13 @@ type OrExpr struct{ Operands []Expr }
 // multi-operand forms come from AddFilter.
 type NotExpr struct{ Operands []Expr }
 
-// Sorting expressions
+// OrderByColumn is one sort key: a column name and its direction.
 type OrderByColumn struct {
 	Name string
 	Desc bool
 }
 
+// OrderBy is the parsed sort= directive: sort keys in priority order.
 type OrderBy struct{ Columns []OrderByColumn }
 
 // Query is a marker interface for adapter-agnostic rendered queries
@@ -379,26 +443,38 @@ func (OrExpr) isExpr()    {}
 func (NotExpr) isExpr()   {}
 func (OrderBy) isExpr()   {}
 
+// InExpr matches rows whose Field equals any of Values (DSL: field<in>[...]).
+// An empty Values list matches nothing on every adapter (never dropped).
 type InExpr struct {
 	Field  string
 	Values []any
 }
 
+// NotInExpr matches rows whose Field equals none of Values (DSL:
+// field<nin>[...]). An empty Values list matches everything.
 type NotInExpr struct {
 	Field  string
 	Values []any
 }
 
+// BetweenExpr matches rows whose Field lies in [Low, High], inclusive on both
+// ends on every adapter (DSL: field<bet>(low..high)).
 type BetweenExpr struct {
 	Field string
 	Low   any
 	High  any
 }
 
+// IsNullExpr matches rows whose Field is NULL (DSL: field<null> or field=null).
+// Document stores (Mongo/Elasticsearch) also match documents missing the field.
 type IsNullExpr struct{ Field string }
 
+// NotNullExpr matches rows whose Field is not NULL (DSL: field<notnull> or
+// field!=null).
 type NotNullExpr struct{ Field string }
 
+// ILikeExpr is a case-insensitive LikeExpr (DSL: field.=^pattern). SQL
+// adapters render LOWER(col) LIKE LOWER(?), Mongo an (?i) regex.
 type ILikeExpr struct {
 	Field string
 	Value any
@@ -469,6 +545,11 @@ func (FullTextSearchExpr) isExpr() {}
 func (GeoDistanceExpr) isExpr()    {}
 func (CustomExpr) isExpr()         {}
 
+// Figo is the query-building facade: feed it DSL (AddFiltersFromString) or
+// programmatic expressions (AddFilter), Build against an Adapter, then render
+// via GetSqlString/GetQuery or the adapter package's Build* helpers. Create
+// instances with New. All methods are safe for concurrent use; plugin hooks
+// and Walk visitors run outside the internal lock.
 type Figo interface {
 	AddFiltersFromString(input string) error
 	AddFilter(exp Expr)
@@ -498,6 +579,11 @@ type Figo interface {
 	Walk(visit func(Expr))
 }
 
+// Adapter renders a Figo's built state for one backend. The bool result is
+// the success flag: false means the render failed (unsupported expression,
+// wrong ctx type, ...) and the caller must treat the query as unrenderable —
+// never as "no filters". ctx is adapter-specific (a *gorm.DB, a table name
+// string, ...); conditionType optionally selects statement segments.
 type Adapter interface {
 	GetSqlString(f Figo, ctx any, conditionType ...string) (string, bool)
 	GetQuery(f Figo, ctx any, conditionType ...string) (Query, bool)
@@ -534,6 +620,10 @@ func (p *Page) validate() {
 	}
 }
 
+// Node is the parser's intermediate tree node. It is exported for historical
+// reasons only — nothing outside the parser reads it, and its layout may
+// change without notice. Build queries through the Figo interface and inspect
+// them via GetClauses/Walk instead.
 type Node struct {
 	Expression []Expr
 	Operator   Operation
@@ -766,7 +856,25 @@ func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 							table := strings.TrimSpace(rawTable)
 							loadContent := strings.TrimSpace(l[colonIndex+1:])
 
-							loadRootNode := f.parseDSL(loadContent, diags)
+							// Parse the relation filter on a scratch instance: the
+							// content is a full DSL expression, so without isolation
+							// a sort=/page=/load= directive written inside it would
+							// mutate the OUTER query (a preload's sort= used to
+							// become the main query's ORDER BY, its page= the main
+							// LIMIT/OFFSET, and a nested load= a top-level preload).
+							// Preloads have no sort/page/nested-load representation,
+							// so those directives are dropped with a diagnostic.
+							scratch := &figo{preloads: make(map[string][]Expr), selectFields: make(map[string]bool), namingFunc: f.namingFunc}
+							loadRootNode := scratch.parseDSL(loadContent, diags)
+							if scratch.sort != nil {
+								addDiag(diags, "sort= inside load=[%s:...] is not supported and was ignored", table)
+							}
+							if scratch.page != (Page{}) {
+								addDiag(diags, "page= inside load=[%s:...] is not supported and was ignored", table)
+							}
+							if len(scratch.preloads) > 0 {
+								addDiag(diags, "nested load= inside load=[%s:...] is not supported and was ignored", table)
+							}
 							expressionParser(loadRootNode)
 							loadExpr := getFinalExpr(*loadRootNode)
 							if loadExpr != nil {
@@ -1433,7 +1541,7 @@ func buildExpressionTreeWithPrecedence(children []*Node) Expr {
 	}
 
 	// Build a list of expressions and operators in order
-	var items []interface{} // Can be Expr or Operation
+	var items []any // Can be Expr or Operation
 
 	for _, child := range children {
 		// Add expressions from this child
@@ -1468,7 +1576,7 @@ func buildExpressionTreeWithPrecedence(children []*Node) Expr {
 // expressions[]/operators[] slices and paired them by index, which drifts one
 // slot whenever a connector is implicit: "a=1 not b=2" negated a instead of b,
 // and "a=1 b=2 or c=3" attached the OR to (a,b) instead of (b,c).
-func processWithPrecedence(items []interface{}) Expr {
+func processWithPrecedence(items []any) Expr {
 	if len(items) == 0 {
 		return nil
 	}
@@ -1476,7 +1584,7 @@ func processWithPrecedence(items []interface{}) Expr {
 	// First pass: NOT (highest precedence, unary prefix). A NOT wraps the NEXT
 	// expression in source order; consecutive NOTs stack ("not not a=1").
 	// A trailing NOT with no operand is dropped.
-	resolved := make([]interface{}, 0, len(items))
+	resolved := make([]any, 0, len(items))
 	pendingNots := 0
 	for _, item := range items {
 		switch v := item.(type) {
@@ -1495,14 +1603,32 @@ func processWithPrecedence(items []interface{}) Expr {
 		}
 	}
 
-	// Second and third passes: the binary connectors, in precedence order.
+	// Second pass: make implicit conjunction explicit. Two expressions
+	// adjacent with no connector between them (e.g. "a=1 b=2", or a filter
+	// following a load=/sort=/page= segment that emits no connector) are
+	// AND-ed. Inserting the operator HERE — before the binary reduction
+	// passes — gives the implicit form exactly the precedence of a written
+	// "and": "a=1 b=2 or c=3" builds (a AND b) OR c, identical to
+	// "a=1 and b=2 or c=3". (It used to be joined after OR reduction, which
+	// silently made the implicit AND bind LOOSER than or.)
+	withImplicit := make([]any, 0, len(resolved))
+	for _, item := range resolved {
+		if _, isExpr := item.(Expr); isExpr && len(withImplicit) > 0 {
+			if _, prevIsExpr := withImplicit[len(withImplicit)-1].(Expr); prevIsExpr {
+				withImplicit = append(withImplicit, OperationAnd)
+			}
+		}
+		withImplicit = append(withImplicit, item)
+	}
+	resolved = withImplicit
+
+	// Third and fourth passes: the binary connectors, in precedence order.
 	resolved = reduceBinary(resolved, OperationAnd)
 	resolved = reduceBinary(resolved, OperationOr)
 
-	// Any expressions still left are adjacent with no logical operator between
-	// them (e.g. "a=1 b=2", or a filter following a load=/sort=/page= segment
-	// that emits no connector). Combine them with an implicit AND instead of
-	// silently dropping all but the first.
+	// Safety net: anything still left unpaired (dangling connectors are
+	// dropped by reduceBinary) is combined with AND rather than silently
+	// dropping all but the first expression.
 	var expressions []Expr
 	for _, item := range resolved {
 		if e, ok := item.(Expr); ok {
@@ -1522,8 +1648,8 @@ func processWithPrecedence(items []interface{}) Expr {
 // left-associatively, preserving source positions. A dangling connector with
 // no expression on one side (leading/trailing/doubled "and"/"or") is dropped
 // rather than pairing two unrelated expressions.
-func reduceBinary(items []interface{}, op Operation) []interface{} {
-	out := make([]interface{}, 0, len(items))
+func reduceBinary(items []any, op Operation) []any {
+	out := make([]any, 0, len(items))
 	for i := 0; i < len(items); i++ {
 		o, isOp := items[i].(Operation)
 		if !isOp || o != op {
@@ -1609,12 +1735,14 @@ func (f *figo) AddFiltersFromString(input string) error {
 	pm := f.pluginManager
 	f.mu.RUnlock()
 
-	// Execute BeforeParse plugin hooks
+	// Execute BeforeParse plugin hooks. ExecuteBeforeParse already attributes
+	// the failing plugin ("plugin X BeforeParse error: ..."), so the error is
+	// returned as-is rather than wrapped into a doubled prefix.
 	if pm != nil {
 		var err error
 		input, err = pm.ExecuteBeforeParse(f, input)
 		if err != nil {
-			return fmt.Errorf("plugin BeforeParse error: %w", err)
+			return err
 		}
 	}
 
@@ -1628,14 +1756,14 @@ func (f *figo) AddFiltersFromString(input string) error {
 	f.dsl = input
 	f.mu.Unlock()
 
-	// Execute AfterParse plugin hooks
+	// Execute AfterParse plugin hooks (error returned unwrapped, as above).
 	if pm != nil {
 		err := pm.ExecuteAfterParse(f, input)
 		if err != nil {
 			f.mu.Lock()
 			f.dsl = prevDSL
 			f.mu.Unlock()
-			return fmt.Errorf("plugin AfterParse error: %w", err)
+			return err
 		}
 	}
 
