@@ -80,9 +80,20 @@ var SQLiteDialect = &SQLDialect{
 }
 
 // quoteIdent quotes an identifier with the dialect's quote rune, escaping
-// embedded quote runes by doubling them.
+// embedded quote runes by doubling them. A dotted name is quoted per segment
+// (users.first_name -> `users`.`first_name`) so a qualified reference set via
+// Walk/SetNodeField renders as table.column instead of one quoted identifier
+// naming a nonexistent dotted column. Every segment still has embedded quote
+// runes doubled, so the injection hardening is unchanged.
 func (d *SQLDialect) quoteIdent(ident string) string {
 	q := string(d.QuoteRune)
+	if strings.Contains(ident, ".") {
+		segs := strings.Split(ident, ".")
+		for i, s := range segs {
+			segs[i] = q + strings.ReplaceAll(s, q, q+q) + q
+		}
+		return strings.Join(segs, ".")
+	}
 	return q + strings.ReplaceAll(ident, q, q+q) + q
 }
 

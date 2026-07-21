@@ -242,6 +242,16 @@ func mongoOperands(ops []figo.Expr, rc mongoRender) ([]bson.M, error) {
 
 // Translate figo.Expr to MongoDB filter fragment
 func mongoExpr(e figo.Expr, rc mongoRender) (bson.M, error) {
+	// A field name beginning with '$' would land in operator position in the
+	// filter document — {"$where": "..."} EXECUTES as an operator, not a field
+	// match. The default snake_case naming can't produce one, but a permissive
+	// NamingFunc (NoChangeNaming) plus attacker-influenced field names would
+	// inject straight into the query engine. Rejecting here is the analogue of
+	// the SQL adapters' identifier quoting. ('$' later in a dotted path stays
+	// legal: "a.$b" is a path component, not an operator.)
+	if field := figo.ExprField(e); strings.HasPrefix(field, "$") {
+		return nil, fmt.Errorf("figo: field name %q would render as a MongoDB operator and was rejected", field)
+	}
 	switch x := e.(type) {
 	case figo.EqExpr:
 		return bson.M{rc.key(x.Field): rc.value(x.Field, x.Value)}, nil

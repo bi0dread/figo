@@ -161,7 +161,20 @@ func exprToSQL(d *SQLDialect, e figo.Expr) (string, []any, error) {
 	case figo.AndExpr:
 		return joinGroup(d, "AND", x.Operands)
 	case figo.OrExpr:
-		return joinGroup(d, "OR", x.Operands)
+		p, a, err := joinGroup(d, "OR", x.Operands)
+		if err != nil {
+			return "", nil, err
+		}
+		if p == "" {
+			// An OR with no renderable operands is a false disjunction: it must
+			// match NOTHING. Returning "" dropped the predicate entirely (a
+			// top-level empty OR made the WHERE clause vanish → every row
+			// matched) — the same fail-open the empty-IN guard above closes,
+			// and that Mongo ($nor:[{}]) and ES (empty should) already prevent.
+			// An empty AND stays dropped: it is the true identity.
+			return "1=0", nil, nil
+		}
+		return p, a, nil
 	case figo.NotExpr:
 		if len(x.Operands) == 0 {
 			return "", nil, nil
@@ -243,7 +256,15 @@ func exprToSQLQualified(d *SQLDialect, e figo.Expr, qualifier string) (string, [
 	case figo.AndExpr:
 		return joinGroupQualified(d, "AND", x.Operands, qualifier)
 	case figo.OrExpr:
-		return joinGroupQualified(d, "OR", x.Operands, qualifier)
+		p, a, err := joinGroupQualified(d, "OR", x.Operands, qualifier)
+		if err != nil {
+			return "", nil, err
+		}
+		if p == "" {
+			// See exprToSQL: an empty OR must match nothing, not vanish.
+			return "1=0", nil, nil
+		}
+		return p, a, nil
 	case figo.NotExpr:
 		if len(x.Operands) == 0 {
 			return "", nil, nil

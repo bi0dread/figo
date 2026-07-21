@@ -4,6 +4,7 @@ import (
 	. "github.com/bi0dread/figo/v4"
 	. "github.com/bi0dread/figo/v4/adapters"
 
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -22,10 +23,9 @@ func TestWalkMutatesFieldInPlace(t *testing.T) {
 	})
 
 	where, _, _ := BuildRawWhere(f)
-	assert.Contains(t, where, "`users.first_name`")
-	assert.NotContains(t, where, "`first_name` =")
-	// The other node is untouched.
-	assert.Contains(t, where, "`age` >")
+	// Dotted names quote per segment: a real table-qualified reference, with
+	// the other node untouched.
+	assert.Equal(t, "(`users`.`first_name` = ? AND `age` > ?)", where)
 }
 
 // The uniform helper style: rename a field on ANY node type in one block.
@@ -45,8 +45,9 @@ func TestWalkNodeFieldHelpers(t *testing.T) {
 	assert.Equal(t, 4, renamed, "every field-bearing node should be reachable and renamed")
 
 	where, _, _ := BuildRawWhere(f)
-	assert.NotContains(t, where, "`first_name`")
-	assert.Contains(t, where, "`users.first_name`")
+	// All four field references are table-qualified (an unqualified leftover
+	// would render `first_name` without the `users`. prefix and change the count).
+	assert.Equal(t, 4, strings.Count(where, "`users`.`first_name`"), "where: %s", where)
 }
 
 // Visits nested nodes and reaches into preloads too.
@@ -63,12 +64,12 @@ func TestWalkReachesNestedAndPreloads(t *testing.T) {
 
 	// Root clause updated.
 	where, _, _ := BuildRawWhere(f)
-	assert.Contains(t, where, "`u.first_name`")
+	assert.Contains(t, where, "`u`.`first_name`")
 	// Preload clause updated too.
 	pre, _ := BuildRawPreloads(f)
 	po, ok := pre["orders"]
 	assert.True(t, ok)
-	assert.Contains(t, po.Where, "`u.first_name`")
+	assert.Contains(t, po.Where, "`u`.`first_name`")
 }
 
 // The package-level Walk returns the new root (value-type roots need reassigning).

@@ -11,17 +11,17 @@ import (
 )
 
 // toGormClauseWithFigo converts an internal figo.Expr tree into a gorm
-// clause.Expression with field name normalization. An expression this adapter
-// has no rendering for returns an error — dropping it silently would widen
-// the result set (a filter/authorization bypass).
+// clause.Expression. An expression this adapter has no rendering for returns
+// an error — dropping it silently would widen the result set (a
+// filter/authorization bypass).
+//
+// Field names are used VERBATIM: the parser already ran them through the
+// instance's NamingFunc, exactly like the raw/Mongo/Elasticsearch adapters
+// assume. Re-applying the func here was invisible with the idempotent
+// snake_case default but rendered nonexistent columns (t_t_age) for any
+// non-idempotent naming strategy.
 func toGormClauseWithFigo(e figo.Expr, f figo.Figo) (clause.Expression, error) {
-	// Helper function to get normalized field name
-	getFieldName := func(field string) string {
-		if f != nil {
-			return normalizeColumnName(f, field)
-		}
-		return field
-	}
+	getFieldName := func(field string) string { return field }
 
 	// convertOperands maps a logical node's operand list, propagating the
 	// first conversion error.
@@ -90,17 +90,35 @@ func toGormClauseWithFigo(e figo.Expr, f figo.Figo) (clause.Expression, error) {
 		if err != nil {
 			return nil, err
 		}
+		if len(parts) == 0 {
+			// Empty AND is the true identity: no predicate, consistent with
+			// the raw adapter and Mongo's empty-$and ({}) rendering.
+			return nil, nil
+		}
 		return clause.And(parts...), nil
 	case figo.OrExpr:
 		parts, err := convertOperands(x.Operands)
 		if err != nil {
 			return nil, err
 		}
+		if len(parts) == 0 {
+			// An OR with no renderable operands is a false disjunction: it
+			// must match NOTHING. clause.Or() with zero parts emitted no
+			// predicate at all — matching everything, the same fail-open the
+			// empty-IN guard above closes and that Mongo ($nor:[{}]) and ES
+			// (empty should) already prevent.
+			return clause.Expr{SQL: "1=0"}, nil
+		}
 		return clause.Or(parts...), nil
 	case figo.NotExpr:
 		parts, err := convertOperands(x.Operands)
 		if err != nil {
 			return nil, err
+		}
+		if len(parts) == 0 {
+			// NOT of nothing is vacuously true: no predicate, like Mongo's
+			// empty $nor.
+			return nil, nil
 		}
 		return clause.Not(parts...), nil
 	case figo.CustomExpr:
@@ -117,8 +135,8 @@ func toGormClauseWithFigo(e figo.Expr, f figo.Figo) (clause.Expression, error) {
 	case figo.OrderBy:
 		var cols []clause.OrderByColumn
 		for _, c := range x.Columns {
-			normalizedName := getFieldName(c.Name)
-			cols = append(cols, clause.OrderByColumn{Column: clause.Column{Name: normalizedName, Table: clause.CurrentTable}, Desc: c.Desc})
+			// c.Name was normalized at parse time (see getFieldName above).
+			cols = append(cols, clause.OrderByColumn{Column: clause.Column{Name: c.Name, Table: clause.CurrentTable}, Desc: c.Desc})
 		}
 		return clause.OrderBy{Columns: cols}, nil
 	default:
@@ -235,6 +253,13 @@ func gormDryRunSQL(trx *gorm.DB, conditionType ...string) (string, []any) {
 	stmt := tr.Statement
 
 	tr.Callback().Query().Execute(tr)
+	// When the caller's DB was opened with a global DryRun:true, Execute
+	// leaves the fully built SELECT in the statement buffer, so Build would
+	// APPEND the requested segment to it — and the segment's binds to Vars,
+	// duplicating every arg. Build renders from stmt.Clauses, so starting it
+	// from a clean buffer is correct under every caller configuration.
+	stmt.SQL.Reset()
+	stmt.Vars = nil
 	stmt.Build(conditionType...)
 	return stmt.SQL.String(), stmt.Vars
 }
