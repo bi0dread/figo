@@ -44,13 +44,13 @@ import (
 
 - **Policy is opt-in, per instance.** Nothing polices your queries until you register the plugin for it — `f.RegisterPlugin(plugins.NewFieldsPlugin())` and friends. Field ignore-lists/whitelists (`FieldsPlugin`), complexity limits (`LimitsPlugin`), value validation (`ValidationPlugin`), strict syntax checking or repair (`SyntaxPlugin`), mandatory multi-tenant scopes (`ScopePlugin`), caching (`CachePlugin`), metrics (`MetricsPlugin`), and audit logging (`AuditPlugin`) are all plugins; without registration, no pruning or enforcement happens. Each has a dedicated section below.
 
-- **Plugin hooks fire automatically.** `BeforeQuery`/`AfterQuery` wrap every `GetSqlString`/`GetQuery` render (a hook error vetoes the render), `ExprFilter` prunes DSL and programmatic filters alike, and `FinalizeClauses` runs on every `Build` — the mechanism behind mandatory scopes.
+- **Plugin hooks fire automatically, in registration order.** `BeforeQuery`/`AfterQuery` wrap every `GetSqlString`/`GetQuery` render (a hook error vetoes the render), `ExprFilter` prunes DSL and programmatic filters alike, and `FinalizeClauses` runs on every `Build` — the mechanism behind mandatory scopes. Within each hook, plugins run in the order they were registered.
 
 - **Dialect-aware raw SQL.** `RawAdapter{Dialect: adapters.PostgresDialect}` renders `"col"` identifiers, `$1..$N` placeholders, and the `~` regex operator; `adapters.SQLiteDialect` renders `"col"` with `?`; the zero value renders MySQL (backticks, `?`, `REGEXP`). String-literal escaping is per-dialect too (backslash doubling only on MySQL). The GORM adapter's regex operator is configured separately via `SetRegexSQLOperator`.
 
 - **Naming is one function.** Every field name passes through a single `NamingFunc`: `figo.SnakeCaseNaming` by default (leading underscores preserved, so `_id` stays `_id`), `figo.NoChangeNaming` to keep DSL names as written, or your own via `SetNamingFunc`. `figo.ParseValue` is the package-level literal typer the DSL uses for values.
 
-- **Fail-loud rendering.** An expression an adapter can't render is an error, never a silently dropped condition (which would return too many rows — or on a search index, everything). Identifiers are hardened against SQL injection, rendered SQL is deterministic, and empty `<in>` sets can't bypass filters.
+- **Fail-loud rendering.** An expression an adapter can't render is an error, never a silently dropped condition (which would return too many rows — or on a search index, everything). Identifiers are hardened against SQL injection (the MongoDB adapter likewise rejects `$`-prefixed field names, which would execute as operators), rendered SQL is deterministic, and empty `<in>` sets and empty `or` groups can't bypass filters — both render as match-nothing on every adapter.
 
 ## Table of contents
 
@@ -221,6 +221,11 @@ f.AddFiltersFromString(`not deleted=true and active=true`)
 f.AddFiltersFromString(`(a=1 or a=2) and (b=3 or b=4)`)
 // parentheses override precedence
 ```
+
+Two terms written next to each other with no connector are joined by an
+**implicit `and` with exactly the same precedence as a written `and`**:
+`a=1 b=2 or c=3` builds `(a=1 AND b=2) OR c=3`, identical to
+`a=1 and b=2 or c=3`.
 
 **`not` semantics are uniform across adapters:** `not` over multiple operands means *none of them match* — `NOT (a OR b)` in SQL, `$nor` in MongoDB, `must_not` over all operands in Elasticsearch, `clause.Not` in GORM. The DSL only ever produces single-operand `not`; multi-operand forms come from building the AST directly with `AddFilter`.
 
@@ -617,10 +622,17 @@ f.AddSelectFields("id", "name", "email")
 lp := plugins.NewLimitsPlugin(plugins.DefaultQueryLimits()) // nesting 10, fields 50, params 100, expressions 200
 f.RegisterPlugin(lp)
 
-err := f.AddFiltersFromString(hugeUntrustedDSL) // e.g. "query exceeds MaxParameterCount: 250 > 100"
+err := f.AddFiltersFromString(hugeUntrustedDSL)
+// e.g. "plugin figo-limits AfterParse error: query exceeds MaxParameterCount: 250 > 100"
 ```
 
-Limits are measured after any registered field pruning, i.e. on the query that would actually run.
+**Nesting depth counts logical nesting as a user reads the query**, not parser
+tree levels: a bare condition or one flat connector chain
+(`a=1 and b=2 and ... and z=9`, any length) is depth 1, and each embedded
+group of a *different* connector adds a level — `a=1 and (b=2 or c=3)` is
+depth 2. Field/parameter/expression counts are what they say.
+
+Limits are measured after any registered field pruning, i.e. on the query that would actually run — including clauses a `ScopePlugin` injects.
 
 ## Mandatory scopes (multi-tenant)
 
@@ -708,6 +720,12 @@ f.Walk(func(n figo.Expr) {
 	}
 })
 ```
+
+Dotted names are first-class on every adapter: the SQL adapters quote each
+segment (`users.first_name` renders `` `users`.`first_name` `` on MySQL,
+`"users"."first_name"` on PostgreSQL — a real table-qualified reference, with
+injection hardening intact), and MongoDB/Elasticsearch treat them as document
+paths.
 
 A package-level `figo.Walk(expr, visit)` is also available for traversing a standalone `Expr` tree (it returns the rewritten expression).
 
@@ -854,7 +872,7 @@ go test -race ./...      # race detector
 
 No live databases are needed: the MongoDB adapter tests use the BSON encoder directly, the Elasticsearch adapter tests assert on the generated query JSON, and the GORM tests run against in-memory SQLite. Tests are split across the three packages — core behavior in the root (`figo_test`), adapter rendering in `adapters/`, plugin behavior and integration in `plugins/`.
 
-Runnable usage examples live in [examples/example_usage.go](examples/example_usage.go).
+Runnable usage examples live in [examples/example_usage.go](examples/example_usage.go) (currently Elasticsearch-focused; the Quick start and adapter sections above cover the other backends).
 
 ## Status of features
 

@@ -27,6 +27,8 @@ Values follow figo's typing rules: numbers, booleans, `null`, and ISO dates stay
 everything else is double-quoted. Wrap a value in quotes yourself (`"0123"`) to force string
 typing. Nodes that don't reach the Query node are dimmed and excluded from the DSL.
 
-The generated strings are validated against the actual Go parser (`figo.AddFiltersFromString`
-+ the raw SQL adapter), including operator coverage, nested groups, preload filters, and the
-list/range/null forms.
+The generated strings were validated by hand against the actual Go parser
+(`figo.AddFiltersFromString` + the raw SQL adapter) when the playground was
+built — operator coverage, nested groups, preload filters, and the
+list/range/null forms. There is no automated cross-check between the two, so
+if they ever disagree, the Go parser is authoritative.

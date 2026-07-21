@@ -525,18 +525,24 @@ func TestPluginIntegration(t *testing.T) {
 
 ## Plugin System Architecture
 
+figo never executes queries itself — hooks wrap the three pipelines it does
+own. Within every hook, plugins run in registration order.
+
 ```
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│   DSL String    │───▶│  BeforeParse    │───▶│   Parse DSL     │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-                                                       │
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  Query Result   │◀───│   AfterQuery    │◀───│  Execute Query  │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
-                                                       │
-┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐
-│  Post-Process   │◀───│   AfterParse    │◀───│   Build Query   │
-└─────────────────┘    └─────────────────┘    └─────────────────┘
+AddFiltersFromString:
+┌────────────┐   ┌─────────────┐   ┌────────────┐   ┌────────────┐
+│ DSL String │──▶│ BeforeParse │──▶│ commit DSL │──▶│ AfterParse │  (error ⇒ DSL rolled back)
+└────────────┘   └─────────────┘   └────────────┘   └────────────┘
+
+Build / BuildE:
+┌───────────┐   ┌──────────────┐   ┌──────────────────┐
+│ parse DSL │──▶│ ExprFilter(s)│──▶│ FinalizeClauses  │  (runs even with no DSL)
+└───────────┘   └──────────────┘   └──────────────────┘
+
+GetSqlString / GetQuery:
+┌─────────────┐   ┌────────────────┐   ┌────────────┐
+│ BeforeQuery │──▶│ adapter render │──▶│ AfterQuery │  (an error at either end vetoes the render)
+└─────────────┘   └────────────────┘   └────────────┘
 ```
 
 ## Conclusion

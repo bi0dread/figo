@@ -1,0 +1,27 @@
+name: Playground CI
+
+# The Go workflow ignores playground/** and the deploy workflow only fires on
+# push to main — without this, a TypeScript error in a playground PR merged
+# silently and only surfaced when the main-branch deploy failed.
+on:
+  pull_request:
+    paths:
+      - "playground/**"
+      - ".github/workflows/playground-ci.yml"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: playground
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: playground/package-lock.json
+      - run: npm ci
+      # Same build the deploy runs: tsc --noEmit && vite build.
+      - run: npm run build
