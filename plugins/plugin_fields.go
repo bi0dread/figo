@@ -47,7 +47,7 @@ func (p *FieldsPlugin) Initialize(figo.Figo) error { return nil }
 func (p *FieldsPlugin) BeforeQuery(figo.Figo, any) error { return nil }
 
 // AfterQuery implements Plugin
-func (p *FieldsPlugin) AfterQuery(figo.Figo, any, interface{}) error { return nil }
+func (p *FieldsPlugin) AfterQuery(figo.Figo, any, any) error { return nil }
 
 // BeforeParse implements Plugin
 func (p *FieldsPlugin) BeforeParse(_ figo.Figo, dsl string) (string, error) { return dsl, nil }

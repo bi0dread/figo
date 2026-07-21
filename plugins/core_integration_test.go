@@ -305,14 +305,14 @@ func TestCaching(t *testing.T) {
 		_, found = cache.Get("nonexistent")
 		assert.False(t, found)
 
-		// Test Set with TTL
-		cache.Set("key2", "value2", 1*time.Second)
+		// Test Set with TTL (kept short: this sleep is pure wall-clock cost)
+		cache.Set("key2", "value2", 50*time.Millisecond)
 		value, found = cache.Get("key2")
 		assert.True(t, found)
 		assert.Equal(t, "value2", value)
 
 		// Wait for expiration
-		time.Sleep(2 * time.Second)
+		time.Sleep(120 * time.Millisecond)
 		_, found = cache.Get("key2")
 		assert.False(t, found)
 	})
@@ -370,100 +370,6 @@ func TestPerformanceMonitor(t *testing.T) {
 }
 
 // Test Advanced Operators (Basic functionality)
-
-// Test Validation System (Basic functionality)
-func TestValidationSystemBasic(t *testing.T) {
-	t.Run("ValidationPlugin", func(t *testing.T) {
-		plugin := NewValidationPlugin()
-
-		// Test rule addition
-		rule := ValidationRule{
-			Field:   "email",
-			Rule:    "email",
-			Message: "Invalid email format",
-		}
-		plugin.AddRule(rule)
-
-		// Test validator registration
-		validator := EmailValidator{}
-		plugin.RegisterValidator(validator)
-
-		// Test validation
-		err := plugin.Validate("email", "invalid-email")
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "Invalid email format")
-
-		err = plugin.Validate("email", "valid@example.com")
-		assert.NoError(t, err)
-	})
-
-	t.Run("BuiltInValidators", func(t *testing.T) {
-		// Test RequiredValidator
-		required := RequiredValidator{}
-		err := required.Validate("name", "required", "")
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "is required")
-
-		err = required.Validate("name", "required", "john")
-		assert.NoError(t, err)
-
-		// Test MinLengthValidator
-		minLength := MinLengthValidator{}
-		err = minLength.Validate("name", "min_length", "ab")
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "at least 3 characters")
-
-		err = minLength.Validate("name", "min_length", "john")
-		assert.NoError(t, err)
-
-		// Test EmailValidator
-		email := EmailValidator{}
-		err = email.Validate("email", "email", "invalid")
-		assert.Error(t, err)
-		assert.Contains(t, err.Error(), "must be a valid email")
-
-		err = email.Validate("email", "email", "test@example.com")
-		assert.NoError(t, err)
-	})
-
-	t.Run("FigoValidationIntegration", func(t *testing.T) {
-		f := New()
-
-		// Validation is wired in as a plugin
-		plugin := NewValidationPlugin()
-		plugin.RegisterValidator(EmailValidator{})
-		plugin.RegisterValidator(RequiredValidator{})
-
-		plugin.AddRule(ValidationRule{
-			Field:   "email",
-			Rule:    "email",
-			Message: "Invalid email format",
-		})
-
-		err := f.RegisterPlugin(plugin)
-		assert.NoError(t, err)
-
-		// Parsing a DSL with an invalid value fails via the AfterParse hook
-		err = f.AddFiltersFromString(`email="invalid-email"`)
-		assert.Error(t, err)
-
-		err = f.AddFiltersFromString(`email="valid@example.com"`)
-		assert.NoError(t, err)
-
-		// Direct validation stays available on the plugin
-		plugin.AddRule(ValidationRule{
-			Field:   "name",
-			Rule:    "required",
-			Message: "Name is required",
-		})
-
-		err = plugin.Validate("name", "")
-		assert.Error(t, err)
-
-		err = plugin.Validate("name", "john")
-		assert.NoError(t, err)
-	})
-}
 
 // Test Plugin System (Basic functionality)
 

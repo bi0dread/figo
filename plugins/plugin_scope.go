@@ -49,7 +49,7 @@ func (p *ScopePlugin) Initialize(figo.Figo) error { return nil }
 func (p *ScopePlugin) BeforeQuery(figo.Figo, any) error { return nil }
 
 // AfterQuery implements Plugin
-func (p *ScopePlugin) AfterQuery(figo.Figo, any, interface{}) error { return nil }
+func (p *ScopePlugin) AfterQuery(figo.Figo, any, any) error { return nil }
 
 // BeforeParse implements Plugin
 func (p *ScopePlugin) BeforeParse(_ figo.Figo, dsl string) (string, error) { return dsl, nil }

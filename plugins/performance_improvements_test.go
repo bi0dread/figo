@@ -247,9 +247,11 @@ func TestPerformanceImprovementsIntegration(t *testing.T) {
 		f.AddFiltersFromString(`id=1 and name="test" and age>18`)
 		f.Build(RawAdapter{})
 
-		// Execute multiple times to test caching
+		// Execute multiple times to test caching. The ctx must be a real
+		// table name: a nil ctx fails the raw render, and failed (empty)
+		// renders are deliberately never cached.
 		for i := 0; i < 5; i++ {
-			_ = cp.GetCachedSqlString(f, nil)
+			_ = cp.GetCachedSqlString(f, "users")
 		}
 
 		// Verify cache stats

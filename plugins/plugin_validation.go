@@ -61,7 +61,7 @@ func (p *ValidationPlugin) Initialize(figo.Figo) error { return nil }
 func (p *ValidationPlugin) BeforeQuery(figo.Figo, any) error { return nil }
 
 // AfterQuery implements Plugin
-func (p *ValidationPlugin) AfterQuery(figo.Figo, any, interface{}) error { return nil }
+func (p *ValidationPlugin) AfterQuery(figo.Figo, any, any) error { return nil }
 
 // BeforeParse implements Plugin
 func (p *ValidationPlugin) BeforeParse(_ figo.Figo, dsl string) (string, error) { return dsl, nil }
@@ -70,9 +70,16 @@ func (p *ValidationPlugin) BeforeParse(_ figo.Figo, dsl string) (string, error) 
 // clause tree is only materialized by Build, which the caller may not have
 // run yet, so the DSL is built on a clone — the caller's instance is left
 // untouched.
+//
+// Rules are matched through the instance's naming strategy (see validateAs):
+// the parser has already converted field names, so a rule registered as
+// "userEmail" must fire for the parsed field "user_email" — exactly the dual
+// matching FieldsPlugin applies to its ignore list and whitelist.
 func (p *ValidationPlugin) AfterParse(f figo.Figo, _ string) error {
 	c := f.Clone()
 	c.Build(nil)
+
+	fn := f.GetNamingFunc() // never nil: SnakeCaseNaming is the default
 
 	var vErr error
 	c.Walk(func(n figo.Expr) {
@@ -84,7 +91,7 @@ func (p *ValidationPlugin) AfterParse(f figo.Figo, _ string) error {
 			return
 		}
 		for _, v := range values {
-			if err := p.Validate(field, v); err != nil {
+			if err := p.validateAs(fn, field, v); err != nil {
 				vErr = err
 				return
 			}
@@ -107,8 +114,21 @@ func (p *ValidationPlugin) RegisterValidator(validator Validator) {
 	p.validators[validator.GetRuleName()] = validator
 }
 
-// Validate validates a field value against all applicable rules
+// Validate validates a field value against all applicable rules, matching
+// rule fields verbatim (or as "*"). The AfterParse hook goes through
+// validateAs instead, which additionally matches naming-converted spellings.
 func (p *ValidationPlugin) Validate(field string, value any) error {
+	return p.validateAs(nil, field, value)
+}
+
+// validateAs runs every rule whose Field matches: verbatim, as "*", or (when
+// fn is non-nil) in its naming-converted form — so the same registration
+// spelling works for ValidationPlugin and FieldsPlugin alike.
+//
+// A matching rule with neither a Handler nor a registered validator for its
+// Rule name FAILS the validation: silently skipping it (the old behavior)
+// meant a typo in the rule name switched the check off entirely.
+func (p *ValidationPlugin) validateAs(fn figo.NamingFunc, field string, value any) error {
 	// Snapshot rules and validators under the lock, then run the user's
 	// handlers WITHOUT it — a handler calling AddRule/RegisterValidator
 	// must not deadlock.
@@ -122,19 +142,38 @@ func (p *ValidationPlugin) Validate(field string, value any) error {
 	p.mu.RUnlock()
 
 	for _, rule := range rules {
-		if rule.Field == field || rule.Field == "*" {
-			if rule.Handler != nil {
-				if err := rule.Handler(field, rule.Rule, value); err != nil {
-					return fmt.Errorf("validation failed for field %s: %s", field, rule.Message)
-				}
-			} else if validator, exists := validators[rule.Rule]; exists {
-				if err := validator.Validate(field, rule.Rule, value); err != nil {
-					return fmt.Errorf("validation failed for field %s: %s", field, rule.Message)
-				}
+		match := rule.Field == field || rule.Field == "*"
+		if !match && fn != nil {
+			match = fn(rule.Field) == field
+		}
+		if !match {
+			continue
+		}
+
+		if rule.Handler != nil {
+			if err := rule.Handler(field, rule.Rule, value); err != nil {
+				return validationError(field, rule.Message, err)
 			}
+			continue
+		}
+		validator, exists := validators[rule.Rule]
+		if !exists {
+			return fmt.Errorf("validation rule %q for field %s has no registered validator and no handler", rule.Rule, rule.Field)
+		}
+		if err := validator.Validate(field, rule.Rule, value); err != nil {
+			return validationError(field, rule.Message, err)
 		}
 	}
 	return nil
+}
+
+// validationError wraps a rule violation. With no configured Message the
+// validator's own error is surfaced instead of an empty suffix.
+func validationError(field, message string, err error) error {
+	if message == "" {
+		return fmt.Errorf("validation failed for field %s: %v", field, err)
+	}
+	return fmt.Errorf("validation failed for field %s: %s", field, message)
 }
 
 // exprFieldValues returns the field a leaf node filters on together with the

@@ -6,6 +6,7 @@ import (
 
 import (
 	"crypto/md5"
+	"errors"
 	"fmt"
 	"runtime"
 	"sort"
@@ -18,7 +19,12 @@ import (
 // CachePlugin and render through it (GetCachedSqlString/GetCachedQuery) to get
 // cached results, or use any QueryCache implementation standalone.
 
-// CacheConfig defines caching configuration
+// CacheConfig defines caching configuration.
+//
+// TTL <= 0 means entries never expire (previously a zero TTL stored every
+// entry pre-expired, so an enabled cache without an explicit TTL never hit).
+// MaxSize <= 0 means unlimited; CleanupInterval <= 0 disables the periodic
+// sweep (expired entries are still dropped lazily on Get).
 type CacheConfig struct {
 	Enabled         bool
 	TTL             time.Duration
@@ -94,7 +100,7 @@ func (p *CachePlugin) Initialize(figo.Figo) error { return nil }
 func (p *CachePlugin) BeforeQuery(figo.Figo, any) error { return nil }
 
 // AfterQuery implements Plugin
-func (p *CachePlugin) AfterQuery(figo.Figo, any, interface{}) error { return nil }
+func (p *CachePlugin) AfterQuery(figo.Figo, any, any) error { return nil }
 
 // BeforeParse implements Plugin
 func (p *CachePlugin) BeforeParse(_ figo.Figo, dsl string) (string, error) { return dsl, nil }
@@ -128,24 +134,54 @@ func (p *CachePlugin) GetCache() QueryCache {
 }
 
 // SetConfig sets the cache configuration. When enabled and no cache has been
-// injected, an owned InMemoryCache is created.
+// injected, an owned InMemoryCache is created — and when an owned cache
+// already exists, it is RECREATED with the new settings (dropping its
+// entries): MaxSize and CleanupInterval live inside the cache, and the old
+// behavior of only storing p.config meant an owned cache silently kept its
+// original limits forever. An injected cache (SetCache) is caller-managed;
+// only the plugin-level settings (Enabled, TTL) apply to it.
 func (p *CachePlugin) SetConfig(config CacheConfig) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.config = config
-	if p.cache == nil && config.Enabled {
-		owned := NewInMemoryCache(config)
-		p.cache = owned
-		p.owned = owned
-		// The cleanup goroutine keeps the cache alive forever; stop it when
-		// this plugin is garbage-collected so plugins created per request
-		// don't accumulate goroutines.
-		runtime.SetFinalizer(p, func(pp *CachePlugin) {
-			if pp.owned != nil {
-				pp.owned.Stop()
-			}
-		})
+
+	ownedCurrent := p.owned != nil && QueryCache(p.owned) == p.cache
+
+	if !config.Enabled {
+		// Disabling releases an owned cache (and its cleanup goroutine).
+		if ownedCurrent {
+			p.owned.Stop()
+			p.owned = nil
+			p.cache = nil
+		}
+		return
 	}
+
+	if p.cache != nil && !ownedCurrent {
+		return // injected cache: not ours to reconfigure
+	}
+
+	if ownedCurrent {
+		if p.owned.config == config {
+			return // no-op reconfigure keeps the warm cache
+		}
+		p.owned.Stop()
+	}
+
+	owned := NewInMemoryCache(config)
+	p.cache = owned
+	p.owned = owned
+	// The cleanup goroutine keeps the cache alive forever; stop it when
+	// this plugin is garbage-collected so plugins created per request
+	// don't accumulate goroutines. Clear any previous registration first —
+	// SetFinalizer fatals on double-set, and reconfiguring an owned cache
+	// passes through here more than once.
+	runtime.SetFinalizer(p, nil)
+	runtime.SetFinalizer(p, func(pp *CachePlugin) {
+		if pp.owned != nil {
+			pp.owned.Stop()
+		}
+	})
 }
 
 // GetConfig returns the current cache configuration
@@ -201,6 +237,11 @@ func (p *CachePlugin) Close() {
 	p.cache = nil
 }
 
+// errRenderFailed is recorded into the performance monitor when a cached
+// render wrapper's underlying render produced no result (vetoed by a
+// BeforeQuery hook, no adapter configured, or an unsupported expression).
+var errRenderFailed = errors.New("figo: render returned no result (vetoed, no adapter, or unsupported expression)")
+
 // GetCachedSqlString retrieves the SQL string from cache or renders it via
 // f.GetSqlString. Hits and misses are recorded into the plugin's performance
 // monitor when one is attached.
@@ -239,8 +280,13 @@ func (p *CachePlugin) GetCachedSqlString(f figo.Figo, ctx any, conditionType ...
 	// concurrent Build/AddFiltersFromString changed the state in between, the
 	// rendered SQL belongs to the NEW state and storing it under the OLD key
 	// would poison the cache — verify and skip caching.
+	//
+	// An empty render is never cached either: "" means the render failed
+	// (hook veto, no adapter, unsupported expression) or the requested
+	// segment is empty. Caching it served the empty string as a hit for the
+	// whole TTL — even after a transient veto lifted.
 	sql := f.GetSqlString(ctx, conditionType...)
-	if generateCacheKey(f, "sql", ctx, conditionType...) == key {
+	if sql != "" && generateCacheKey(f, "sql", ctx, conditionType...) == key {
 		cache.Set(key, sql, ttl)
 	}
 
@@ -253,6 +299,7 @@ func (p *CachePlugin) GetCachedSqlString(f figo.Figo, ctx any, conditionType ...
 func (p *CachePlugin) GetCachedQuery(f figo.Figo, ctx any, conditionType ...string) figo.Query {
 	start := time.Now()
 	var cacheHit bool
+	var renderErr error
 
 	p.mu.RLock()
 	cache := p.cache
@@ -263,12 +310,16 @@ func (p *CachePlugin) GetCachedQuery(f figo.Figo, ctx any, conditionType ...stri
 
 	defer func() {
 		if monitor != nil {
-			monitor.RecordQuery(time.Since(start), cacheHit, nil)
+			monitor.RecordQuery(time.Since(start), cacheHit, renderErr)
 		}
 	}()
 
 	if cache == nil || !enabled {
-		return f.GetQuery(ctx, conditionType...)
+		q := f.GetQuery(ctx, conditionType...)
+		if q == nil {
+			renderErr = errRenderFailed
+		}
+		return q
 	}
 
 	key := generateCacheKey(f, "query", ctx, conditionType...)
@@ -283,6 +334,11 @@ func (p *CachePlugin) GetCachedQuery(f figo.Figo, ctx any, conditionType ...stri
 
 	// Generate and cache (see GetCachedSqlString for the key re-check).
 	query := f.GetQuery(ctx, conditionType...)
+	if query == nil {
+		// A failed render is observable in the monitor's ErrorCount instead
+		// of counting as an ordinary miss.
+		renderErr = errRenderFailed
+	}
 	if query != nil && generateCacheKey(f, "query", ctx, conditionType...) == key {
 		cache.Set(key, query, ttl)
 	}
@@ -404,6 +460,19 @@ func appendValueTypes(b *strings.Builder, e figo.Expr) {
 	case figo.BetweenExpr:
 		writeT(x.Low)
 		writeT(x.High)
+	// The advanced expr types carry `any` values too and were missing here,
+	// so int64(1) vs float64(1) in a CustomExpr/JsonPathExpr collided into
+	// one cache slot — the exact collapse this signature exists to prevent.
+	case figo.JsonPathExpr:
+		writeT(x.Value)
+	case figo.ArrayContainsExpr:
+		writeList(x.Values)
+	case figo.ArrayOverlapsExpr:
+		writeList(x.Values)
+	case figo.FullTextSearchExpr:
+		writeT(x.Query)
+	case figo.CustomExpr:
+		writeT(x.Value)
 	case figo.AndExpr:
 		for _, op := range x.Operands {
 			appendValueTypes(b, op)
@@ -463,9 +532,10 @@ func (c *InMemoryCache) Get(key string) (interface{}, bool) {
 		return nil, false
 	}
 
-	// Check if expired. Delete it here so expired entries don't linger (and
-	// inflate Size) when no periodic cleanup runs — e.g. CleanupInterval <= 0.
-	if time.Now().After(entry.ExpiresAt) {
+	// Check if expired (a zero ExpiresAt never expires: TTL <= 0). Delete it
+	// here so expired entries don't linger (and inflate Size) when no
+	// periodic cleanup runs — e.g. CleanupInterval <= 0.
+	if !entry.ExpiresAt.IsZero() && time.Now().After(entry.ExpiresAt) {
 		delete(c.entries, key)
 		c.misses++
 		return nil, false
@@ -495,13 +565,19 @@ func (c *InMemoryCache) Set(key string, value interface{}, ttl time.Duration) {
 	}
 
 	now := time.Now()
-	c.entries[key] = &CacheEntry{
+	entry := &CacheEntry{
 		Data:           value,
-		ExpiresAt:      now.Add(ttl),
 		CreatedAt:      now,
 		LastAccessedAt: now,
 		HitCount:       0,
 	}
+	// TTL <= 0 means "never expires" (zero ExpiresAt). Storing now.Add(0)
+	// created entries that were already expired on arrival, so an enabled
+	// cache with no explicit TTL could never produce a hit.
+	if ttl > 0 {
+		entry.ExpiresAt = now.Add(ttl)
+	}
+	c.entries[key] = entry
 }
 
 // Delete removes a value from the cache
@@ -518,7 +594,11 @@ func (c *InMemoryCache) Clear() {
 	c.entries = make(map[string]*CacheEntry)
 }
 
-// Stats returns cache performance statistics
+// Stats returns cache performance statistics. Size counts only LIVE entries:
+// with no periodic cleanup, expired entries linger in the map until a Get
+// touches them, and counting those reported a fuller cache than callers can
+// ever hit. MemoryUsage stays a rough estimate (keys + string payloads + a
+// fixed per-entry overhead), not an exact accounting.
 func (c *InMemoryCache) Stats() CacheStats {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -529,12 +609,28 @@ func (c *InMemoryCache) Stats() CacheStats {
 		hitRate = float64(c.hits) / float64(total)
 	}
 
+	now := time.Now()
+	size := 0
+	var mem int64
+	for key, entry := range c.entries {
+		if !entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt) {
+			continue
+		}
+		size++
+		mem += int64(len(key)) + 64 // fixed bookkeeping estimate per entry
+		if s, ok := entry.Data.(string); ok {
+			mem += int64(len(s))
+		} else {
+			mem += 100 // opaque non-string payload estimate
+		}
+	}
+
 	return CacheStats{
 		Hits:        c.hits,
 		Misses:      c.misses,
-		Size:        len(c.entries),
+		Size:        size,
 		HitRate:     hitRate,
-		MemoryUsage: int64(len(c.entries) * 100), // Rough estimate
+		MemoryUsage: mem,
 	}
 }
 
@@ -579,7 +675,7 @@ func (c *InMemoryCache) cleanupExpired() {
 
 	now := time.Now()
 	for key, entry := range c.entries {
-		if now.After(entry.ExpiresAt) {
+		if !entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt) {
 			delete(c.entries, key)
 		}
 	}

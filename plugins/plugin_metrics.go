@@ -116,7 +116,7 @@ func (p *MetricsPlugin) Initialize(figo.Figo) error { return nil }
 func (p *MetricsPlugin) BeforeQuery(figo.Figo, any) error { return nil }
 
 // AfterQuery implements Plugin
-func (p *MetricsPlugin) AfterQuery(figo.Figo, any, interface{}) error { return nil }
+func (p *MetricsPlugin) AfterQuery(figo.Figo, any, any) error { return nil }
 
 // BeforeParse implements Plugin
 func (p *MetricsPlugin) BeforeParse(_ figo.Figo, dsl string) (string, error) { return dsl, nil }

@@ -20,8 +20,14 @@ import (
 
 // QueryLimits defines limits for query complexity. A zero (or negative) value
 // disables that particular limit.
+//
+// MaxNestingDepth counts logical nesting as a user reads the query: a bare
+// condition or one flat connector chain ("a=1 and b=2 and ... z=9") is depth
+// 1 — regardless of how the parser nested its binary nodes internally — and
+// each embedded group of a DIFFERENT connector adds a level, so
+// "a=1 and (b=2 or c=3)" is depth 2.
 type QueryLimits struct {
-	MaxNestingDepth    int // max nesting of logical operators (a flat query has depth 1)
+	MaxNestingDepth    int // max logical nesting (a flat query has depth 1)
 	MaxFieldCount      int // max number of distinct fields referenced
 	MaxParameterCount  int // max total number of filter values (each <in> element counts)
 	MaxExpressionCount int // max total number of expression nodes
@@ -62,7 +68,7 @@ func (p *LimitsPlugin) Initialize(figo.Figo) error { return nil }
 func (p *LimitsPlugin) BeforeQuery(figo.Figo, any) error { return nil }
 
 // AfterQuery implements Plugin
-func (p *LimitsPlugin) AfterQuery(figo.Figo, any, interface{}) error { return nil }
+func (p *LimitsPlugin) AfterQuery(figo.Figo, any, any) error { return nil }
 
 // BeforeParse implements Plugin
 func (p *LimitsPlugin) BeforeParse(_ figo.Figo, dsl string) (string, error) { return dsl, nil }
@@ -97,11 +103,17 @@ func (p *LimitsPlugin) AfterParse(f figo.Figo, _ string) error {
 
 	m := &queryMeasure{fields: make(map[string]bool)}
 	for _, e := range c.GetClauses() {
-		measureExpr(e, 1, m)
+		measureExpr(e, m)
+		if d := logicalDepth(e); d > m.maxDepth {
+			m.maxDepth = d
+		}
 	}
 	for _, exprs := range c.GetPreloads() {
 		for _, e := range exprs {
-			measureExpr(e, 1, m)
+			measureExpr(e, m)
+			if d := logicalDepth(e); d > m.maxDepth {
+				m.maxDepth = d
+			}
 		}
 	}
 
@@ -128,29 +140,26 @@ type queryMeasure struct {
 	fields      map[string]bool
 }
 
-// measureExpr walks an expression tree counting nodes, values, distinct
-// fields, and the deepest level of logical nesting (a flat query is depth 1).
-func measureExpr(e figo.Expr, depth int, m *queryMeasure) {
+// measureExpr walks an expression tree counting nodes, values, and distinct
+// fields. Depth is measured separately by logicalDepth.
+func measureExpr(e figo.Expr, m *queryMeasure) {
 	if e == nil {
 		return
-	}
-	if depth > m.maxDepth {
-		m.maxDepth = depth
 	}
 	m.expressions++
 
 	switch v := e.(type) {
 	case figo.AndExpr:
 		for _, op := range v.Operands {
-			measureExpr(op, depth+1, m)
+			measureExpr(op, m)
 		}
 	case figo.OrExpr:
 		for _, op := range v.Operands {
-			measureExpr(op, depth+1, m)
+			measureExpr(op, m)
 		}
 	case figo.NotExpr:
 		for _, op := range v.Operands {
-			measureExpr(op, depth+1, m)
+			measureExpr(op, m)
 		}
 	case figo.OrderBy:
 		// Sorting isn't filter complexity; only the node itself is counted.
@@ -160,6 +169,51 @@ func measureExpr(e figo.Expr, depth int, m *queryMeasure) {
 		}
 		m.params += exprParamCount(e)
 	}
+}
+
+// logicalDepth measures nesting the way QueryLimits documents it: leaves and
+// flat single-connector chains are depth 1; each embedded group of a
+// different connector adds a level. Counting raw tree levels (the previous
+// behavior) inflated flat chains — the parser builds "a and b and ... and k"
+// as left-nested binary AndExprs, so an 11-term FLAT query measured depth 11
+// and tripped the default MaxNestingDepth of 10.
+func logicalDepth(e figo.Expr) int {
+	if d := exprDepth(e, figo.Operation("")); d > 1 {
+		return d
+	}
+	return 1
+}
+
+// exprDepth returns how many logical levels e contributes under a parent
+// connector. Operands using the SAME connector as their parent continue the
+// parent's level (chain flattening); a different connector opens a new one.
+func exprDepth(e figo.Expr, parentOp figo.Operation) int {
+	var op figo.Operation
+	var operands []figo.Expr
+	switch v := e.(type) {
+	case figo.AndExpr:
+		op, operands = figo.OperationAnd, v.Operands
+	case figo.OrExpr:
+		op, operands = figo.OperationOr, v.Operands
+	case figo.NotExpr:
+		op, operands = figo.OperationNot, v.Operands
+	default:
+		return 0
+	}
+
+	maxChild := 0
+	for _, o := range operands {
+		if o == nil {
+			continue
+		}
+		if d := exprDepth(o, op); d > maxChild {
+			maxChild = d
+		}
+	}
+	if op == parentOp {
+		return maxChild
+	}
+	return maxChild + 1
 }
 
 // exprParamCount returns the number of filter values a leaf node carries
