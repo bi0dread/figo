@@ -177,3 +177,66 @@ func (p *FieldsPlugin) FilterExpr(f figo.Figo, e figo.Expr) figo.Expr {
 	}
 	return e
 }
+
+// FinalizeClauses implements ClauseFinalizer. The clause list itself passes
+// through untouched (expression pruning happens in FilterExpr); the hook is
+// where the SORT specification is enforced. sort= columns previously bypassed
+// both the ignore list and the whitelist entirely, so a query could order —
+// and, with page=take:1, probe value-by-value — a forbidden column the same
+// plugin had just pruned from the WHERE clause.
+func (p *FieldsPlugin) FinalizeClauses(f figo.Figo, clauses []figo.Expr) []figo.Expr {
+	sort := f.GetSort()
+	if sort == nil || len(sort.Columns) == 0 {
+		return clauses
+	}
+
+	p.mu.RLock()
+	ignore := make([]string, 0, len(p.ignoreFields))
+	for k := range p.ignoreFields {
+		ignore = append(ignore, k)
+	}
+	allowed := make([]string, 0, len(p.allowedFields))
+	for k := range p.allowedFields {
+		allowed = append(allowed, k)
+	}
+	whitelist := p.fieldWhitelist
+	p.mu.RUnlock()
+
+	if len(ignore) == 0 && !whitelist {
+		return clauses
+	}
+
+	// Sort columns went through the naming strategy at parse time; match
+	// registered names both verbatim and converted, exactly as FilterExpr does.
+	fn := f.GetNamingFunc()
+	ignored := make(map[string]bool, len(ignore)*2)
+	for _, name := range ignore {
+		ignored[name] = true
+		ignored[fn(name)] = true
+	}
+	allowedConv := make(map[string]bool, len(allowed)*2)
+	for _, name := range allowed {
+		allowedConv[name] = true
+		allowedConv[fn(name)] = true
+	}
+
+	kept := make([]figo.OrderByColumn, 0, len(sort.Columns))
+	for _, col := range sort.Columns {
+		if ignored[col.Name] {
+			continue
+		}
+		if whitelist && !allowedConv[col.Name] {
+			continue
+		}
+		kept = append(kept, col)
+	}
+	if len(kept) == len(sort.Columns) {
+		return clauses
+	}
+	if len(kept) == 0 {
+		f.SetSort(nil)
+	} else {
+		f.SetSort(&figo.OrderBy{Columns: kept})
+	}
+	return clauses
+}

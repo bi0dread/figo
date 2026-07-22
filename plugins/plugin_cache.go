@@ -8,6 +8,7 @@ import (
 	"crypto/md5"
 	"errors"
 	"fmt"
+	"reflect"
 	"runtime"
 	"sort"
 	"strings"
@@ -248,6 +249,7 @@ var errRenderFailed = errors.New("figo: render returned no result (vetoed, no ad
 func (p *CachePlugin) GetCachedSqlString(f figo.Figo, ctx any, conditionType ...string) string {
 	start := time.Now()
 	var cacheHit bool
+	var renderErr error
 
 	p.mu.RLock()
 	cache := p.cache
@@ -258,12 +260,16 @@ func (p *CachePlugin) GetCachedSqlString(f figo.Figo, ctx any, conditionType ...
 
 	defer func() {
 		if monitor != nil {
-			monitor.RecordQuery(time.Since(start), cacheHit, nil)
+			monitor.RecordQuery(time.Since(start), cacheHit, renderErr)
 		}
 	}()
 
 	if cache == nil || !enabled {
-		return f.GetSqlString(ctx, conditionType...)
+		sql := f.GetSqlString(ctx, conditionType...)
+		if sql == "" {
+			renderErr = errRenderFailed
+		}
+		return sql
 	}
 
 	key := generateCacheKey(f, "sql", ctx, conditionType...)
@@ -286,6 +292,11 @@ func (p *CachePlugin) GetCachedSqlString(f figo.Figo, ctx any, conditionType ...
 	// segment is empty. Caching it served the empty string as a hit for the
 	// whole TTL — even after a transient veto lifted.
 	sql := f.GetSqlString(ctx, conditionType...)
+	if sql == "" {
+		// A failed render is observable in the monitor's ErrorCount instead
+		// of counting as an ordinary miss (mirrors GetCachedQuery).
+		renderErr = errRenderFailed
+	}
 	if sql != "" && generateCacheKey(f, "sql", ctx, conditionType...) == key {
 		cache.Set(key, sql, ttl)
 	}
@@ -324,15 +335,19 @@ func (p *CachePlugin) GetCachedQuery(f figo.Figo, ctx any, conditionType ...stri
 
 	key := generateCacheKey(f, "query", ctx, conditionType...)
 
-	// Try to get from cache
+	// Try to get from cache. Hits are served as a defensive copy — the cached
+	// entry is shared across callers, and one caller mutating the returned
+	// Args slice must not poison every subsequent hit.
 	if cached, found := cache.Get(key); found {
 		if query, ok := cached.(figo.Query); ok {
 			cacheHit = true
-			return query
+			return copyQuery(query)
 		}
 	}
 
-	// Generate and cache (see GetCachedSqlString for the key re-check).
+	// Generate and cache (see GetCachedSqlString for the key re-check). A
+	// copy is stored so the caller mutating the query returned from THIS
+	// call can't reach into the cache either.
 	query := f.GetQuery(ctx, conditionType...)
 	if query == nil {
 		// A failed render is observable in the monitor's ErrorCount instead
@@ -340,10 +355,44 @@ func (p *CachePlugin) GetCachedQuery(f figo.Figo, ctx any, conditionType ...stri
 		renderErr = errRenderFailed
 	}
 	if query != nil && generateCacheKey(f, "query", ctx, conditionType...) == key {
-		cache.Set(key, query, ttl)
+		cache.Set(key, copyQuery(query), ttl)
 	}
 
 	return query
+}
+
+// copyQuery returns a defensive copy of q for cache storage and hit serving.
+// figo.SQLQuery (the only Query shape core figo defines) carries a mutable
+// Args slice; returning the cached instance by reference let a caller's
+// `q.Args[0] = x` rewrite the cached entry for everyone. Adapter-defined
+// Query types (Mongo/Elasticsearch results) pass through as-is — this package
+// can't know their shape, so their callers must treat cached results as
+// read-only.
+func copyQuery(q figo.Query) figo.Query {
+	switch v := q.(type) {
+	case figo.SQLQuery:
+		v.Args = copyArgsSlice(v.Args)
+		return v
+	case *figo.SQLQuery:
+		if v == nil {
+			return v
+		}
+		cp := *v
+		cp.Args = copyArgsSlice(cp.Args)
+		return &cp
+	default:
+		return q
+	}
+}
+
+// copyArgsSlice shallow-copies a query args slice (nil stays nil).
+func copyArgsSlice(args []any) []any {
+	if args == nil {
+		return nil
+	}
+	out := make([]any, len(args))
+	copy(out, args)
+	return out
 }
 
 // generateCacheKey creates a unique cache key for a query. kind ("sql"/"query")
@@ -376,19 +425,162 @@ func generateCacheKey(f figo.Figo, kind string, ctx any, conditionType ...string
 		// expressions before they enter the clause tree, so the clauses
 		// component above already reflects it.
 		fmt.Sprintf("%v", f.GetSelectFields()),
-		fmt.Sprintf("%p", f.GetNamingFunc()),
-		// %+v (not just %T): adapter configuration changes the rendered SQL —
-		// e.g. RawAdapter{Dialect: PostgresDialect} vs the MySQL default must
-		// not share a cache slot.
-		fmt.Sprintf("%T%+v", f.GetAdapterObject(), f.GetAdapterObject()),
+		namingFingerprint(f),
+		// Contents, not %T%+v: adapter configuration changes the rendered
+		// SQL — e.g. RawAdapter{Dialect: PostgresDialect} vs the MySQL
+		// default must not share a cache slot — and %+v printed pointer
+		// fields (like *SQLDialect) as bare addresses, keying on WHERE the
+		// config lived instead of what it said.
+		adapterFingerprint(f.GetAdapterObject()),
 		figo.GetRegexSQLOperator(),
 		fmt.Sprintf("%v", ctx),
 		fmt.Sprintf("%v", conditionType),
 	}
 
-	content := strings.Join(components, "|")
-	hash := md5.Sum([]byte(content))
+	// Length-prefix every component before joining: a plain "|" join let a
+	// "|" inside a %v-rendered component shift the boundaries, so ctx
+	// `users|[where]` with no conditionType collided with ctx `users` plus
+	// conditionType `where]|[`.
+	var content strings.Builder
+	for _, c := range components {
+		fmt.Fprintf(&content, "%d:%s|", len(c), c)
+	}
+	hash := md5.Sum([]byte(content.String()))
 	return fmt.Sprintf("figo:%x", hash)
+}
+
+// namingFingerprint keys the naming strategy by BEHAVIOR rather than function
+// identity. The old %p encoding collided closures created at the same call
+// site (e.g. a per-tenant factory `func mk(prefix string) figo.NamingFunc`):
+// they share one code pointer regardless of captured state, so two instances
+// differing only in captured naming state produced identical keys and
+// cross-tenant cache hits returned the wrong columns. Instead, the naming
+// func is applied to a canonical probe set — a few fixed strings plus the
+// instance's own pre-naming select fields and sort columns — and the outputs
+// are folded into the key.
+//
+// Limitation: behavior can only be sampled, not proven equal. A pathological
+// naming func that ignores its input (or its captured state) on every probe
+// string while still renaming real clause columns differently could collide.
+func namingFingerprint(f figo.Figo) string {
+	fn := f.GetNamingFunc()
+	if fn == nil {
+		return "<nil>"
+	}
+	probes := []string{"FigoProbe", "user.createdAt", "AbCd_ef"}
+	if sel := f.GetSelectFields(); len(sel) > 0 {
+		fields := make([]string, 0, len(sel))
+		for name := range sel {
+			fields = append(fields, name)
+		}
+		sort.Strings(fields)
+		probes = append(probes, fields...)
+	}
+	if ob := f.GetSort(); ob != nil {
+		for _, col := range ob.Columns {
+			probes = append(probes, col.Name)
+		}
+	}
+	var b strings.Builder
+	for _, probe := range probes {
+		out := fn(probe)
+		fmt.Fprintf(&b, "%d:%s,", len(out), out)
+	}
+	return b.String()
+}
+
+// adapterFingerprint renders the adapter's configuration by CONTENTS,
+// dereferencing pointers. fmt's %+v printed a RawAdapter{Dialect: d} as the
+// *SQLDialect's ADDRESS: reconfiguring the dialect in place kept the old key
+// (serving stale MySQL-quoted SQL for a Postgres request), and heap address
+// reuse across per-request dialect copies (the customization pattern
+// adapters/dialect.go recommends) collided fresh configs into stale slots.
+func adapterFingerprint(a figo.Adapter) string {
+	if a == nil {
+		return "<nil>"
+	}
+	var b strings.Builder
+	fmt.Fprintf(&b, "%T", a)
+	writeValueContents(&b, reflect.ValueOf(a), make(map[uintptr]bool), 0)
+	return b.String()
+}
+
+// writeValueContents renders v recursively with pointers dereferenced and map
+// entries in deterministic order. seen guards against pointer cycles; depth
+// bounds pathological nesting. Funcs have no comparable contents and key by
+// code pointer (the best identity available).
+func writeValueContents(b *strings.Builder, v reflect.Value, seen map[uintptr]bool, depth int) {
+	if depth > 10 {
+		b.WriteString("<deep>")
+		return
+	}
+	switch v.Kind() {
+	case reflect.Invalid:
+		b.WriteString("<nil>")
+	case reflect.Pointer:
+		if v.IsNil() {
+			b.WriteString("<nil>")
+			return
+		}
+		if p := v.Pointer(); seen[p] {
+			b.WriteString("<cycle>")
+			return
+		} else {
+			seen[p] = true
+		}
+		b.WriteByte('&')
+		writeValueContents(b, v.Elem(), seen, depth+1)
+	case reflect.Interface:
+		if v.IsNil() {
+			b.WriteString("<nil>")
+			return
+		}
+		fmt.Fprintf(b, "(%s)", v.Elem().Type())
+		writeValueContents(b, v.Elem(), seen, depth+1)
+	case reflect.Struct:
+		b.WriteByte('{')
+		for i := 0; i < v.NumField(); i++ {
+			b.WriteString(v.Type().Field(i).Name)
+			b.WriteByte(':')
+			writeValueContents(b, v.Field(i), seen, depth+1)
+			b.WriteByte(';')
+		}
+		b.WriteByte('}')
+	case reflect.Slice, reflect.Array:
+		b.WriteByte('[')
+		for i := 0; i < v.Len(); i++ {
+			writeValueContents(b, v.Index(i), seen, depth+1)
+			b.WriteByte(';')
+		}
+		b.WriteByte(']')
+	case reflect.Map:
+		entries := make([]string, 0, v.Len())
+		iter := v.MapRange()
+		for iter.Next() {
+			var e strings.Builder
+			writeValueContents(&e, iter.Key(), seen, depth+1)
+			e.WriteByte('=')
+			writeValueContents(&e, iter.Value(), seen, depth+1)
+			entries = append(entries, e.String())
+		}
+		sort.Strings(entries)
+		b.WriteString("map[")
+		for _, e := range entries {
+			b.WriteString(e)
+			b.WriteByte(';')
+		}
+		b.WriteByte(']')
+	case reflect.Func, reflect.Chan, reflect.UnsafePointer:
+		if v.IsNil() {
+			b.WriteString("<nil>")
+			return
+		}
+		fmt.Fprintf(b, "%s@%x", v.Kind(), v.Pointer())
+	default:
+		// Scalars (and strings). fmt renders a reflect.Value operand as the
+		// value it holds, so unexported fields print fine here too.
+		fmt.Fprintf(b, "%v", v)
+	}
 }
 
 // valueTypeSignature renders the Go type of every value carried by the given

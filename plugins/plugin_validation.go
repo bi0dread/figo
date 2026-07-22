@@ -76,7 +76,10 @@ func (p *ValidationPlugin) BeforeParse(_ figo.Figo, dsl string) (string, error) 
 // "userEmail" must fire for the parsed field "user_email" — exactly the dual
 // matching FieldsPlugin applies to its ignore list and whitelist.
 func (p *ValidationPlugin) AfterParse(f figo.Figo, _ string) error {
-	c := f.Clone()
+	// Built without clause finalizers (see cloneForInspection): validating a
+	// ScopePlugin's injected tenant value against the user's rules wrongly
+	// rejected legitimate queries.
+	c := cloneForInspection(f)
 	c.Build(nil)
 
 	fn := f.GetNamingFunc() // never nil: SnakeCaseNaming is the default

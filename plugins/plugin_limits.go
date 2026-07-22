@@ -91,14 +91,16 @@ func (p *LimitsPlugin) GetLimits() QueryLimits {
 // tree is only materialized by Build, which the caller may not have run yet,
 // so the DSL is built on a clone — the caller's instance is left untouched.
 // Measurement happens after any registered expression filters (e.g.
-// FieldsPlugin pruning), i.e. on the query that would actually run.
+// FieldsPlugin pruning) but WITHOUT clause finalizers (see
+// cloneForInspection), i.e. on the user's query as it would actually run —
+// not on policy clauses a ScopePlugin injects.
 func (p *LimitsPlugin) AfterParse(f figo.Figo, _ string) error {
 	limits := p.GetLimits()
 	if limits == (QueryLimits{}) {
 		return nil
 	}
 
-	c := f.Clone()
+	c := cloneForInspection(f)
 	c.Build(nil)
 
 	m := &queryMeasure{fields: make(map[string]bool)}

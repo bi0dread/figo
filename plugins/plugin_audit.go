@@ -23,6 +23,12 @@ import (
 // on cached paths only real renders are audited, not cache hits). Entries go
 // to the optional slog.Logger and into a bounded in-memory history (oldest
 // entries are evicted first); pass historySize 0 to disable the history.
+//
+// A "parse" entry records a parse ATTEMPT: another plugin's AfterParse hook
+// (LimitsPlugin, ValidationPlugin) may still reject the same DSL, in which
+// case AddFiltersFromString rolls it back and returns the error. All
+// AfterParse hooks run regardless of each other's errors, so the attempt is
+// recorded consistently whatever order the plugins were registered in.
 type AuditPlugin struct {
 	mu      sync.RWMutex
 	logger  *slog.Logger
