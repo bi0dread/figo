@@ -1861,16 +1861,18 @@ func TestGormSortFieldNameFix(t *testing.T) {
 func TestSortPageComprehensive(t *testing.T) {
 	t.Run("SortEdgeCases", func(t *testing.T) {
 		testCases := []struct {
-			name        string
-			dsl         string
-			expectError bool
-			description string
+			name          string
+			dsl           string
+			expectError   bool
+			expectNoOrder bool
+			description   string
 		}{
 			{
-				name:        "EmptySortField",
-				dsl:         "sort=:desc",
-				expectError: false,
-				description: "Empty field name should be handled gracefully",
+				name:          "EmptySortField",
+				dsl:           "sort=:desc",
+				expectError:   false,
+				expectNoOrder: true, // an empty field must be skipped, not rendered as ORDER BY ""
+				description:   "Empty field name should be handled gracefully",
 			},
 			{
 				name:        "EmptySortDirection",
@@ -1933,8 +1935,11 @@ func TestSortPageComprehensive(t *testing.T) {
 					f.Build(RawAdapter{})
 					sql := f.GetSqlString("test_table")
 
-					// Verify that sort is present in SQL
-					if strings.Contains(tc.dsl, "sort=") && !strings.Contains(sql, "ORDER BY") {
+					if tc.expectNoOrder {
+						if strings.Contains(sql, "ORDER BY") {
+							t.Errorf("Expected no ORDER BY clause in SQL for %s, got %q", tc.description, sql)
+						}
+					} else if strings.Contains(tc.dsl, "sort=") && !strings.Contains(sql, "ORDER BY") {
 						t.Errorf("Expected ORDER BY clause in SQL for %s", tc.description)
 					}
 				}

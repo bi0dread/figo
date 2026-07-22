@@ -20,9 +20,11 @@ func (f *figo) Clone() Figo {
 	// the source struct by value would copy f.mu (a sync.RWMutex) — a vet error.
 	return &figo{
 		// Independent value-typed state (safe to copy directly).
-		page:       f.page,
-		dsl:        f.dsl,
-		namingFunc: f.namingFunc, // shared transformer; assumed pure
+		page:         f.page,
+		dsl:          f.dsl,
+		pageFromDSL:  f.pageFromDSL,
+		builtFromDSL: f.builtFromDSL,
+		namingFunc:   f.namingFunc, // shared transformer; assumed pure
 
 		// Deep-copied reference-typed state.
 		clauses:      cloneExprs(f.clauses),

@@ -36,6 +36,9 @@ func Walk(e Expr, visit func(Expr)) Expr {
 		return v
 
 	// Leaf nodes: visit via a pointer to an addressable copy, then write it back.
+	// Leaves carrying slices copy them first: the struct copy shares the slice
+	// BACKING ARRAY with the snapshots GetClauses/Explain hand out, so a visitor
+	// writing v.Values[i] would mutate them in place (and race with readers).
 	case EqExpr:
 		visit(&v)
 		return v
@@ -64,9 +67,11 @@ func Walk(e Expr, visit func(Expr)) Expr {
 		visit(&v)
 		return v
 	case InExpr:
+		v.Values = cloneAnySlice(v.Values)
 		visit(&v)
 		return v
 	case NotInExpr:
+		v.Values = cloneAnySlice(v.Values)
 		visit(&v)
 		return v
 	case BetweenExpr:
@@ -82,9 +87,11 @@ func Walk(e Expr, visit func(Expr)) Expr {
 		visit(&v)
 		return v
 	case ArrayContainsExpr:
+		v.Values = cloneAnySlice(v.Values)
 		visit(&v)
 		return v
 	case ArrayOverlapsExpr:
+		v.Values = cloneAnySlice(v.Values)
 		visit(&v)
 		return v
 	case FullTextSearchExpr:
@@ -97,6 +104,7 @@ func Walk(e Expr, visit func(Expr)) Expr {
 		visit(&v)
 		return v
 	case OrderBy:
+		v = *cloneOrderBy(&v)
 		visit(&v)
 		return v
 
