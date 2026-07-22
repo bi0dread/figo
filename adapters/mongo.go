@@ -61,19 +61,8 @@ func BuildMongoFindOptions(f figo.Figo) *options.FindOptions {
 		opts.SetSkip(skip)
 	}
 	// sort
-	sort := f.GetSort()
-	if sort != nil {
-		var sd bson.D
-		for _, c := range sort.Columns {
-			order := 1
-			if c.Desc {
-				order = -1
-			}
-			sd = append(sd, bson.E{Key: c.Name, Value: order})
-		}
-		if len(sd) > 0 {
-			opts.SetSort(sd)
-		}
+	if sd := mongoSortDoc(f); len(sd) > 0 {
+		opts.SetSort(sd)
 	}
 	// projection: honor AddSelectFields the way GORM (Select) and Elasticsearch
 	// (_source) do, instead of silently returning full documents.
@@ -85,6 +74,28 @@ func BuildMongoFindOptions(f figo.Figo) *options.FindOptions {
 		opts.SetProjection(proj)
 	}
 	return opts
+}
+
+// mongoSortDoc renders the instance's sort as a bson.D (nil when unset),
+// shared by BuildMongoFindOptions and the aggregation pipeline. Empty column
+// names are skipped defensively — they would render {"": 1}.
+func mongoSortDoc(f figo.Figo) bson.D {
+	sort := f.GetSort()
+	if sort == nil {
+		return nil
+	}
+	var sd bson.D
+	for _, c := range sort.Columns {
+		if c.Name == "" {
+			continue
+		}
+		order := 1
+		if c.Desc {
+			order = -1
+		}
+		sd = append(sd, bson.E{Key: c.Name, Value: order})
+	}
+	return sd
 }
 
 // BuildMongoAggregatePipeline builds an aggregation pipeline for preloads using $lookup.
@@ -131,6 +142,20 @@ func mongoAggregatePipeline(f figo.Figo, joins map[string]MongoJoin, a MongoAdap
 				pipeline = append(pipeline, bson.D{{Key: "$match", Value: m}})
 			}
 		}
+	}
+
+	// sort= and page= must survive the aggregation path with the same
+	// semantics BuildMongoFindOptions gives Find: Take/Skip <= 0 mean
+	// "no limit"/"no offset", so those stages are simply omitted.
+	if sd := mongoSortDoc(f); len(sd) > 0 {
+		pipeline = append(pipeline, bson.D{{Key: "$sort", Value: sd}})
+	}
+	p := f.GetPage()
+	if p.Skip > 0 {
+		pipeline = append(pipeline, bson.D{{Key: "$skip", Value: int64(p.Skip)}})
+	}
+	if p.Take > 0 {
+		pipeline = append(pipeline, bson.D{{Key: "$limit", Value: int64(p.Take)}})
 	}
 
 	return pipeline, nil
@@ -333,11 +358,38 @@ func mongoExpr(e figo.Expr, rc mongoRender) (bson.M, error) {
 		}
 		return logicalBSON("$or", parts), nil
 	case figo.NotExpr:
-		parts, err := mongoOperands(x.Operands, rc)
-		if err != nil {
-			return nil, err
+		// $text is illegal under $nor at any depth — MongoDB rejects the query
+		// server-side — so fail the build with a clear error instead.
+		for _, op := range x.Operands {
+			if op != nil && exprContainsFullText(op) {
+				return nil, fmt.Errorf("figo: full-text search ($text) cannot be negated ($nor) on the MongoDB adapter")
+			}
 		}
-		return logicalBSON("$nor", parts), nil
+		parts := make([]bson.M, 0, len(x.Operands))
+		sawOperand := false
+		for _, op := range x.Operands {
+			if op == nil {
+				continue
+			}
+			sawOperand = true
+			m, err := mongoExpr(op, rc)
+			if err != nil {
+				return nil, err
+			}
+			if len(m) == 0 {
+				// The operand rendered a match-all predicate ({}), so its
+				// negation matches NOTHING. mongoOperands dropped it, leaving
+				// {} — match everything: fail open (raw/ES: NOT(TRUE)=FALSE).
+				return bson.M{"$nor": []bson.M{{}}}, nil
+			}
+			parts = append(parts, m)
+		}
+		if !sawOperand {
+			// NOT of no operands stays the vacuous-true identity, like the
+			// raw adapter's "" and logicalBSON's empty $nor.
+			return bson.M{}, nil
+		}
+		return bson.M{"$nor": parts}, nil
 	case figo.OrderBy:
 		return bson.M{}, nil
 	default:
@@ -369,6 +421,31 @@ func mongoJSONPath(x figo.JsonPathExpr, rc mongoRender) (bson.M, error) {
 	default:
 		return nil, fmt.Errorf("figo: unsupported JSON path op %q for the MongoDB adapter", x.Op)
 	}
+}
+
+// exprContainsFullText reports whether the expression tree contains a
+// FullTextSearchExpr at any depth (used to reject $text under $nor).
+func exprContainsFullText(e figo.Expr) bool {
+	switch x := e.(type) {
+	case figo.FullTextSearchExpr:
+		return true
+	case figo.AndExpr:
+		return anyContainsFullText(x.Operands)
+	case figo.OrExpr:
+		return anyContainsFullText(x.Operands)
+	case figo.NotExpr:
+		return anyContainsFullText(x.Operands)
+	}
+	return false
+}
+
+func anyContainsFullText(ops []figo.Expr) bool {
+	for _, op := range ops {
+		if op != nil && exprContainsFullText(op) {
+			return true
+		}
+	}
+	return false
 }
 
 // logicalBSON wraps rendered operands under a logical operator, avoiding an

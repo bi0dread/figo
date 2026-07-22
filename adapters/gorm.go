@@ -116,11 +116,35 @@ func toGormClauseWithFigo(e figo.Expr, f figo.Figo) (clause.Expression, error) {
 			return nil, err
 		}
 		if len(parts) == 0 {
-			// NOT of nothing is vacuously true: no predicate, like Mongo's
-			// empty $nor.
-			return nil, nil
+			hasOperand := false
+			for _, op := range x.Operands {
+				if op != nil {
+					hasOperand = true
+					break
+				}
+			}
+			if !hasOperand {
+				// NOT of nothing is vacuously true: no predicate, like Mongo's
+				// empty $nor.
+				return nil, nil
+			}
+			// The operands rendered no predicate (vacuously true, e.g. an
+			// empty AND identity), so the negation matches NOTHING. Returning
+			// nil dropped the NOT entirely: fail open.
+			return clause.Expr{SQL: "1=0"}, nil
 		}
-		return clause.Not(parts...), nil
+		// NotExpr is NOR: NOT(op1 OR op2 ...). clause.Not is unusable here —
+		// it unwraps a lone AndConditions and distributes the negation over
+		// its conjuncts, turning NOT(a AND b) (NAND) into NOT a AND NOT b
+		// (NOR). Rendering "NOT (<inner>)" verbatim preserves the semantics
+		// for every operand shape.
+		var inner clause.Expression
+		if len(parts) == 1 {
+			inner = parts[0]
+		} else {
+			inner = clause.Or(parts...)
+		}
+		return clause.Expr{SQL: "NOT (?)", Vars: []any{inner}}, nil
 	case figo.CustomExpr:
 		// Same contract as the raw adapter: the handler receives the field
 		// verbatim and returns a SQL fragment with '?' placeholders + args.
@@ -135,8 +159,15 @@ func toGormClauseWithFigo(e figo.Expr, f figo.Figo) (clause.Expression, error) {
 	case figo.OrderBy:
 		var cols []clause.OrderByColumn
 		for _, c := range x.Columns {
+			// Defensively skip empty column names: they would render ORDER BY ``.
+			if c.Name == "" {
+				continue
+			}
 			// c.Name was normalized at parse time (see getFieldName above).
 			cols = append(cols, clause.OrderByColumn{Column: clause.Column{Name: c.Name, Table: clause.CurrentTable}, Desc: c.Desc})
+		}
+		if len(cols) == 0 {
+			return nil, nil
 		}
 		return clause.OrderBy{Columns: cols}, nil
 	default:
@@ -161,10 +192,11 @@ func ApplyGorm(f figo.Figo, trx *gorm.DB) *gorm.DB {
 		trx = trx.Offset(skip)
 	}
 
-	// select fields
-	if len(f.GetSelectFields()) > 0 {
-		fields := make([]string, 0, len(f.GetSelectFields()))
-		for name := range f.GetSelectFields() {
+	// select fields; keys are sorted so the column list is deterministic (the
+	// raw and Elasticsearch adapters sort theirs too), not map-iteration order.
+	if sel := f.GetSelectFields(); len(sel) > 0 {
+		fields := make([]string, 0, len(sel))
+		for _, name := range sortedKeys(sel) {
 			fields = append(fields, normalizeColumnName(f, name))
 		}
 		trx = trx.Select(fields)

@@ -4,6 +4,7 @@ import (
 	figo "github.com/bi0dread/figo/v4"
 
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -116,6 +117,11 @@ func errUnsupportedExpr(e figo.Expr) error {
 func exprToSQL(d *SQLDialect, e figo.Expr) (string, []any, error) {
 	switch x := e.(type) {
 	case figo.EqExpr:
+		if x.Value == nil {
+			// Canonical across adapters: a nil comparison value is the IS NULL
+			// predicate ("= NULL" is never true under three-valued logic).
+			return exprToSQL(d, figo.IsNullExpr{Field: x.Field})
+		}
 		return fmt.Sprintf("%s = ?", d.quoteIdent(x.Field)), []any{x.Value}, nil
 	case figo.GteExpr:
 		return fmt.Sprintf("%s >= ?", d.quoteIdent(x.Field)), []any{x.Value}, nil
@@ -126,6 +132,10 @@ func exprToSQL(d *SQLDialect, e figo.Expr) (string, []any, error) {
 	case figo.LteExpr:
 		return fmt.Sprintf("%s <= ?", d.quoteIdent(x.Field)), []any{x.Value}, nil
 	case figo.NeqExpr:
+		if x.Value == nil {
+			// Canonical across adapters: != nil is the IS NOT NULL predicate.
+			return exprToSQL(d, figo.NotNullExpr{Field: x.Field})
+		}
 		return fmt.Sprintf("%s != ?", d.quoteIdent(x.Field)), []any{x.Value}, nil
 	case figo.LikeExpr:
 		return fmt.Sprintf("%s LIKE ?", d.quoteIdent(x.Field)), []any{x.Value}, nil
@@ -176,7 +186,7 @@ func exprToSQL(d *SQLDialect, e figo.Expr) (string, []any, error) {
 		}
 		return p, a, nil
 	case figo.NotExpr:
-		if len(x.Operands) == 0 {
+		if !hasNonNilOperand(x.Operands) {
 			return "", nil, nil
 		}
 		// figo.NotExpr means "none of the operands match": NOT(a OR b), matching
@@ -187,7 +197,10 @@ func exprToSQL(d *SQLDialect, e figo.Expr) (string, []any, error) {
 			return "", nil, err
 		}
 		if inner == "" {
-			return "", nil, nil
+			// The operands rendered no predicate (vacuously true, e.g. an
+			// empty AND identity), so the negation matches NOTHING. Returning
+			// "" dropped the NOT entirely: fail open.
+			return "1=0", nil, nil
 		}
 		return fmt.Sprintf("NOT (%s)", inner), args, nil
 	case figo.CustomExpr:
@@ -214,6 +227,10 @@ func exprToSQLQualified(d *SQLDialect, e figo.Expr, qualifier string) (string, [
 	qcol := func(field string) string { return d.quoteIdent(qualifier) + "." + d.quoteIdent(field) }
 	switch x := e.(type) {
 	case figo.EqExpr:
+		if x.Value == nil {
+			// See exprToSQL: nil comparison values canonicalize to IS NULL.
+			return exprToSQLQualified(d, figo.IsNullExpr{Field: x.Field}, qualifier)
+		}
 		return fmt.Sprintf("%s = ?", qcol(x.Field)), []any{x.Value}, nil
 	case figo.GteExpr:
 		return fmt.Sprintf("%s >= ?", qcol(x.Field)), []any{x.Value}, nil
@@ -224,6 +241,10 @@ func exprToSQLQualified(d *SQLDialect, e figo.Expr, qualifier string) (string, [
 	case figo.LteExpr:
 		return fmt.Sprintf("%s <= ?", qcol(x.Field)), []any{x.Value}, nil
 	case figo.NeqExpr:
+		if x.Value == nil {
+			// See exprToSQL: != nil canonicalizes to IS NOT NULL.
+			return exprToSQLQualified(d, figo.NotNullExpr{Field: x.Field}, qualifier)
+		}
 		return fmt.Sprintf("%s != ?", qcol(x.Field)), []any{x.Value}, nil
 	case figo.LikeExpr:
 		return fmt.Sprintf("%s LIKE ?", qcol(x.Field)), []any{x.Value}, nil
@@ -266,7 +287,7 @@ func exprToSQLQualified(d *SQLDialect, e figo.Expr, qualifier string) (string, [
 		}
 		return p, a, nil
 	case figo.NotExpr:
-		if len(x.Operands) == 0 {
+		if !hasNonNilOperand(x.Operands) {
 			return "", nil, nil
 		}
 		// See exprToSQL: figo.NotExpr is NOT(a OR b) across all adapters.
@@ -275,7 +296,8 @@ func exprToSQLQualified(d *SQLDialect, e figo.Expr, qualifier string) (string, [
 			return "", nil, err
 		}
 		if inner == "" {
-			return "", nil, nil
+			// See exprToSQL: NOT over a vacuously-true operand matches NOTHING.
+			return "1=0", nil, nil
 		}
 		return fmt.Sprintf("NOT (%s)", inner), args, nil
 	case figo.CustomExpr:
@@ -294,6 +316,18 @@ func exprToSQLQualified(d *SQLDialect, e figo.Expr, qualifier string) (string, [
 	default:
 		return "", nil, errUnsupportedExpr(e)
 	}
+}
+
+// hasNonNilOperand reports whether the operand list has at least one real
+// entry — NOT() with no operands is the vacuous-true identity, but NOT over
+// operands that merely RENDER empty must fail closed instead.
+func hasNonNilOperand(ops []figo.Expr) bool {
+	for _, op := range ops {
+		if op != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func joinGroup(d *SQLDialect, op string, operands []figo.Expr) (string, []any, error) {
@@ -351,6 +385,10 @@ func buildOrderBy(d *SQLDialect, f figo.Figo) string {
 	if sort != nil {
 		cols := make([]string, 0, len(sort.Columns))
 		for _, c := range sort.Columns {
+			// Defensively skip empty column names: they would render ORDER BY ``.
+			if c.Name == "" {
+				continue
+			}
 			dir := "ASC"
 			if c.Desc {
 				dir = "DESC"
@@ -714,8 +752,10 @@ func toSQLLiteral(d *SQLDialect, v any) string {
 		return fmt.Sprintf("%v", x)
 	case uint, uint8, uint16, uint32, uint64:
 		return fmt.Sprintf("%v", x)
-	case float32, float64:
-		return fmt.Sprintf("%v", x)
+	case float32:
+		return floatLiteral(float64(x))
+	case float64:
+		return floatLiteral(x)
 	case bool:
 		if x {
 			return "TRUE"
@@ -730,6 +770,17 @@ func toSQLLiteral(d *SQLDialect, v any) string {
 		// Fallback: quote stringified value
 		return "'" + d.escapeString(fmt.Sprintf("%v", x)) + "'"
 	}
+}
+
+// floatLiteral renders a float literal, guarding non-finite values: NaN/Inf
+// would be spliced verbatim as invalid SQL. This display path (see
+// expandPlaceholders) has no error channel, so render NULL instead — a NULL
+// comparison is never true, failing closed.
+func floatLiteral(v float64) string {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return "NULL"
+	}
+	return fmt.Sprintf("%v", v)
 }
 
 func normalizeColumnName(f figo.Figo, name string) string {

@@ -493,6 +493,38 @@ jsonStr, err = adapters.NewElasticsearchQueryBuilder().FromFigo(f).ToJSON()  // 
 
 `AddSelectFields` maps to `_source`, `page=` maps to `from`/`size`, `sort=` maps to the ES sort array. `ElasticsearchQuery` is JSON-ready (`Query`, `Sort`, `From`, `Size`, `Source` fields with the right tags), so you can marshal it straight into a search request body. If the built AST contains an expression the ES adapter can't render, `BuildElasticsearchQuery` returns the error; the fluent builder's `FromFigo` (which has no error return) defers it until `ToJSON`/`ToJSONCompact`.
 
+### Cross-backend semantics: NULL rows and the ES size cap
+
+The adapters render the same AST, but the backends do not agree on what a
+missing value is. SQL uses three-valued logic: a row where the column is NULL
+makes `!=`, `<in>`, `<nin>`, and any `not (...)` predicate evaluate to
+UNKNOWN, so the raw and GORM adapters **exclude NULL rows** from all of those.
+MongoDB and Elasticsearch have no UNKNOWN:
+
+- `field != v` — Mongo's `$ne` and ES's `must_not term` **match** documents
+  where the field is null or missing; SQL excludes those rows.
+- `field <nin> [..]` — same divergence: `$nin` / negated `terms` match
+  null-or-missing documents, SQL's `NOT IN` never does.
+- `field <in> [.., null]` — a `null` in the list matches null-or-missing
+  documents on Mongo; on SQL, `IN (.., NULL)` can never match a NULL row
+  (and on ES a null in a `terms` list is invalid).
+- `not (...)` — Mongo's `$nor` and ES's `must_not` match documents where the
+  inner predicate is false *or* the field is absent; SQL's `NOT` still
+  excludes rows where the inner predicate involved a NULL.
+
+If NULL/missing rows matter to a negated filter, make the intent explicit with
+`<null>` / `<notnull>` instead of relying on negation.
+
+One more backend limit: Elasticsearch cannot express figo's `take:0`
+("no limit") — a request without `size` returns only 10 hits. The ES adapter
+therefore renders an explicit `"size": 10000` (the `index.max_result_window`
+default) for `take:0`; results beyond that window (including a `from` that
+pushes past it) need `search_after`/scroll. Relatedly, the ES adapter has no
+preload path, so `load=` fails the build with an error instead of being
+silently dropped, and the fluent builder fails closed: after a `FromFigo`
+error, `Build()` returns a `match_none` query and `Err()`/`BuildE()` expose
+the error.
+
 ### Writing your own adapter
 
 An adapter is anything implementing the two-method `figo.Adapter` interface, so you can target another backend (or another SQL dialect) yourself:

@@ -5,9 +5,16 @@ import (
 
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 )
+
+// esMaxResultWindow is Elasticsearch's default index.max_result_window. figo's
+// Take <= 0 means "no limit", which ES cannot express — omitting "size" would
+// silently cap the result at 10 hits, so the window default is rendered
+// explicitly instead. Result sets beyond it need search_after/scroll.
+const esMaxResultWindow = 10000
 
 // ElasticsearchAdapter provides query building for Elasticsearch
 type ElasticsearchAdapter struct{}
@@ -35,6 +42,12 @@ func (e ElasticsearchAdapter) GetQuery(f figo.Figo, ctx any, conditionType ...st
 	}
 	query, err := BuildElasticsearchQuery(f)
 	if err != nil {
+		return nil, false
+	}
+	// An unmarshalable value (e.g. a NaN float) would surface only from the
+	// wrapper's GetSQL, which has no error return and yielded a silent "".
+	// Fail here instead, like GetSqlString does.
+	if _, err := json.Marshal(query); err != nil {
 		return nil, false
 	}
 	return ElasticsearchQueryWrapper{Query: query}, true
@@ -70,6 +83,14 @@ type ElasticsearchQuery struct {
 
 // BuildElasticsearchQuery converts the built figo expressions into an Elasticsearch query
 func BuildElasticsearchQuery(f figo.Figo) (ElasticsearchQuery, error) {
+	// ES has no join/preload analogue, so load= cannot be rendered. Every
+	// other adapter honors preloads (GORM Preload, Mongo $lookup, raw JOIN);
+	// failing the build keeps the file's fail-closed convention instead of
+	// silently discarding them.
+	if len(f.GetPreloads()) > 0 {
+		return ElasticsearchQuery{}, fmt.Errorf("figo: the Elasticsearch adapter does not support load= preloads")
+	}
+
 	q, err := buildElasticsearchQueryFromExprs(f.GetClauses())
 	if err != nil {
 		return ElasticsearchQuery{}, err
@@ -85,12 +106,20 @@ func BuildElasticsearchQuery(f figo.Figo) (ElasticsearchQuery, error) {
 	}
 	if p.Take > 0 {
 		query.Size = p.Take
+	} else {
+		// Take <= 0 is figo's "no limit"; render the max_result_window default
+		// explicitly, otherwise ES silently returns only 10 hits.
+		query.Size = esMaxResultWindow
 	}
 
 	// Handle sorting
 	sort := f.GetSort()
 	if sort != nil {
 		for _, c := range sort.Columns {
+			// Defensively skip empty column names: {"":{"order":...}} is invalid.
+			if c.Name == "" {
+				continue
+			}
 			sortField := map[string]interface{}{
 				c.Name: map[string]string{
 					"order": "asc",
@@ -151,6 +180,11 @@ func buildElasticsearchQueryFromExprs(exprs []figo.Expr) (map[string]interface{}
 func buildElasticsearchQueryFromExpr(expr figo.Expr) (map[string]interface{}, error) {
 	switch x := expr.(type) {
 	case figo.EqExpr:
+		if x.Value == nil {
+			// Canonical across adapters: a nil comparison value is the IS NULL
+			// predicate ("term": null is invalid ES anyway).
+			return buildElasticsearchQueryFromExpr(figo.IsNullExpr{Field: x.Field})
+		}
 		return map[string]interface{}{
 			"term": map[string]interface{}{
 				x.Field: x.Value,
@@ -181,6 +215,10 @@ func buildElasticsearchQueryFromExpr(expr figo.Expr) (map[string]interface{}, er
 			},
 		}, nil
 	case figo.NeqExpr:
+		if x.Value == nil {
+			// Canonical across adapters: != nil is the IS NOT NULL predicate.
+			return buildElasticsearchQueryFromExpr(figo.NotNullExpr{Field: x.Field})
+		}
 		return map[string]interface{}{
 			"bool": map[string]interface{}{
 				"must_not": map[string]interface{}{
@@ -286,9 +324,14 @@ func buildElasticsearchQueryFromExpr(expr figo.Expr) (map[string]interface{}, er
 		}, nil
 	case figo.FullTextSearchExpr:
 		if x.Field == "" {
-			// No target field: search across all fields via multi_match.
+			// No target field: search across all fields via multi_match. The
+			// language maps to an analyzer exactly like the field-scoped match.
+			mm := map[string]interface{}{"query": x.Query}
+			if x.Language != "" {
+				mm["analyzer"] = x.Language
+			}
 			return map[string]interface{}{
-				"multi_match": map[string]interface{}{"query": x.Query},
+				"multi_match": mm,
 			}, nil
 		}
 		body := map[string]interface{}{"query": x.Query}
@@ -304,6 +347,11 @@ func buildElasticsearchQueryFromExpr(expr figo.Expr) (map[string]interface{}, er
 		unit, err := esGeoUnit(x.Unit)
 		if err != nil {
 			return nil, err
+		}
+		if math.IsNaN(x.Distance) || math.IsInf(x.Distance, 0) {
+			// A non-finite distance would render "NaNkm"/"+Infkm", which ES
+			// rejects; fail the build like esGeoUnit does for bad units.
+			return nil, fmt.Errorf("figo: non-finite geo distance %v for field %q on the Elasticsearch adapter", x.Distance, x.Field)
 		}
 		return map[string]interface{}{
 			"geo_distance": map[string]interface{}{
@@ -519,18 +567,35 @@ func NewElasticsearchQueryBuilder() *ElasticsearchQueryBuilder {
 	}
 }
 
+// matchNoneQuery is the fail-closed rendering used when a build error must not
+// surface a filter-stripped query: {"query":{"match_none":{}}}.
+func matchNoneQuery() ElasticsearchQuery {
+	return ElasticsearchQuery{
+		Query: map[string]interface{}{
+			"match_none": map[string]interface{}{},
+		},
+	}
+}
+
 // FromFigo initializes the builder with a figo instance. If the figo clauses
 // contain an unsupported expression, the error is deferred and returned by
-// ToJSON/ToJSONCompact (the fluent API has no error return here).
+// Err/BuildE/ToJSON/ToJSONCompact (the fluent API has no error return here),
+// and the stored query fails closed to match_none — previously the initial
+// match_all survived, so Build() returned a match-everything query with every
+// filter stripped.
 func (b *ElasticsearchQueryBuilder) FromFigo(f figo.Figo) *ElasticsearchQueryBuilder {
 	q, err := BuildElasticsearchQuery(f)
 	if err != nil {
 		b.err = err
+		b.query = matchNoneQuery()
 		return b
 	}
 	b.query = q
 	return b
 }
+
+// Err returns the error deferred by FromFigo, if any.
+func (b *ElasticsearchQueryBuilder) Err() error { return b.err }
 
 // AddSort adds a sort field to the query
 func (b *ElasticsearchQueryBuilder) AddSort(field string, ascending bool) *ElasticsearchQueryBuilder {
@@ -562,9 +627,21 @@ func (b *ElasticsearchQueryBuilder) SetSource(fields ...string) *ElasticsearchQu
 	return b
 }
 
-// Build returns the final Elasticsearch query
+// Build returns the final Elasticsearch query. When FromFigo deferred an
+// error it returns the fail-closed match_none query — never a match-all with
+// the filters stripped; use Err or BuildE to observe the error.
 func (b *ElasticsearchQueryBuilder) Build() ElasticsearchQuery {
-	return b.query
+	q, _ := b.BuildE()
+	return q
+}
+
+// BuildE returns the final Elasticsearch query, or the deferred FromFigo
+// error alongside the fail-closed match_none query.
+func (b *ElasticsearchQueryBuilder) BuildE() (ElasticsearchQuery, error) {
+	if b.err != nil {
+		return matchNoneQuery(), b.err
+	}
+	return b.query, nil
 }
 
 // ToJSON returns the query as a JSON string
