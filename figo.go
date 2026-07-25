@@ -1623,38 +1623,32 @@ func getClausesFromOperation(o Operation, field string, value any) Expr {
 	}
 }
 
+// expressionParser walks the node tree bottom-up, turning each node's children
+// into that node's Expression. Every node is visited EXACTLY once: a second
+// recursion pass (previously run for non-group nodes, duplicating the loop
+// below) re-entered the whole subtree, so each level appended its child's
+// expression list to its own a second time. The lists grew one entry per level
+// and every append copied them, making a parse quadratic in group-nesting
+// depth — "((((...a=1...))))" 20 000 deep took a full second, 100 000 deep did
+// not finish. LimitsPlugin cannot bound this: its AfterParse hook has to Build
+// (i.e. parse) before it can measure anything.
 func expressionParser(node *Node, diags *[]error) {
-	// First, recursively process all child nodes to build their expressions
+	// Build every group child's expression before combining them here.
 	for _, child := range node.Children {
 		if child.Operator == OperationChild {
 			expressionParser(child, diags)
 		}
 	}
 
-	if node.Operator == OperationChild {
-		if len(node.Children) == 1 {
-			node.Expression = append(node.Expression, node.Children[0].Expression...)
-			return
-		}
+	// A group wrapping a single child is that child: adopt its expression as-is
+	// rather than re-running the precedence pass over one item.
+	if node.Operator == OperationChild && len(node.Children) == 1 {
+		node.Expression = append(node.Expression, node.Children[0].Expression...)
+		return
+	}
 
-		// For multiple children, build proper logical expression tree with precedence
-		expr := buildExpressionTreeWithPrecedence(node.Children, diags)
-		if expr != nil {
-			node.Expression = append(node.Expression, expr)
-		}
-	} else {
-		// For non-child nodes, recursively process children
-		for _, child := range node.Children {
-			if child.Operator == OperationChild {
-				expressionParser(child, diags)
-			}
-		}
-
-		// After processing children, build expression tree with precedence
-		expr := buildExpressionTreeWithPrecedence(node.Children, diags)
-		if expr != nil {
-			node.Expression = append(node.Expression, expr)
-		}
+	if expr := buildExpressionTreeWithPrecedence(node.Children, diags); expr != nil {
+		node.Expression = append(node.Expression, expr)
 	}
 }
 
@@ -1798,10 +1792,19 @@ func processWithPrecedence(items []any, diags *[]error) Expr {
 	return AndExpr{Operands: expressions}
 }
 
-// reduceBinary combines every "expr op expr" triple for one connector,
-// left-associatively, preserving source positions. A dangling connector with
-// no expression on one side (leading/trailing/doubled "and"/"or") is dropped
-// (with a diagnostic) rather than pairing two unrelated expressions.
+// reduceBinary collapses every run of one connector ("expr op expr op expr …")
+// into a SINGLE n-ary AndExpr/OrExpr, preserving source positions. A dangling
+// connector with no expression on one side (leading/trailing/doubled
+// "and"/"or") is dropped (with a diagnostic) rather than pairing two unrelated
+// expressions.
+//
+// Runs collapse flat rather than nesting left-associatively. Both connectors
+// are associative, so the two shapes mean the same thing, but the old
+// AndExpr{AndExpr{AndExpr{a,b},c},d} form was N levels deep for N conjuncts:
+// every adapter recursed once per level and the SQL renderer re-joined and
+// re-parenthesized the whole accumulated string at each one, so rendering a
+// flat "a=1 and b=2 and …" chain was quadratic (8 000 conjuncts took 387ms,
+// 50 000 took twelve seconds) and the SQL carried N redundant paren pairs.
 func reduceBinary(items []any, op Operation, diags *[]error) []any {
 	out := make([]any, 0, len(items))
 	for i := 0; i < len(items); i++ {
@@ -1819,15 +1822,31 @@ func reduceBinary(items []any, op Operation, diags *[]error) []any {
 		if i+1 < len(items) {
 			right, rok = items[i+1].(Expr)
 		}
-		if lok && rok {
-			if op == OperationAnd {
-				out[len(out)-1] = AndExpr{Operands: []Expr{left, right}}
-			} else {
-				out[len(out)-1] = OrExpr{Operands: []Expr{left, right}}
-			}
-			i++ // the right operand is consumed
-		} else {
+		if !lok || !rok {
 			addDiag(diags, "dangling %q connector dropped", string(op))
+			continue
+		}
+
+		operands := []Expr{left, right}
+		i++ // the right operand is consumed
+		// Absorb the rest of the run: "… op expr" pairs immediately following.
+		for i+2 < len(items) {
+			nextOp, isNextOp := items[i+1].(Operation)
+			if !isNextOp || nextOp != op {
+				break
+			}
+			nextExpr, ok := items[i+2].(Expr)
+			if !ok {
+				break
+			}
+			operands = append(operands, nextExpr)
+			i += 2
+		}
+
+		if op == OperationAnd {
+			out[len(out)-1] = AndExpr{Operands: operands}
+		} else {
+			out[len(out)-1] = OrExpr{Operands: operands}
 		}
 	}
 	return out

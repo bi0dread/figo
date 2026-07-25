@@ -491,6 +491,15 @@ func (a RawAdapter) GetQuery(f figo.Figo, ctx any, conditionType ...string) (fig
 func buildByConditions(f figo.Figo, table string, conditionType ...string) (string, []any, error) {
 	d := rawDialectOf(f)
 
+	// No conditionType: the whole SELECT. Answered BEFORE the per-segment
+	// builders below, which buildFullSelect renders itself — computing them
+	// here first and then discarding them did every join/where/order render
+	// twice on the adapter's main path (measurably 2x on large filters, on top
+	// of whatever those renders cost).
+	if len(conditionType) == 0 {
+		return buildFullSelect(d, f, table)
+	}
+
 	// Determine columns from selectFields; default to *
 	cols := "*"
 	if sel := f.GetSelectFields(); len(sel) > 0 {
@@ -511,12 +520,6 @@ func buildByConditions(f figo.Figo, table string, conditionType ...string) (stri
 	}
 	orderBy := buildOrderBy(d, f)
 	limitOffset := buildLimitOffset(d, f)
-
-	// If no conditionType specified, return full SELECT (?-form; the adapter
-	// numbers or interpolates at its boundary)
-	if len(conditionType) == 0 {
-		return buildFullSelect(d, f, table)
-	}
 
 	// Build only requested parts, in the order provided
 	parts := make([]string, 0, len(conditionType)*2)
