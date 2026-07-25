@@ -144,6 +144,13 @@ type queryMeasure struct {
 
 // measureExpr walks an expression tree counting nodes, values, and distinct
 // fields. Depth is measured separately by logicalDepth.
+//
+// An n-ary AND/OR counts as one connector per JOIN (operands-1), not as a
+// single node, so the measurement does not depend on how the parser happens to
+// shape a chain — the same principle logicalDepth already applies to nesting.
+// "a=1 and b=2 and c=3" measures 5 whether it was built as one 3-operand
+// AndExpr or as two nested 2-operand ones; without this, flattening chains
+// silently doubled how long a chain a given MaxExpressionCount admits.
 func measureExpr(e figo.Expr, m *queryMeasure) {
 	if e == nil {
 		return
@@ -152,10 +159,12 @@ func measureExpr(e figo.Expr, m *queryMeasure) {
 
 	switch v := e.(type) {
 	case figo.AndExpr:
+		m.expressions += connectorSurplus(v.Operands)
 		for _, op := range v.Operands {
 			measureExpr(op, m)
 		}
 	case figo.OrExpr:
+		m.expressions += connectorSurplus(v.Operands)
 		for _, op := range v.Operands {
 			measureExpr(op, m)
 		}
@@ -171,6 +180,22 @@ func measureExpr(e figo.Expr, m *queryMeasure) {
 		}
 		m.params += exprParamCount(e)
 	}
+}
+
+// connectorSurplus returns how many EXTRA connector nodes an n-ary logical
+// node stands for beyond the one measureExpr already counted: joining k
+// operands takes k-1 connectors. Nodes with 0 or 1 operand add nothing.
+func connectorSurplus(operands []figo.Expr) int {
+	real := 0
+	for _, op := range operands {
+		if op != nil {
+			real++
+		}
+	}
+	if real < 2 {
+		return 0
+	}
+	return real - 2
 }
 
 // logicalDepth measures nesting the way QueryLimits documents it: leaves and
