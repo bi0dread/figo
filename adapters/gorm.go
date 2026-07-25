@@ -109,6 +109,18 @@ func toGormClauseWithFigo(e figo.Expr, f figo.Figo) (clause.Expression, error) {
 			// (empty should) already prevent.
 			return clause.Expr{SQL: "1=0"}, nil
 		}
+		if len(parts) == 1 {
+			// An OR of ONE operand is that operand (the raw adapter's
+			// joinGroup returns parts[0] here too). clause.Or of a single
+			// expression yields clause.OrConditions{1 expr}, a shape GORM's
+			// clause.Where treats as an "or condition": buildExprs joins it to
+			// the PRECEDING clause with " OR " instead of " AND ", and
+			// Where.Build's position swap moves it off index 0 to make that
+			// happen. A single-operand OrExpr therefore turned every sibling
+			// top-level clause into a disjunct — including a ScopePlugin's
+			// mandatory tenant filter, which became optional.
+			return parts[0], nil
+		}
 		return clause.Or(parts...), nil
 	case figo.NotExpr:
 		parts, err := convertOperands(x.Operands)

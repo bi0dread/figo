@@ -1671,6 +1671,24 @@ func buildExpressionTreeWithPrecedence(children []*Node, diags *[]error) Expr {
 		// Add expressions from this child
 		if len(child.Expression) > 0 {
 			items = append(items, child.Expression[len(child.Expression)-1])
+		} else if child.Operator == OperationChild {
+			// A parenthesized group that produced NO expression — "()", a group
+			// holding only sort=/page=/load= directives, or one whose every
+			// condition was invalid — contributes nothing here. A "not" written
+			// in front of it would then land next to the FOLLOWING expression
+			// and negate that instead: "not (sort=id:desc) and a=1" rendered
+			// NOT(a=1), inverting a filter the user never negated (and, for
+			// "not () a=1", with no diagnostic at all). The group consumes its
+			// pending nots instead. dropDanglingNot handles the analogous case
+			// for a dropped TOKEN; this is the group form.
+			for len(items) > 0 {
+				op, isOp := items[len(items)-1].(Operation)
+				if !isOp || op != OperationNot {
+					break
+				}
+				items = items[:len(items)-1]
+				addDiag(diags, "dropped 'not' preceding a group with no conditions")
+			}
 		}
 		// Add operators
 		if child.Operator == OperationAnd || child.Operator == OperationOr || child.Operator == OperationNot {
