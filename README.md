@@ -579,8 +579,11 @@ Cached rendering lives on the `CachePlugin` (see [Caching](#caching)): `cp.GetCa
 SetPage(skip, take int)
 SetPageString(v string)             // "skip:10,take:5"
 GetPage() Page                      // returns a copy — use SetPage to change it
-GetSort() *OrderBy
+SetSort(sort *OrderBy)              // nil clears; copied in
+GetSort() *OrderBy                  // returns a copy
 ```
+
+> A page or sort set through `SetPage`/`SetSort` belongs to the caller and survives `Build`. A `page=`/`sort=` directive in the DSL still wins, and a value that came *from* a directive is cleared when the DSL is replaced.
 
 **Adapter & inspection**
 
@@ -601,7 +604,7 @@ SetPluginManager(m *PluginManager)
 GetPluginManager() *PluginManager
 ```
 
-**Field & select control** — `AddSelectFields(...)` / `GetSelectFields()` (`map[string]bool`), `SetNamingFunc(fn)` / `GetNamingFunc()`. Ignore/whitelist state lives on the `FieldsPlugin`, complexity limits on the `LimitsPlugin`.
+**Field & select control** — `AddSelectFields(...)` (widens the projection) / `SetSelectFields(...)` (replaces it; no arguments restores `SELECT *`) / `GetSelectFields()` (`map[string]bool`), `SetNamingFunc(fn)` / `GetNamingFunc()`. Ignore/whitelist state lives on the `FieldsPlugin`, complexity limits on the `LimitsPlugin`.
 
 > `GetPage()` returns a **copy** of the page. Mutating it has no effect — call `SetPage(skip, take)` to change pagination.
 

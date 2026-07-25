@@ -23,6 +23,7 @@ func (f *figo) Clone() Figo {
 		page:         f.page,
 		dsl:          f.dsl,
 		pageFromDSL:  f.pageFromDSL,
+		sortFromDSL:  f.sortFromDSL,
 		builtFromDSL: f.builtFromDSL,
 		namingFunc:   f.namingFunc, // shared transformer; assumed pure
 

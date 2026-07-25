@@ -22,6 +22,11 @@ func sortedKeys(m map[string]bool) []string {
 	return keys
 }
 
+// sortStrings sorts a slice of names in place. It exists so adapters in this
+// package can order map-derived relation names deterministically without each
+// importing "sort" (gorm.go shadows that name with local sort variables).
+func sortStrings(s []string) { sort.Strings(s) }
+
 // RawPreload represents a built WHERE clause and args for a preload relationship
 type RawPreload struct {
 	Where string

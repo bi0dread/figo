@@ -560,6 +560,7 @@ type Figo interface {
 	AddFiltersFromString(input string) error
 	AddFilter(exp Expr)
 	AddSelectFields(fields ...string)
+	SetSelectFields(fields ...string)
 	GetDSL() string
 	SetPluginManager(manager *PluginManager)
 	GetPluginManager() *PluginManager
@@ -607,6 +608,7 @@ type figo struct {
 	namingFunc    NamingFunc // never nil; SnakeCaseNaming by default
 	adapterObj    Adapter
 	pageFromDSL   bool         // page came from a page= directive (vs SetPage), so a DSL replacement resets it
+	sortFromDSL   bool         // sort came from a sort= directive (vs SetSort), same rule as pageFromDSL
 	builtFromDSL  bool         // last Build materialized clause state from a DSL, so an empty-DSL rebuild must clear it
 	mu            sync.RWMutex // Mutex for concurrent access protection
 }
@@ -821,8 +823,8 @@ func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 				// these keywords (sortOrder, pageCount, loadedAt) are parsed as
 				// filters rather than swallowed as sort/page/load directives.
 				if strings.HasPrefix(token, string(OperationSort)+"=") || strings.HasPrefix(token, string(OperationPage)+"=") || strings.HasPrefix(token, string(OperationLoad)+"=") {
-					k := j - 1
 					if strings.HasPrefix(token, string(OperationLoad)+"=") {
+						k := j - 1
 						loadLabel := fmt.Sprintf("%v=[", string(OperationLoad))
 						// Without the '[' there is no bracket to balance: the scan
 						// below starts at bracketCount 1 and would hunt a ']' all
@@ -1032,6 +1034,11 @@ func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 								Columns: c,
 							}
 							f.sort = &sortExpr
+							// Flag the sort as DSL-derived only once it is
+							// actually adopted, so a directive whose every
+							// segment was malformed leaves a SetSort value
+							// (and its caller-owned flag) alone.
+							f.sortFromDSL = true
 						}
 						// Advance past the whole sort token (see the page branch).
 						i = j
@@ -1039,7 +1046,9 @@ func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 
 					}
 
-					i = k
+					// Unreachable: the enclosing condition guarantees the token
+					// starts with load=, page= or sort=, and every one of those
+					// branches advances i and continues.
 				} else {
 					// Try to combine tokens for expressions like "field > value" or "field =^ value"
 					// Only do this for very specific cases to avoid interfering with complex operators
@@ -1982,6 +1991,21 @@ func (f *figo) AddSelectFields(fields ...string) {
 	}
 }
 
+// SetSelectFields replaces the projection set (no arguments clears it, which
+// restores "select every column"). AddSelectFields can only ever widen the
+// projection, so a plugin enforcing field policy had no way to remove a column
+// from it — FieldsPlugin uses this to prune ignored/non-whitelisted columns
+// the way it prunes them from the filter and sort.
+func (f *figo) SetSelectFields(fields ...string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.selectFields = make(map[string]bool, len(fields))
+	for _, field := range fields {
+		f.selectFields[field] = true
+	}
+}
+
 func (f *figo) GetClauses() []Expr {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
@@ -2025,10 +2049,16 @@ func (f *figo) GetSort() *OrderBy {
 // The spec is copied in, so the caller's OrderBy stays independent. Like a
 // sort= directive, the value set here is subject to plugin finalizers (e.g.
 // FieldsPlugin prunes forbidden columns on the next Build).
+//
+// The sort now belongs to the caller and survives Build, exactly as SetPage's
+// value does. Build used to clear the sort unconditionally before re-parsing,
+// so setting one before Build on an instance that also had a DSL silently did
+// nothing. A sort= directive in the DSL still wins, matching page=.
 func (f *figo) SetSort(sort *OrderBy) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.sort = cloneOrderBy(sort)
+	f.sortFromDSL = false
 }
 
 func (f *figo) SetPage(skip, take int) {
@@ -2222,7 +2252,10 @@ func (f *figo) BuildE(adapter Adapter) error {
 		if f.builtFromDSL {
 			f.clauses = []Expr{}
 			f.preloads = make(map[string][]Expr)
-			f.sort = nil
+			if f.sortFromDSL {
+				f.sort = nil
+				f.sortFromDSL = false
+			}
 			if f.pageFromDSL {
 				f.page = Page{Skip: 0, Take: 20} // New()'s default
 				f.pageFromDSL = false
@@ -2239,12 +2272,15 @@ func (f *figo) BuildE(adapter Adapter) error {
 
 	// Clear all DSL-derived state before rebuilding so Build is idempotent:
 	// preloads used to accumulate (Build();Build() duplicated every load=
-	// condition) and a previous DSL's sort survived a rebuild. The page is
-	// reset only when it came from a page= directive — SetPage's effect must
-	// outlive Build.
+	// condition) and a previous DSL's sort survived a rebuild. The page and
+	// sort are reset only when they came from a page=/sort= directive —
+	// SetPage's and SetSort's effects must outlive Build.
 	f.clauses = []Expr{}
 	f.preloads = make(map[string][]Expr)
-	f.sort = nil
+	if f.sortFromDSL {
+		f.sort = nil
+		f.sortFromDSL = false
+	}
 	if f.pageFromDSL {
 		f.page = Page{Skip: 0, Take: 20} // New()'s default
 		f.pageFromDSL = false
@@ -2333,6 +2369,7 @@ func (f *figo) guardPluginPanic() {
 func (f *figo) finalizeClauses() {
 	f.mu.RLock()
 	pm := f.pluginManager
+	sortOrigin := f.sortFromDSL
 	f.mu.RUnlock()
 	if pm == nil {
 		return
@@ -2342,6 +2379,12 @@ func (f *figo) finalizeClauses() {
 
 	f.mu.Lock()
 	f.clauses = finalized
+	// A finalizer that rewrites the sort (FieldsPlugin prunes forbidden
+	// columns) goes through the public SetSort, which marks the sort
+	// caller-owned. Restore where the sort actually came from: pruning a
+	// DSL-derived sort leaves it DSL-derived, so the next rebuild still
+	// clears it instead of leaking it into a later query.
+	f.sortFromDSL = sortOrigin
 	f.mu.Unlock()
 }
 

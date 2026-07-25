@@ -327,7 +327,11 @@ f.AddFiltersFromString(`id=1 and internal_flag=true and secret="x"`)
 f.Build(adapters.RawAdapter{}) // only id=1 survives
 ```
 
-Ignore names match both raw and naming-converted spellings. Select fields (`AddSelectFields`) are not part of this plugin — they are projection state on the instance itself.
+Ignore names match both raw and naming-converted spellings.
+
+The policy covers all three places a column name reaches the query: the **filter** (pruned in `FilterExpr`, on parsed DSL and on `AddFilter` alike), the **sort** and the **projection** (both enforced in `FinalizeClauses`, so `sort=salary:desc` cannot order by — or, with `page=take:1`, probe value-by-value — a column the plugin just pruned from the `WHERE`, and `AddSelectFields("salary")` cannot return it).
+
+Projection pruning never *widens* the query: an empty select set means "every column", so if no requested column is permitted, the whitelist is substituted when one is configured, and with only an ignore list the caller's set is left alone. An instance that never called `AddSelectFields` still renders `SELECT *` — projection defaults are the application's call, not the plugin's.
 
 ### Syntax validation & repair
 

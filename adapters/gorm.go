@@ -218,7 +218,18 @@ func ApplyGorm(f figo.Figo, trx *gorm.DB) *gorm.DB {
 	// clause being silently dropped (which would widen the result set). GORM's
 	// standard callbacks are guarded by db.Error == nil, so an errored DB
 	// never executes the widened query; callers see the error on Find/Error.
-	for k, v := range f.GetPreloads() {
+	// Preloads are applied in sorted relation order (as the raw and Mongo
+	// adapters render theirs) so a conversion failure always surfaces the same
+	// error first, rather than whichever one map iteration happened to reach.
+	preloadExprs := f.GetPreloads()
+	relations := make([]string, 0, len(preloadExprs))
+	for relation := range preloadExprs {
+		relations = append(relations, relation)
+	}
+	sortStrings(relations)
+
+	for _, k := range relations {
+		v := preloadExprs[k]
 		var conv []clause.Expression
 		for _, e := range v {
 			if e == nil {

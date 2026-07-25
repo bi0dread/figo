@@ -180,16 +180,13 @@ func (p *FieldsPlugin) FilterExpr(f figo.Figo, e figo.Expr) figo.Expr {
 
 // FinalizeClauses implements ClauseFinalizer. The clause list itself passes
 // through untouched (expression pruning happens in FilterExpr); the hook is
-// where the SORT specification is enforced. sort= columns previously bypassed
-// both the ignore list and the whitelist entirely, so a query could order —
-// and, with page=take:1, probe value-by-value — a forbidden column the same
-// plugin had just pruned from the WHERE clause.
+// where the SORT specification and the PROJECTION are enforced. sort= columns
+// previously bypassed both the ignore list and the whitelist entirely, so a
+// query could order — and, with page=take:1, probe value-by-value — a
+// forbidden column the same plugin had just pruned from the WHERE clause; the
+// select-field set could likewise still project a column the plugin refused to
+// filter or order by.
 func (p *FieldsPlugin) FinalizeClauses(f figo.Figo, clauses []figo.Expr) []figo.Expr {
-	sort := f.GetSort()
-	if sort == nil || len(sort.Columns) == 0 {
-		return clauses
-	}
-
 	p.mu.RLock()
 	ignore := make([]string, 0, len(p.ignoreFields))
 	for k := range p.ignoreFields {
@@ -206,8 +203,9 @@ func (p *FieldsPlugin) FinalizeClauses(f figo.Figo, clauses []figo.Expr) []figo.
 		return clauses
 	}
 
-	// Sort columns went through the naming strategy at parse time; match
-	// registered names both verbatim and converted, exactly as FilterExpr does.
+	// Sort columns went through the naming strategy at parse time, select
+	// fields did not (adapters convert them at render time), so both spellings
+	// are matched — exactly as FilterExpr does for registered names.
 	fn := f.GetNamingFunc()
 	ignored := make(map[string]bool, len(ignore)*2)
 	for _, name := range ignore {
@@ -220,23 +218,74 @@ func (p *FieldsPlugin) FinalizeClauses(f figo.Figo, clauses []figo.Expr) []figo.
 		allowedConv[fn(name)] = true
 	}
 
+	permitted := func(name string) bool {
+		if ignored[name] || ignored[fn(name)] {
+			return false
+		}
+		if whitelist && !allowedConv[name] && !allowedConv[fn(name)] {
+			return false
+		}
+		return true
+	}
+
+	p.enforceSort(f, permitted)
+	p.enforceSelectFields(f, permitted, allowed, whitelist)
+	return clauses
+}
+
+// enforceSort drops forbidden columns from the sort specification.
+func (p *FieldsPlugin) enforceSort(f figo.Figo, permitted func(string) bool) {
+	sort := f.GetSort()
+	if sort == nil || len(sort.Columns) == 0 {
+		return
+	}
+
 	kept := make([]figo.OrderByColumn, 0, len(sort.Columns))
 	for _, col := range sort.Columns {
-		if ignored[col.Name] {
-			continue
+		if permitted(col.Name) {
+			kept = append(kept, col)
 		}
-		if whitelist && !allowedConv[col.Name] {
-			continue
-		}
-		kept = append(kept, col)
 	}
 	if len(kept) == len(sort.Columns) {
-		return clauses
+		return
 	}
 	if len(kept) == 0 {
 		f.SetSort(nil)
-	} else {
-		f.SetSort(&figo.OrderBy{Columns: kept})
+		return
 	}
-	return clauses
+	f.SetSort(&figo.OrderBy{Columns: kept})
+}
+
+// enforceSelectFields drops forbidden columns from the projection.
+//
+// Pruning must never WIDEN the projection: an empty select set means "select
+// every column", so removing the last permitted entry would expose more than
+// the caller asked for, not less. When nothing survives, fall back to the
+// whitelist (a projection of exactly the allowed columns) if one is
+// configured; with only an ignore list there is no safe narrower projection to
+// substitute, so the set is left as the caller built it. Instances that never
+// called AddSelectFields still render SELECT * — projection defaults are the
+// application's call, not this plugin's.
+func (p *FieldsPlugin) enforceSelectFields(f figo.Figo, permitted func(string) bool, allowed []string, whitelist bool) {
+	selected := f.GetSelectFields()
+	if len(selected) == 0 {
+		return
+	}
+
+	kept := make([]string, 0, len(selected))
+	for name := range selected {
+		if permitted(name) {
+			kept = append(kept, name)
+		}
+	}
+	if len(kept) == len(selected) {
+		return
+	}
+	if len(kept) == 0 {
+		if whitelist && len(allowed) > 0 {
+			f.SetSelectFields(allowed...)
+		}
+		return
+	}
+	f.SetSelectFields(kept...)
 }

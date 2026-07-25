@@ -5,6 +5,7 @@ import (
 
 	"fmt"
 	"regexp"
+	"sort"
 	"strings"
 
 	"go.mongodb.org/mongo-driver/bson"
@@ -117,8 +118,20 @@ func mongoAggregatePipeline(f figo.Figo, joins map[string]MongoJoin, a MongoAdap
 		pipeline = append(pipeline, bson.D{{Key: "$match", Value: rootMatch}})
 	}
 
-	// preloads
-	for preload, exprs := range f.GetPreloads() {
+	// preloads, in a deterministic order: ranging the map emitted the $lookup
+	// (and its $match) stages in a different order on every build, so the same
+	// figo state produced a different pipeline document each time — defeating
+	// golden tests, plan caching and any diffing of generated queries. The raw
+	// adapter sorts its JOIN tables for the same reason.
+	preloadExprs := f.GetPreloads()
+	relations := make([]string, 0, len(preloadExprs))
+	for relation := range preloadExprs {
+		relations = append(relations, relation)
+	}
+	sort.Strings(relations)
+
+	for _, preload := range relations {
+		exprs := preloadExprs[preload]
 		j, ok := joins[preload]
 		if !ok {
 			// fallback: assume From = preload, LocalField = "", ForeignField = "", As = preload
