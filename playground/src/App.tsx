@@ -79,56 +79,140 @@ function mkEdge(source: string, target: string, targetHandle: string, kind: Kind
   }
 }
 
+// The preset is a deliberately non-trivial query, because the shapes that are
+// easy to get wrong are the ones worth showing by default: OR nested inside
+// AND (figo binds NOT > AND > OR, so the grouping is what decides the result),
+// a negated group, both null operators, a BETWEEN over dates, a multi-column
+// sort, and a preload with its own filter. Node ORDER within a group is decided
+// by vertical position, so the y values below are load-bearing, not cosmetic.
+//
+// It renders as:
+//
+//	(status<in>["active","trialing"] or (plan="enterprise" and seats>=50))
+//	and not (email=^"%@test.local" or name=^"QA %")
+//	and signup_date<bet>(2024-01-01..2024-12-31)
+//	and deleted_at<null> and last_login<notnull> and mrr>99.5
+//	sort=mrr:desc,name:asc page=skip:0,take:20
+//	load=[Orders:total>100 and status!="refunded"]
 function presetNodes(): AppNode[] {
   return [
-    { id: 'root', type: 'root', position: { x: 880, y: 170 }, deletable: false, data: {} },
+    { id: 'root', type: 'root', position: { x: 1250, y: 430 }, deletable: false, data: {} },
+
+    // --- branch A: status IN (...) OR (plan = ... AND seats >= ...) ---
     {
       id: 'c-status',
       type: 'condition',
-      position: { x: 30, y: 10 },
-      data: { field: 'status', op: '=', value: 'active', value2: '' },
+      position: { x: 20, y: 0 },
+      data: { field: 'status', op: '<in>', value: 'active, trialing', value2: '' },
     },
     {
-      id: 'c-age',
+      id: 'c-plan',
       type: 'condition',
-      position: { x: 30, y: 175 },
-      data: { field: 'age', op: '<bet>', value: '18', value2: '65' },
+      position: { x: 20, y: 120 },
+      data: { field: 'plan', op: '=', value: 'enterprise', value2: '' },
     },
-    { id: 'and-1', type: 'logic', position: { x: 360, y: 90 }, data: { kind: 'and' } },
     {
-      id: 'c-vip',
+      id: 'c-seats',
       type: 'condition',
-      position: { x: 30, y: 350 },
-      data: { field: 'vip', op: '=', value: 'true', value2: '' },
+      position: { x: 20, y: 240 },
+      data: { field: 'seats', op: '>=', value: '50', value2: '' },
     },
-    { id: 'or-1', type: 'logic', position: { x: 590, y: 190 }, data: { kind: 'or' } },
+    { id: 'and-plan', type: 'logic', position: { x: 340, y: 170 }, data: { kind: 'and' } },
+    { id: 'or-1', type: 'logic', position: { x: 650, y: 80 }, data: { kind: 'or' } },
+
+    // --- branch B: NOT (email LIKE ... OR name LIKE ...) ---
     {
-      id: 's-created',
-      type: 'sort',
-      position: { x: 590, y: 340 },
-      data: { field: 'created_at', dir: 'desc' },
+      id: 'c-email',
+      type: 'condition',
+      position: { x: 20, y: 400 },
+      data: { field: 'email', op: '=^', value: '%@test.local', value2: '' },
     },
-    { id: 'p-1', type: 'page', position: { x: 590, y: 450 }, data: { skip: 0, take: 20 } },
+    {
+      id: 'c-name',
+      type: 'condition',
+      position: { x: 20, y: 520 },
+      data: { field: 'name', op: '=^', value: 'QA %', value2: '' },
+    },
+    { id: 'or-2', type: 'logic', position: { x: 340, y: 450 }, data: { kind: 'or' } },
+    { id: 'not-1', type: 'logic', position: { x: 650, y: 450 }, data: { kind: 'not' } },
+
+    // --- the remaining conjuncts, in the order they appear in the DSL ---
+    {
+      id: 'c-signup',
+      type: 'condition',
+      position: { x: 340, y: 640 },
+      data: { field: 'signup_date', op: '<bet>', value: '2024-01-01', value2: '2024-12-31' },
+    },
+    {
+      id: 'c-deleted',
+      type: 'condition',
+      position: { x: 340, y: 760 },
+      data: { field: 'deleted_at', op: '<null>', value: '', value2: '' },
+    },
+    {
+      id: 'c-login',
+      type: 'condition',
+      position: { x: 340, y: 880 },
+      data: { field: 'last_login', op: '<notnull>', value: '', value2: '' },
+    },
+    {
+      id: 'c-mrr',
+      type: 'condition',
+      position: { x: 340, y: 1000 },
+      data: { field: 'mrr', op: '>', value: '99.5', value2: '' },
+    },
+    { id: 'and-root', type: 'logic', position: { x: 950, y: 430 }, data: { kind: 'and' } },
+
+    // --- directives ---
+    { id: 's-mrr', type: 'sort', position: { x: 1250, y: 700 }, data: { field: 'mrr', dir: 'desc' } },
+    { id: 's-name', type: 'sort', position: { x: 1250, y: 820 }, data: { field: 'name', dir: 'asc' } },
+    { id: 'p-1', type: 'page', position: { x: 1250, y: 940 }, data: { skip: 0, take: 20 } },
+
+    // --- load=[Orders: ...] with its own filter ---
     {
       id: 'c-total',
       type: 'condition',
-      position: { x: 30, y: 520 },
+      position: { x: 20, y: 1130 },
       data: { field: 'total', op: '>', value: '100', value2: '' },
     },
-    { id: 'l-orders', type: 'load', position: { x: 360, y: 540 }, data: { relation: 'Orders' } },
+    {
+      id: 'c-ostatus',
+      type: 'condition',
+      position: { x: 20, y: 1250 },
+      data: { field: 'status', op: '!=', value: 'refunded', value2: '' },
+    },
+    { id: 'and-load', type: 'logic', position: { x: 340, y: 1190 }, data: { kind: 'and' } },
+    { id: 'l-orders', type: 'load', position: { x: 650, y: 1190 }, data: { relation: 'Orders' } },
   ]
 }
 
 function presetEdges(): Edge[] {
   return [
-    mkEdge('c-status', 'and-1', 'in', 'expr'),
-    mkEdge('c-age', 'and-1', 'in', 'expr'),
-    mkEdge('and-1', 'or-1', 'in', 'expr'),
-    mkEdge('c-vip', 'or-1', 'in', 'expr'),
-    mkEdge('or-1', 'root', 'filter', 'expr'),
-    mkEdge('s-created', 'root', 'sort', 'sort'),
+    // branch A
+    mkEdge('c-plan', 'and-plan', 'in', 'expr'),
+    mkEdge('c-seats', 'and-plan', 'in', 'expr'),
+    mkEdge('c-status', 'or-1', 'in', 'expr'),
+    mkEdge('and-plan', 'or-1', 'in', 'expr'),
+    // branch B
+    mkEdge('c-email', 'or-2', 'in', 'expr'),
+    mkEdge('c-name', 'or-2', 'in', 'expr'),
+    mkEdge('or-2', 'not-1', 'in', 'expr'),
+    // top-level AND, in vertical order
+    mkEdge('or-1', 'and-root', 'in', 'expr'),
+    mkEdge('not-1', 'and-root', 'in', 'expr'),
+    mkEdge('c-signup', 'and-root', 'in', 'expr'),
+    mkEdge('c-deleted', 'and-root', 'in', 'expr'),
+    mkEdge('c-login', 'and-root', 'in', 'expr'),
+    mkEdge('c-mrr', 'and-root', 'in', 'expr'),
+    mkEdge('and-root', 'root', 'filter', 'expr'),
+    // directives
+    mkEdge('s-mrr', 'root', 'sort', 'sort'),
+    mkEdge('s-name', 'root', 'sort', 'sort'),
     mkEdge('p-1', 'root', 'page', 'page'),
-    mkEdge('c-total', 'l-orders', 'filter', 'expr'),
+    // preload
+    mkEdge('c-total', 'and-load', 'in', 'expr'),
+    mkEdge('c-ostatus', 'and-load', 'in', 'expr'),
+    mkEdge('and-load', 'l-orders', 'filter', 'expr'),
     mkEdge('l-orders', 'root', 'load', 'load'),
   ]
 }
@@ -297,7 +381,11 @@ function Flow() {
             isValidConnection={isValidConnection}
             deleteKeyCode={['Backspace', 'Delete']}
             fitView
-            fitViewOptions={{ padding: 0.15, maxZoom: 1 }}
+            fitViewOptions={{ padding: 0.12, maxZoom: 1 }}
+            // The preset graph is taller than the default 0.5 minZoom can fit, so
+            // fitView clipped it on load; this also lets users zoom out to see a
+            // large query whole.
+            minZoom={0.2}
             proOptions={{ hideAttribution: false }}
           >
             <Background variant={BackgroundVariant.Dots} gap={22} size={1.2} />
