@@ -1,6 +1,7 @@
 package plugins
 
 import (
+	"strings"
 	"sync"
 
 	figo "github.com/bi0dread/figo/v4"
@@ -137,11 +138,16 @@ func (p *FieldsPlugin) IsFieldAllowed(field string) bool {
 // its converted form — callers may register either spelling. (The whitelist
 // previously matched only the converted form, so SetAllowedFields("userName")
 // under snake_case naming pruned the legitimate user_name filter.)
+//
+// The ignore list additionally matches case-insensitively and past a table
+// qualifier (see newDenyMatcher): under NoChangeNaming the byte-exact lookup
+// let `Password=` and `probe_users.password=` hit the very column the ignore
+// list exists to hide.
 func (p *FieldsPlugin) FilterExpr(f figo.Figo, e figo.Expr) figo.Expr {
 	p.mu.RLock()
-	ignore := make(map[string]bool, len(p.ignoreFields))
+	ignore := make([]string, 0, len(p.ignoreFields))
 	for k := range p.ignoreFields {
-		ignore[k] = true
+		ignore = append(ignore, k)
 	}
 	allowed := make(map[string]bool, len(p.allowedFields))
 	for k := range p.allowedFields {
@@ -155,13 +161,9 @@ func (p *FieldsPlugin) FilterExpr(f figo.Figo, e figo.Expr) figo.Expr {
 	fn := f.GetNamingFunc() // never nil: SnakeCaseNaming is the default
 
 	if len(ignore) > 0 {
-		ignored := make(map[string]bool, len(ignore)*2)
-		for name := range ignore {
-			ignored[name] = true
-			ignored[fn(name)] = true
-		}
+		denied := newDenyMatcher(ignore, fn)
 		e = figo.PruneExprFields(e, func(field string) bool {
-			return !ignored[field]
+			return !denied(field)
 		})
 	}
 
@@ -176,6 +178,69 @@ func (p *FieldsPlugin) FilterExpr(f figo.Figo, e figo.Expr) figo.Expr {
 		})
 	}
 	return e
+}
+
+// canonicalPolicyName case-folds a field name. MySQL and SQLite resolve column
+// identifiers case-INSENSITIVELY, so `Password` and `password` are one column
+// to the engine while a byte-exact map lookup treats them as two.
+func canonicalPolicyName(name string) string { return strings.ToLower(name) }
+
+// terminalPolicyName case-folds and drops a table qualifier: every SQL dialect
+// resolves `probe_users.password` and `password` to the same column.
+func terminalPolicyName(name string) string {
+	n := canonicalPolicyName(name)
+	if i := strings.LastIndexByte(n, '.'); i >= 0 {
+		return n[i+1:]
+	}
+	return n
+}
+
+// newDenyMatcher builds the predicate a DENY list (FieldsPlugin's ignore list,
+// ValidationPlugin's rules) matches incoming field names with. A registered
+// name matches verbatim, in its naming-converted form, and case-folded; the
+// INCOMING field is additionally stripped of a table qualifier before the
+// case-folded lookup, so `probe_users.password` is matched by a registered
+// `password`. A registered name keeps its own qualifier, so registering
+// `orders.secret` does not silently deny the unrelated `secret`.
+//
+// Only the deny side is broadened. Applying the same folding to the ALLOW side
+// (the whitelist) would admit spellings the policy never approved, and the
+// whitelist already fails closed on them. Without this, under NoChangeNaming
+// (where the naming func collapses nothing) a case variant or a qualified
+// spelling of an ignored/validated column reached the database unfiltered.
+func newDenyMatcher(names []string, fn figo.NamingFunc) func(string) bool {
+	if len(names) == 0 {
+		return func(string) bool { return false }
+	}
+	exact := make(map[string]bool, len(names)*2)
+	folded := make(map[string]bool, len(names)*2)
+	for _, n := range names {
+		exact[n] = true
+		folded[canonicalPolicyName(n)] = true
+		if fn != nil {
+			c := fn(n)
+			exact[c] = true
+			folded[canonicalPolicyName(c)] = true
+		}
+	}
+	return func(field string) bool {
+		if exact[field] {
+			return true
+		}
+		if fn != nil && exact[fn(field)] {
+			return true
+		}
+		if folded[canonicalPolicyName(field)] || folded[terminalPolicyName(field)] {
+			return true
+		}
+		if fn != nil {
+			conv := fn(field)
+			if folded[canonicalPolicyName(conv)] || folded[terminalPolicyName(conv)] {
+				return true
+			}
+		}
+		return false
+	}
 }
 
 // FinalizeClauses implements ClauseFinalizer. The clause list itself passes
@@ -207,11 +272,7 @@ func (p *FieldsPlugin) FinalizeClauses(f figo.Figo, clauses []figo.Expr) []figo.
 	// fields did not (adapters convert them at render time), so both spellings
 	// are matched — exactly as FilterExpr does for registered names.
 	fn := f.GetNamingFunc()
-	ignored := make(map[string]bool, len(ignore)*2)
-	for _, name := range ignore {
-		ignored[name] = true
-		ignored[fn(name)] = true
-	}
+	denied := newDenyMatcher(ignore, fn)
 	allowedConv := make(map[string]bool, len(allowed)*2)
 	for _, name := range allowed {
 		allowedConv[name] = true
@@ -219,7 +280,7 @@ func (p *FieldsPlugin) FinalizeClauses(f figo.Figo, clauses []figo.Expr) []figo.
 	}
 
 	permitted := func(name string) bool {
-		if ignored[name] || ignored[fn(name)] {
+		if denied(name) {
 			return false
 		}
 		if whitelist && !allowedConv[name] && !allowedConv[fn(name)] {
@@ -229,7 +290,16 @@ func (p *FieldsPlugin) FinalizeClauses(f figo.Figo, clauses []figo.Expr) []figo.
 	}
 
 	p.enforceSort(f, permitted)
-	p.enforceSelectFields(f, permitted, allowed, whitelist)
+	if !p.enforceSelectFields(f, permitted, allowed, whitelist) {
+		// Every requested column is forbidden and there is no permitted
+		// projection to substitute. Leaving the caller's set intact returned
+		// exactly the column the policy promises can never be returned, and
+		// clearing it would render SELECT * — wider still. Fail closed with
+		// the canonical never-true clause (an empty OrExpr renders 1=0), the
+		// same choice Build makes for a preload whose every condition was
+		// pruned.
+		return []figo.Expr{figo.OrExpr{}}
+	}
 	return clauses
 }
 
@@ -256,20 +326,22 @@ func (p *FieldsPlugin) enforceSort(f figo.Figo, permitted func(string) bool) {
 	f.SetSort(&figo.OrderBy{Columns: kept})
 }
 
-// enforceSelectFields drops forbidden columns from the projection.
+// enforceSelectFields drops forbidden columns from the projection. It reports
+// whether a safe projection remains; false means the caller must fail the
+// query closed (see FinalizeClauses).
 //
 // Pruning must never WIDEN the projection: an empty select set means "select
 // every column", so removing the last permitted entry would expose more than
 // the caller asked for, not less. When nothing survives, fall back to the
-// whitelist (a projection of exactly the allowed columns) if one is
-// configured; with only an ignore list there is no safe narrower projection to
-// substitute, so the set is left as the caller built it. Instances that never
-// called AddSelectFields still render SELECT * — projection defaults are the
+// PERMITTED part of the whitelist if one is configured — the raw whitelist was
+// written straight through, which handed back a column the same plugin's
+// ignore list refuses in WHERE and ORDER BY. Instances that never called
+// AddSelectFields still render SELECT * — projection defaults are the
 // application's call, not this plugin's.
-func (p *FieldsPlugin) enforceSelectFields(f figo.Figo, permitted func(string) bool, allowed []string, whitelist bool) {
+func (p *FieldsPlugin) enforceSelectFields(f figo.Figo, permitted func(string) bool, allowed []string, whitelist bool) bool {
 	selected := f.GetSelectFields()
 	if len(selected) == 0 {
-		return
+		return true
 	}
 
 	kept := make([]string, 0, len(selected))
@@ -279,13 +351,23 @@ func (p *FieldsPlugin) enforceSelectFields(f figo.Figo, permitted func(string) b
 		}
 	}
 	if len(kept) == len(selected) {
-		return
+		return true
 	}
 	if len(kept) == 0 {
-		if whitelist && len(allowed) > 0 {
-			f.SetSelectFields(allowed...)
+		if whitelist {
+			safe := make([]string, 0, len(allowed))
+			for _, name := range allowed {
+				if permitted(name) {
+					safe = append(safe, name)
+				}
+			}
+			if len(safe) > 0 {
+				f.SetSelectFields(safe...)
+				return true
+			}
 		}
-		return
+		return false
 	}
 	f.SetSelectFields(kept...)
+	return true
 }

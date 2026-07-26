@@ -79,7 +79,10 @@ func TestRawRendersCustomExpr(t *testing.T) {
 
 	where, args, err := BuildRawWhere(f)
 	require.NoError(t, err)
-	assert.Equal(t, "`name` <=> ?", where)
+	// The handler fragment is parenthesized: it is spliced into an AND join,
+	// and AND binds tighter than OR, so an un-delimited compound fragment
+	// re-associated the whole WHERE (see TestA3_1_...).
+	assert.Equal(t, "(`name` <=> ?)", where)
 	assert.Equal(t, []any{"x"}, args)
 }
 

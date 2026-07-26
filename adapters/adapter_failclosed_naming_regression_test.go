@@ -15,8 +15,10 @@ import (
 
 // An OrExpr with no renderable operands is a false disjunction and must match
 // NOTHING on every adapter. The SQL adapters used to render it as "" — the
-// predicate vanished, so a top-level empty OR matched every row (Mongo and ES
-// already matched nothing; pinned in bughunt_round2_regression_test.go).
+// predicate vanished, so a top-level empty OR matched every row (Mongo already
+// matched nothing, pinned in bughunt_round2_regression_test.go; the ES case was
+// hunt-#6 H1 — it rendered an empty "should", which is match_all — and is
+// pinned in elasticsearch_hunt7_regression_test.go).
 func TestEmptyOrExprFailsClosedOnSQLAdapters(t *testing.T) {
 	t.Run("raw top-level", func(t *testing.T) {
 		f := New()

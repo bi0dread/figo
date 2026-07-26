@@ -298,16 +298,18 @@ func TestMongoNewOperations(t *testing.T) {
 	if !foundIn {
 		t.Fatalf("id $in missing")
 	}
-	// name ilike -> regex + options i (search similar way)
+	// name ilike -> regex carrying the 'i' option (alongside the DOTALL 's'
+	// every LIKE-derived pattern now carries, so match on 'i' being present
+	// rather than on the whole option string).
 	foundILike := false
 	if andList, ok := m["$and"].([]bson.M); ok {
 		for _, it := range andList {
-			if rv, ok2 := it["name"].(primitive.Regex); ok2 && rv.Options == "i" {
+			if rv, ok2 := it["name"].(primitive.Regex); ok2 && strings.Contains(rv.Options, "i") {
 				foundILike = true
 				break
 			}
 		}
-	} else if rv, ok := m["name"].(primitive.Regex); ok && rv.Options == "i" {
+	} else if rv, ok := m["name"].(primitive.Regex); ok && strings.Contains(rv.Options, "i") {
 		foundILike = true
 	}
 	if !foundILike {

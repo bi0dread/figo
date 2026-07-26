@@ -52,22 +52,97 @@ function formatRangeBound(raw: string, warn?: (msg: string) => void): string {
   return formatValue(t, warn)
 }
 
-const IDENT_STRIP_RE = /[\s"<>=!~^()[\],:|]/g
+/**
+ * Characters that cannot appear in a bare DSL identifier.
+ *
+ * The operator/whitespace set is what the tokenizer would otherwise read as the
+ * end of the field name. The `\u0000-\u001f` + `\u007f` range is separate and
+ * load-bearing: `\s` only covers 0x09-0x0d, so NUL and the rest of the C0
+ * controls used to survive sanitisation, and the Go raw adapter's `validateIdent`
+ * (adapters/dialect.go) REJECTS a control byte in a field name, sort key,
+ * projection column or table name — `GetSqlString` returns ok=false and
+ * `GetQuery` returns nil for the whole query. Emitting such a name handed the
+ * user a string the playground presented as valid DSL and the library then
+ * refused to render at all.
+ */
+const IDENT_STRIP_RE = /[\s"<>=!~^()[\],:|\u0000-\u001f\u007f]/g
+
+/**
+ * Dots separate the segments of a qualified name (`orders.total`), so they are
+ * NOT stripped — but an EMPTY segment is rejected by the same `validateIdent`
+ * as a control byte ("" / "..." / "a..b" / ".a" / "a." all fail the render under
+ * `NoChangeNaming`, and "..." fails even under the default `SnakeCaseNaming`).
+ * Collapsing runs of dots and trimming the ends keeps every legitimate qualified
+ * name intact while making an empty segment unrepresentable.
+ */
+function collapseDotSegments(ident: string): string {
+  return ident.replace(/\.{2,}/g, '.').replace(/^\.+/, '').replace(/\.+$/, '')
+}
+
+/**
+ * Tokens the DSL reads as directives rather than as conditions. The parser only
+ * treats them that way when an `=` follows the keyword immediately (README
+ * "Directives"), so `sort!=x`, `sort>=x`, `sort.=^x` and `sort<in>[…]` are
+ * ordinary conditions on a column named `sort` and stay allowed — it is the
+ * operators that begin with `=` that collide. Matching is case-sensitive on the
+ * Go side: `Sort="x"` is an ordinary field.
+ */
+const DIRECTIVE_IDENTS = ['sort', 'page', 'load']
 
 /**
  * Field / relation names are bare tokens in the DSL — whitespace or operator
- * characters inside them cannot be expressed, so they are stripped.
+ * characters inside them cannot be expressed, so they are stripped, and an empty
+ * dot segment is collapsed away.
+ *
+ * The invariant this function owes the rest of the app: whatever it returns must
+ * be something the Go library will actually RENDER. The playground presents its
+ * output as valid DSL, so a name that survives sanitisation but trips
+ * `validateIdent` on the Go side turns the whole query into ok=false / a nil
+ * `Query` — a strictly worse outcome than the dimmed node the empty-name path
+ * already produces. `examples/dslcheck` + the Playground CI cross-check step pin
+ * that invariant against the real parser and all four adapters.
  */
 function sanitizeIdent(raw: string, what: string, warn: (msg: string) => void): string {
   const t = raw.trim()
-  const clean = t.replace(IDENT_STRIP_RE, '')
+  const clean = collapseDotSegments(t.replace(IDENT_STRIP_RE, ''))
   if (clean !== t) warn(`${what} "${t}" contains characters the DSL cannot parse — they were removed`)
+  // A '$'-leading name is legal on all three SQL dialects and is REJECTED by the
+  // MongoDB adapter, which would otherwise execute it as an operator. The
+  // playground does not know the target backend, so stripping it would break SQL
+  // users and keeping it silently breaks Mongo ones — say so instead. This is the
+  // one divergence examples/dslcheck exempts, and this warning is why.
+  if (clean.split('.').some((seg) => seg.startsWith('$'))) {
+    warn(`${what} "${clean}" starts with "$" — valid on SQL, but the MongoDB adapter rejects it as an operator`)
+  }
   return clean
 }
 
-/** Split an IN/NIN list on commas, keeping quoted segments intact. */
-function splitList(raw: string): string[] {
-  const parts = raw.match(/"[^"]*"|[^,]+/g) ?? []
+/**
+ * Split an IN/NIN list on commas, keeping quoted segments intact.
+ *
+ * This is a left-to-right scanner rather than a `match()` alternation on
+ * purpose: an alternation only reaches its quoted branch when a `"` sits at the
+ * current scan index, so `a, "b,c", d` — the comma-space spacing the value box's
+ * own `a, b, c` placeholder teaches — fell through to `[^,]+` and tore the
+ * quoted item in two, emitting a four-value IN list for a three-item input.
+ */
+function splitList(raw: string, warn?: (msg: string) => void): string[] {
+  const parts: string[] = []
+  let cur = ''
+  let inQuotes = false
+  for (const ch of raw) {
+    if (ch === '"') {
+      inQuotes = !inQuotes
+      cur += ch
+    } else if (ch === ',' && !inQuotes) {
+      parts.push(cur)
+      cur = ''
+    } else {
+      cur += ch
+    }
+  }
+  parts.push(cur)
+  if (inQuotes) warn?.('Unclosed double quote in the list — everything after it was read as one item')
   return parts.map((p) => p.trim()).filter((p) => p !== '')
 }
 
@@ -95,16 +170,33 @@ export function generateDsl(nodes: AppNode[], edges: Edge[]): DslResult {
       return null
     }
     const op = String(d.op ?? '=')
+    // A condition on a column literally named sort/page/load is unexpressible
+    // when the operator starts with `=`: the parser reads `sort="active"` as a
+    // malformed sort= directive, drops the predicate AND the connector next to
+    // it, and the emitted string would otherwise look like a valid filter.
+    if (DIRECTIVE_IDENTS.includes(field) && op.startsWith('=')) {
+      warn(
+        `Field "${field}" with "${op}" would be read as the ${field}= directive — the DSL cannot express it (use a different operator, e.g. ${field}!=…)`,
+      )
+      return null
+    }
     let text: string
     if (NULL_OPS.includes(op)) {
       text = `${field}${op}`
     } else if (LIST_OPS.includes(op)) {
-      const items = splitList(String(d.value ?? ''))
+      const items = splitList(String(d.value ?? ''), warn)
       text = `${field}${op}[${items.map((v) => formatValue(v, warn)).join(',')}]`
     } else if (op === RANGE_OP) {
       const lo = String(d.value ?? '').trim()
       const hi = String(d.value2 ?? '').trim()
-      if (lo === '' || hi === '') warn(`BETWEEN on "${field}" needs both bounds`)
+      // A half-filled BETWEEN has no honest rendering: `price<bet>(10..)` builds
+      // an executable query with an empty-string upper bound, and
+      // `price<bet>(..600)` is rejected by the parser so the predicate vanishes
+      // and the query matches every row. Emit nothing and dim the node instead.
+      if (lo === '' || hi === '') {
+        warn(`BETWEEN on "${field}" needs both bounds — the condition was left out`)
+        return null
+      }
       text = `${field}<bet>(${formatRangeBound(lo, warn)}..${formatRangeBound(hi, warn)})`
     } else {
       text = `${field}${op}${formatValue(String(d.value ?? ''), warn)}`
@@ -130,6 +222,15 @@ export function generateDsl(nodes: AppNode[], edges: Edge[]): DslResult {
     try {
       const operands = incoming(node.id, 'in')
       if (kind === 'not') {
+        // The canvas keeps a NOT node to one input (App.tsx isSingleInput), but
+        // if a graph ever carries more, only the top-most one survives — which
+        // means dragging a node vertically would change the query. Every other
+        // drop in this function warns; this one used to be silent.
+        if (operands.length > 1) {
+          warn(
+            `A NOT node takes one input — ${operands.length - 1} extra connection(s) were ignored (the top-most input is used)`,
+          )
+        }
         const first = operands[0]
         const inner = first ? renderExpr(first, true) : null
         if (inner === null) {
@@ -162,6 +263,12 @@ export function generateDsl(nodes: AppNode[], edges: Edge[]): DslResult {
   // filter expression
   const filterSrc = incoming(root.id, 'filter')[0]
   const filterText = filterSrc ? renderExpr(filterSrc, false) : null
+  // Something IS wired into the filter handle but nothing came back (a cycle, an
+  // empty group, an all-invalid AND). The sort=/page=/load= directives below
+  // still render, so the DSL looks complete while selecting every row — say so.
+  if (filterSrc && filterText === null) {
+    warn('The filter could not be rendered — the DSL below has NO filter and matches every row')
+  }
 
   // sort= (multiple sort nodes merge, top→bottom)
   const sortEntries: string[] = []
@@ -180,8 +287,16 @@ export function generateDsl(nodes: AppNode[], edges: Edge[]): DslResult {
   const pageNode = incoming(root.id, 'page')[0]
   let pageText: string | null = null
   if (pageNode) {
-    const skip = Number(pageNode.data.skip) || 0
-    const take = Number(pageNode.data.take) || 0
+    const rawSkip = Number(pageNode.data.skip) || 0
+    const rawTake = Number(pageNode.data.take) || 0
+    // A negative operand is normalised to 0 by the parser with no diagnostic, so
+    // `take:-3` silently means "no row limit" — the opposite of what the box
+    // shows. Clamp here and say what happened.
+    const skip = Math.max(0, rawSkip)
+    const take = Math.max(0, rawTake)
+    if (rawSkip < 0 || rawTake < 0) {
+      warn('Page skip/take cannot be negative — clamped to 0 (take:0 means no row limit)')
+    }
     pageText = `page=skip:${skip},take:${take}`
     active.add(pageNode.id)
   }

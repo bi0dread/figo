@@ -3,11 +3,30 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 
 	"github.com/bi0dread/figo/v4"
 	"github.com/bi0dread/figo/v4/adapters"
 )
+
+// esQuery renders the built instance and STOPS on a render error.
+//
+// Checking this error is the whole point of the helper, not boilerplate.
+// ElasticsearchAdapter.GetSqlString/GetQuery deliberately report ok=true with a
+// fail-closed `{"query":{"match_none":{}}}` body when they cannot render, so a
+// query the adapter refused looks like a successful one that matches nothing —
+// zero hits, no signal. GetElasticsearchQueryString's error return (along with
+// BuildElasticsearchQuery and the builder's Err()) is the ONLY channel that
+// reports it. Discarding it with `_` is how a silently-empty search endpoint
+// ships.
+func esQuery(label string, f figo.Figo) string {
+	s, err := adapters.GetElasticsearchQueryString(f)
+	if err != nil {
+		log.Fatalf("%s: the Elasticsearch adapter could not render this query: %v", label, err)
+	}
+	return s
+}
 
 func main() {
 	fmt.Println("🚀 figo Elasticsearch Adapter Usage Examples")
@@ -19,7 +38,7 @@ func main() {
 	f1.AddFiltersFromString(`status = "active"`)
 	f1.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr1, _ := adapters.GetElasticsearchQueryString(f1)
+	jsonStr1 := esQuery("Example 1", f1)
 	fmt.Printf("DSL: status = \"active\"\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr1)
 
@@ -29,7 +48,7 @@ func main() {
 	f2.AddFiltersFromString(`age > 25 and score >= 80`)
 	f2.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr2, _ := adapters.GetElasticsearchQueryString(f2)
+	jsonStr2 := esQuery("Example 2", f2)
 	fmt.Printf("DSL: age > 25 and score >= 80\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr2)
 
@@ -39,7 +58,7 @@ func main() {
 	f3.AddFiltersFromString(`email =^ "%gmail%"`)
 	f3.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr3, _ := adapters.GetElasticsearchQueryString(f3)
+	jsonStr3 := esQuery("Example 3", f3)
 	fmt.Printf("DSL: email =^ \"%%gmail%%\"\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr3)
 
@@ -49,7 +68,7 @@ func main() {
 	f4.AddFiltersFromString(`category <in> [tech,business,finance]`)
 	f4.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr4, _ := adapters.GetElasticsearchQueryString(f4)
+	jsonStr4 := esQuery("Example 4", f4)
 	fmt.Printf("DSL: category <in> [tech,business,finance]\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr4)
 
@@ -59,7 +78,7 @@ func main() {
 	f5.AddFiltersFromString(`price <bet> (100..500)`)
 	f5.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr5, _ := adapters.GetElasticsearchQueryString(f5)
+	jsonStr5 := esQuery("Example 5", f5)
 	fmt.Printf("DSL: price <bet> (100..500)\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr5)
 
@@ -69,7 +88,7 @@ func main() {
 	f6.AddFiltersFromString(`((name =^ "%John%" or email =^ "%gmail%") and (age >= 18 and age <= 65)) or (status = "active" and score > 80)`)
 	f6.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr6, _ := adapters.GetElasticsearchQueryString(f6)
+	jsonStr6 := esQuery("Example 6", f6)
 	fmt.Printf("DSL: ((name =^ \"%%John%%\" or email =^ \"%%gmail%%\") and (age >= 18 and age <= 65)) or (status = \"active\" and score > 80)\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr6)
 
@@ -79,7 +98,7 @@ func main() {
 	f7.AddFiltersFromString(`status = "active" sort=score:desc,age:asc page=skip:0,take:5`)
 	f7.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr7, _ := adapters.GetElasticsearchQueryString(f7)
+	jsonStr7 := esQuery("Example 7", f7)
 	fmt.Printf("DSL: status = \"active\" sort=score:desc,age:asc page=skip:0,take:5\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr7)
 
@@ -93,7 +112,17 @@ func main() {
 		SetSource("id", "name", "email", "score").
 		Build()
 
-	jsonStr8, _ := json.MarshalIndent(query8, "", "  ")
+	// The builder collects failures instead of returning them per call (a negative
+	// from/size, an expression FromFigo cannot convert), so Err() is where a
+	// chained build reports them. Without this check the chain above silently
+	// produces a match_none body.
+	if err := builder.Err(); err != nil {
+		log.Fatalf("Example 8: the fluent builder rejected the query: %v", err)
+	}
+	jsonStr8, err := json.MarshalIndent(query8, "", "  ")
+	if err != nil {
+		log.Fatalf("Example 8: marshalling the built query: %v", err)
+	}
 	fmt.Printf("Fluent Builder Query:\n%s\n", jsonStr8)
 
 	// Example 9: Field selection
@@ -103,7 +132,7 @@ func main() {
 	f9.AddFiltersFromString(`status = "active"`)
 	f9.Build(adapters.ElasticsearchAdapter{})
 
-	jsonStr9, _ := adapters.GetElasticsearchQueryString(f9)
+	jsonStr9 := esQuery("Example 9", f9)
 	fmt.Printf("DSL: status = \"active\" with field selection\n")
 	fmt.Printf("Generated Query:\n%s\n", jsonStr9)
 

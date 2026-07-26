@@ -53,7 +53,12 @@ func TestESTakeZeroRendersMaxWindowSize(t *testing.T) {
 	q, err := BuildElasticsearchQuery(f)
 	require.NoError(t, err)
 	assert.Equal(t, 30, q.From)
-	assert.Equal(t, 10000, q.Size, "take:0 must render the max_result_window default")
+	// hunt6 H14: the size is the window MINUS the offset. ES validates
+	// from + size against index.max_result_window, so the previous flat 10000
+	// made every skip >= 1 an HTTP 400. (This assertion used to read
+	// `assert.Equal(t, 10000, q.Size)`, which pinned the broken output.)
+	assert.Equal(t, 9970, q.Size, "take:0 must render the remaining max_result_window")
+	assert.Equal(t, 10000, q.From+q.Size, "from + size must not exceed the result window")
 
 	// An explicit take still wins.
 	f2 := New()
@@ -75,17 +80,28 @@ func TestESPreloadsFailClosed(t *testing.T) {
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "preload")
 
-	_, ok := ElasticsearchAdapter{}.GetSqlString(f, nil)
-	assert.False(t, ok, "GetSqlString must fail closed on preloads")
+	// hunt7 A7-1/A7-2: "fail closed" on this adapter means match_none, not an
+	// empty rendering — figo.GetSqlString drops the bool and returns "", and an
+	// empty ES request body is match_all. (These two assertions used to read
+	// `assert.False(t, ok)`, which is why the tenant scope evaporated at the
+	// figo boundary.)
+	body, ok := ElasticsearchAdapter{}.GetSqlString(f, nil)
+	assert.True(t, ok, "the fail-closed body is usable")
+	assert.JSONEq(t, `{"query":{"match_none":{}}}`, body, "GetSqlString must fail closed to match_none")
 
-	_, ok = ElasticsearchAdapter{}.GetQuery(f, nil)
-	assert.False(t, ok, "GetQuery must fail closed on preloads")
+	q, ok := ElasticsearchAdapter{}.GetQuery(f, nil)
+	assert.True(t, ok)
+	require.NotNil(t, q, "a nil Query panics the documented type assertion")
+	assert.JSONEq(t, `{"query":{"match_none":{}}}`, q.(ElasticsearchQueryWrapper).GetSQL())
 
-	_, err = GetElasticsearchQueryString(f)
+	// The error itself stays observable on every path that has an error channel.
+	esql, err := GetElasticsearchQueryString(f)
 	assert.Error(t, err)
+	assert.Contains(t, esql, "match_none", "even the error body must match nothing")
 
-	_, err = NewElasticsearchQueryBuilder().FromFigo(f).ToJSON()
+	ejson, err := NewElasticsearchQueryBuilder().FromFigo(f).ToJSON()
 	assert.Error(t, err)
+	assert.Contains(t, ejson, "match_none")
 }
 
 // A6: a non-finite geo distance would render "NaNkm"/"+Infkm"; fail the build
@@ -110,18 +126,24 @@ func TestESGeoDistanceNonFiniteErrors(t *testing.T) {
 	assert.NoError(t, err)
 }
 
-// A7: a query holding an unmarshalable value (NaN) must not report ok=true and
-// then render "" from the wrapper's GetSQL.
+// A7: a query holding an unmarshalable value (NaN) must never render "" from
+// the wrapper's GetSQL — on Elasticsearch an empty body is match_all, so it
+// falls back to match_none. (hunt7 A7-1: these two assertions used to be
+// `assert.False(t, ok)`, which figo.GetSqlString/GetQuery turn into ""/nil.)
 func TestESGetQueryFailsOnUnmarshalableValue(t *testing.T) {
 	f := New()
 	f.AddFilter(EqExpr{Field: "score", Value: math.NaN()})
 	f.Build(ElasticsearchAdapter{})
 
-	_, ok := ElasticsearchAdapter{}.GetQuery(f, nil)
-	assert.False(t, ok, "GetQuery must fail when the query cannot marshal")
+	q, ok := ElasticsearchAdapter{}.GetQuery(f, nil)
+	assert.True(t, ok)
+	require.NotNil(t, q)
+	assert.JSONEq(t, `{"query":{"match_none":{}}}`, q.(ElasticsearchQueryWrapper).GetSQL(),
+		"an unmarshalable query must fail closed, never render \"\"")
 
-	_, ok = ElasticsearchAdapter{}.GetSqlString(f, nil)
-	assert.False(t, ok)
+	body, ok := ElasticsearchAdapter{}.GetSqlString(f, nil)
+	assert.True(t, ok)
+	assert.JSONEq(t, `{"query":{"match_none":{}}}`, body)
 }
 
 // A8: the field-less multi_match branch must carry Language as an analyzer,

@@ -113,10 +113,10 @@ func TestRawAdapterDefaultDialectIsMySQL(t *testing.T) {
 // A '?' inside a quoted identifier or string literal must never be renumbered.
 func TestNumberPlaceholdersIsQuoteAware(t *testing.T) {
 	assert.Equal(t, `SELECT * FROM "a?b" WHERE "x" = $1`,
-		numberPlaceholders(`SELECT * FROM "a?b" WHERE "x" = ?`))
+		numberPlaceholders(PostgresDialect, `SELECT * FROM "a?b" WHERE "x" = ?`))
 	assert.Equal(t, `WHERE "note" = $1 AND "q" = 'why?'`,
-		numberPlaceholders(`WHERE "note" = ? AND "q" = 'why?'`))
+		numberPlaceholders(PostgresDialect, `WHERE "note" = ? AND "q" = 'why?'`))
 	// Two-digit numbering.
 	in := "?,?,?,?,?,?,?,?,?,?,?"
-	assert.Equal(t, "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11", numberPlaceholders(in))
+	assert.Equal(t, "$1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11", numberPlaceholders(PostgresDialect, in))
 }

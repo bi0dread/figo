@@ -201,7 +201,15 @@ Per-backend translation of `=^`:
 
 `x=null` and `x!=null` are shorthand for `<null>` / `<notnull>` — an unquoted `null` value becomes IS NULL / IS NOT NULL rather than a comparison against a literal.
 
-An **empty** `<in>[]` list is safe on every adapter: it renders a match-nothing predicate (SQL `1=0`, ES `match_none`, Mongo `$in: []`) instead of dropping the condition. Empty `<nin>[]` matches everything.
+An **empty** `<in>[]` list is safe on every adapter: it renders a match-nothing predicate (SQL `1=0`, ES `match_none`, Mongo `$in: []`) instead of dropping the condition. Empty `<nin>[]` matches everything. A blank list part — a leading, trailing or doubled comma — is skipped rather than becoming an empty-string member, so `<in>[1,,2]` has two members and `<in>[,]` has none (i.e. it behaves as `<in>[]`).
+
+> **`<bet>` needs BOTH bounds.** A half-open range is rejected, and a rejected
+> predicate is **dropped from the clause tree** — so `price<bet>(10..)`,
+> `price<bet>(..100)` and the malformed `price<bet>(1...5)` do not filter at all
+> and the query returns every row. `Build()` is silent about it by design;
+> `BuildE()` reports it. If a filter's bounds come from user input, either
+> validate them yourself or use `BuildE` and refuse the request — do not assume a
+> missing bound degrades to an open-ended range, because it does not.
 
 ### Logical operators and precedence
 
@@ -290,6 +298,16 @@ where, args, err := adapters.BuildRawWhere(f)
 ```
 
 Multiple `AddFilter` clauses are combined with **AND** at the top level.
+
+> **Pass field names in their ORIGINAL spelling — do not pre-convert them.**
+> `AddFilter` and `SetSort` run the field names they are given through the
+> instance's `NamingFunc`, once, on the way in, exactly as the DSL parser does.
+> With the default `SnakeCaseNaming`, `AddFilter(EqExpr{Field: "userName"})`
+> filters on `user_name`. Conversion is applied per `.`-separated segment, so a
+> qualified name stays qualified. Both built-in naming funcs are idempotent, so
+> pre-converting is harmless with them — but under a **non-idempotent** custom
+> `NamingFunc`, `AddFilter(EqExpr{Field: f.GetNamingFunc()("x")})` converts twice
+> and filters on a column that does not exist.
 
 ### Expression types
 
@@ -425,18 +443,31 @@ sql = f.GetSqlString(adapters.RawContext{Table: "users"}, "SELECT", "FROM", "WHE
 q := f.GetQuery(adapters.RawContext{Table: "users"}).(figo.SQLQuery) // q.SQL + q.Args
 ```
 
-With no `conditionType` arguments you get the full SELECT; otherwise only the named segments are emitted, in the order you list them. Recognized segment keywords (case-insensitive): `SELECT`, `FROM`, `JOIN`, `WHERE`, `ORDER BY` / `SORT`, `LIMIT`, `OFFSET`, `PAGE` (LIMIT + OFFSET together).
+With no `conditionType` arguments you get the full SELECT; otherwise only the named segments are emitted, in the order you list them. Recognized segment keywords (case-insensitive): `SELECT`, `FROM`, `JOIN`, `WHERE`, `ORDER BY` / `SORT`, `LIMIT`, `OFFSET`, `PAGE` (LIMIT + OFFSET together). A keyword outside that set fails the render (`ok=false`) rather than being ignored. `JOIN` and `GROUP BY` are recognized but emit **nothing** — they are accepted so existing callers that list them keep working; see the preload note below for `JOIN`.
 
 Identifiers are quote-escaped per dialect — embedded quote runes are doubled (values are always parameterized) — so field/table names can't break out of quoting. The `Build*` helpers (`BuildRawWhere`, `BuildRawSelect`, `BuildRawPreloads`) pick up the dialect from the instance's adapter, including `$N` numbering on Postgres. They return an error for any expression the raw adapter cannot render (e.g. the Mongo/ES-only advanced expression types) instead of silently dropping the condition; the `RawAdapter` methods likewise fail (`ok=false`) rather than emit SQL that omits a predicate.
 
-`load=` preloads render into the full SELECT as `JOIN <table> ON <filter>` clauses (deterministic table order). If you'd rather run your own join/second-query logic, the same preload filters are exposed as rendered `WHERE` fragments:
+Two classes of identifier fail the render outright rather than being quoted into SQL the engine cannot parse — a field name, sort key, projection column or table name is rejected when it **contains a C0 control byte or DEL**, or when it is **empty or has an empty dot segment** (`""`, `"..."`, `"a..b"` and `".a"` under a naming func that preserves dots). Both used to emit unexecutable SQL with `ok=true`. Failing closed is the deliberate choice: falling back to `*` for a bad projection column would widen it past what the caller asked for.
+
+> `RawAdapter.GetSqlString` / `GetQuery` take the dialect from the **receiver**, so `RawAdapter{Dialect: adapters.PostgresDialect}.GetSqlString(f, ctx)` renders Postgres even if the instance's stored adapter says otherwise. The normal path — `f.GetSqlString(...)` dispatching to the stored adapter — is unaffected, since receiver and stored adapter are the same there. The package-level `Build*` helpers still read the instance and still fall back to MySQL when it holds no raw adapter.
+
+**`load=` contributes nothing to the raw adapter's SELECT.** It is not rendered as a `JOIN`, it does not appear in the `JOIN` segment, and its arguments are not in the statement's arg list. `BuildRawPreloads` is the *only* way to get at the relation predicates:
 
 ```go
 f.AddFiltersFromString(`id>0 load=[Orders:total>100]`)
 f.Build(adapters.RawAdapter{})
+
+sql, args, err := adapters.BuildRawSelect(f, "users")
+// sql:  "SELECT * FROM `users` WHERE `id` > ? LIMIT 20"   <- no JOIN, no `total` predicate
+// args: []any{int64(0)}                                    <- no preload args
+
 preloads, err := adapters.BuildRawPreloads(f)     // map[string]RawPreload
 // preloads["Orders"] == RawPreload{Where: "`total` > ?", Args: []any{int64(100)}}
 ```
+
+Take the `Where`/`Args` from that map and build your own join or second query with it. This is the same separation GORM has (`Preload` issues a separate query) and it is deliberate: the raw adapter has no schema metadata, so it cannot know a relation's join key. Earlier versions did emit a `JOIN <relation> ON <preload filter>` — but with no `ON` key it was a cartesian product that changed the primary row set, so it was removed. If you relied on that JOIN, build it yourself from `BuildRawPreloads`.
+
+Two consequences worth knowing if you are upgrading: preload arguments no longer lead the arg list, so Postgres `$N` numbering of your `WHERE` shifts down accordingly; and a relation name is no longer rendered into SQL at all.
 
 ### MongoDB adapter
 
@@ -459,6 +490,12 @@ joins := map[string]adapters.MongoJoin{
 pipeline, err := adapters.BuildMongoAggregatePipeline(f, joins)
 ```
 
+The `joins` map is keyed by the **relation name exactly as it appears in
+`load=`**, and the match is case-sensitive: `load=[Orders:total>100]` needs the
+key `"Orders"`, not `"orders"`. A key that doesn't match leaves the generated
+`$lookup` without `localField`/`foreignField`, which MongoDB rejects at
+execution time.
+
 `$in`/`$nin` always receive a real array (never `null`), so empty-list filters don't error at the server.
 
 ### Elasticsearch adapter
@@ -471,7 +508,8 @@ f.Build(adapters.ElasticsearchAdapter{})
 
 query, err := adapters.BuildElasticsearchQuery(f) // adapters.ElasticsearchQuery (Query/Sort/From/Size/Source)
 
-// Or via the generic API — returns ElasticsearchQueryWrapper
+// Or via the generic API — returns ElasticsearchQueryWrapper.
+// This never fails and never returns nil: see the fail-closed note below.
 q := f.GetQuery(nil).(adapters.ElasticsearchQueryWrapper) // q.Query is the ElasticsearchQuery
 _ = q.GetSQL()  // the query as compact JSON (GetArgs() is nil — ES has no bind params)
 
@@ -491,7 +529,17 @@ esq := adapters.NewElasticsearchQueryBuilder().
 jsonStr, err = adapters.NewElasticsearchQueryBuilder().FromFigo(f).ToJSON()  // or ToJSONCompact()
 ```
 
-`AddSelectFields` maps to `_source`, `page=` maps to `from`/`size`, `sort=` maps to the ES sort array. `ElasticsearchQuery` is JSON-ready (`Query`, `Sort`, `From`, `Size`, `Source` fields with the right tags), so you can marshal it straight into a search request body. If the built AST contains an expression the ES adapter can't render, `BuildElasticsearchQuery` returns the error; the fluent builder's `FromFigo` (which has no error return) defers it until `ToJSON`/`ToJSONCompact`.
+`AddSelectFields` maps to `_source`, `page=` maps to `from`/`size`, `sort=` maps to the ES sort array. `ElasticsearchQuery` is JSON-ready (`Query`, `Sort`, `From`, `Size`, `Source` fields with the right tags), so you can marshal it straight into a search request body.
+
+#### How the ES adapter reports a query it cannot render
+
+This is the one adapter whose `(string, bool)` contract is not "false means it failed", and it matters, so it is spelled out:
+
+- `ElasticsearchAdapter.GetSqlString` / `GetQuery` — and therefore `f.GetSqlString(nil)` / `f.GetQuery(nil)` — return **`ok=true` with a fail-closed `{"query":{"match_none":{}}}` body** when the query cannot be rendered (a `load=` preload, an unsupported expression type, an unmarshalable value). They do not return `""`/`nil`. That is deliberate: an *empty* ES search body means `match_all`, so returning nothing would have widened the query to the whole index, and `figo.GetSqlString`/`GetQuery` discard the value whenever `ok=false`. Checking `if q == nil` or `if !ok` will therefore never fire.
+- The error is still fully observable, just on a different channel: **`BuildElasticsearchQuery`**, **`GetElasticsearchQueryString`** / **`GetElasticsearchQueryStringCompact`**, and the fluent builder's **`Err()`** / **`BuildE()`**. Use one of those if you need to distinguish "matches nothing" from "could not be rendered" — the JSON body alone cannot tell you, since `match_none` is also a legitimate rendering (an empty `<in>` set, a null range bound).
+- `f.BuildE(adapters.ElasticsearchAdapter{})` reports parse diagnostics, **not** adapter render errors — those surface only at render time, on the channels above.
+
+The fluent builder's `FromFigo` has no error return and defers it to `ToJSON`/`ToJSONCompact`/`Err()`; after a deferred error `Build()` returns a `match_none` query.
 
 ### Cross-backend semantics: NULL rows and the ES size cap
 
@@ -506,8 +554,17 @@ MongoDB and Elasticsearch have no UNKNOWN:
 - `field <nin> [..]` — same divergence: `$nin` / negated `terms` match
   null-or-missing documents, SQL's `NOT IN` never does.
 - `field <in> [.., null]` — a `null` in the list matches null-or-missing
-  documents on Mongo; on SQL, `IN (.., NULL)` can never match a NULL row
-  (and on ES a null in a `terms` list is invalid).
+  documents on Mongo; on SQL, `IN (.., NULL)` can never match a NULL row.
+  Elasticsearch rejects a null inside a `terms` list outright (HTTP 400 for
+  the whole search), so the ES adapter normalizes it to the SQL reading before
+  it ever reaches the server: `<in>` (and the programmatic
+  `ArrayOverlapsExpr`) **drop** the nulls — `[1,null]` renders `terms:[1]`, and
+  an all-null list renders `match_none` — while `<nin>` and
+  `ArrayContainsExpr` **fail closed to `match_none`**, because dropping the
+  null there would widen the predicate: SQL's `x NOT IN (…,NULL)` is UNKNOWN
+  for every row and can never be true. Mongo's `$nin` keeps the null, so
+  `<nin>` with a null in the list is the one operator where Mongo and ES
+  disagree by design.
 - `not (...)` — Mongo's `$nor` and ES's `must_not` match documents where the
   inner predicate is false *or* the field is absent; SQL's `NOT` still
   excludes rows where the inner predicate involved a NULL.
@@ -516,14 +573,28 @@ If NULL/missing rows matter to a negated filter, make the intent explicit with
 `<null>` / `<notnull>` instead of relying on negation.
 
 One more backend limit: Elasticsearch cannot express figo's `take:0`
-("no limit") — a request without `size` returns only 10 hits. The ES adapter
-therefore renders an explicit `"size": 10000` (the `index.max_result_window`
-default) for `take:0`; results beyond that window (including a `from` that
-pushes past it) need `search_after`/scroll. Relatedly, the ES adapter has no
-preload path, so `load=` fails the build with an error instead of being
-silently dropped, and the fluent builder fails closed: after a `FromFigo`
-error, `Build()` returns a `match_none` query and `Err()`/`BuildE()` expose
-the error.
+("no limit") — a request without `size` returns only 10 hits, and Elasticsearch
+validates **`from + size`** against `index.max_result_window` (default 10000),
+not `size` alone. So for `take:0` the ES adapter renders the largest size that
+still fits the window at the requested offset — `max_result_window - from`, not
+a flat 10000:
+
+| `page=`                  | rendered                  |
+| ------------------------ | ------------------------- |
+| `skip:0,take:0`          | `"size": 10000`           |
+| `skip:5,take:0`          | `"from": 5, "size": 9995` |
+| `skip:9999,take:0`       | `"from": 9999, "size": 1` |
+
+An explicit `take:N` is passed through unchanged and is *not* clamped, so
+`skip:10000,take:20` renders as written and Elasticsearch will reject it — that
+is the server's rule to enforce, not figo's. An offset at or past the window
+cannot be expressed as a `take:0` query at all: there is no size that fits.
+Results beyond the window need `search_after` or a scroll, or a larger
+`index.max_result_window` on the index (the adapter assumes the default).
+
+Relatedly, the ES adapter has no preload path, so `load=` is a render error —
+see the fail-closed note above for which calls report it and which return
+`ok=true` with a `match_none` body.
 
 ### Writing your own adapter
 
@@ -601,8 +672,18 @@ Walk(visit func(Expr))              // traverse/mutate the AST
 RegisterPlugin(plugin Plugin) error // Initialize is called; rolled back if it errors
 UnregisterPlugin(name string) error
 SetPluginManager(m *PluginManager)
-GetPluginManager() *PluginManager
+GetPluginManager() *PluginManager   // never nil; empty when no plugin was registered
 ```
+
+> `GetPluginManager()` **always returns a usable manager and never returns
+> `nil`** — on a fresh instance, on a `Clone()` of one, and even after
+> `SetPluginManager(nil)`. An instance that has never registered a plugin gets an
+> empty manager, so `ListPlugins()`, `GetPlugin(name)` and the `Execute*` helpers
+> are all safe to call without a nil check.
+>
+> Because of that, `f.GetPluginManager() == nil` is **not** a test for "this
+> instance has no plugins" — it is never true. Use `len(f.GetPluginManager().ListPlugins()) > 0`,
+> or `_, ok := f.GetPluginManager().GetPlugin("cache")` for a specific one.
 
 **Field & select control** — `AddSelectFields(...)` (widens the projection) / `SetSelectFields(...)` (replaces it; no arguments restores `SELECT *`) / `GetSelectFields()` (`map[string]bool`), `SetNamingFunc(fn)` / `GetNamingFunc()`. Ignore/whitelist state lives on the `FieldsPlugin`, complexity limits on the `LimitsPlugin`.
 
@@ -788,6 +869,21 @@ cp.SetCache(myCache)   // GetCache() / GetConfig() read the current state
 ```
 
 Cache keys are type-aware — `a = int64(1)` and `a = "1"` never collide even when instances share a cache. A cache the plugin created itself stops its background goroutine when it's replaced, `Close`d, or when the plugin is garbage-collected. `NewInMemoryCache(config)` is available if you want to manage one directly (call `Stop()` when done).
+
+> **The render context has to be keyable by *contents*, and a `*gorm.DB` is not.**
+> The key includes the ctx, so the plugin has to fingerprint it. When it cannot do
+> that soundly — over its 64-node budget, deeper than 10 levels, or holding a
+> non-nil func/chan/unsafe pointer — it **bypasses the cache entirely**: no `Get`,
+> no `Set`, the render goes straight through. A `*gorm.DB` is exactly that case (a
+> graph of thousands of nodes, mostly mutable connection-pool state), so
+> **`CachePlugin` caches nothing on the GORM path** and `Stats()` stays at zero
+> there. That is a deliberate fail-safe: the alternative is keying on where the
+> value lives, which served the wrong table whenever an address was reused.
+> `RawContext`, a table-name string, and `nil` all fingerprint fine.
+>
+> Worth pairing with the caveat in [Plugins](#plugins): a cache **hit** skips
+> `BeforeQuery`, so a plugin that vetoes a render is not consulted for a cached
+> result.
 
 ## Performance monitoring
 

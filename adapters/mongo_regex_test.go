@@ -60,5 +60,7 @@ func TestMongoILikeUsesOptions(t *testing.T) {
 	m, _ := BuildMongoFilter(f)
 	re, ok := m["name"].(primitive.Regex)
 	assert.True(t, ok)
-	assert.Equal(t, "i", re.Options)
+	// "is": 'i' for ILIKE plus the DOTALL 's' every LIKE-derived pattern now
+	// carries, so '%'/'_' match a newline the way SQL LIKE does (hunt #6 L9).
+	assert.Equal(t, "is", re.Options)
 }

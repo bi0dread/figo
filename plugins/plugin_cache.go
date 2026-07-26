@@ -5,12 +5,16 @@ import (
 )
 
 import (
-	"crypto/md5"
+	"container/heap"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"reflect"
 	"runtime"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -24,8 +28,12 @@ import (
 //
 // TTL <= 0 means entries never expire (previously a zero TTL stored every
 // entry pre-expired, so an enabled cache without an explicit TTL never hit).
-// MaxSize <= 0 means unlimited; CleanupInterval <= 0 disables the periodic
-// sweep (expired entries are still dropped lazily on Get).
+// MaxSize <= 0 means unlimited. CleanupInterval <= 0 disables the periodic
+// sweep goroutine; expired entries are still reclaimed without it, on Get, on
+// Set and on Stats — the old note that they were "dropped lazily on Get" was
+// reassuring but wrong, because Get only ever drops the key it was handed and a
+// key space driven by distinct filter strings is never requested twice.
+// MaxSize remains the only bound on a cache of LIVE entries.
 type CacheConfig struct {
 	Enabled         bool
 	TTL             time.Duration
@@ -40,6 +48,15 @@ type CacheEntry struct {
 	CreatedAt      time.Time
 	LastAccessedAt time.Time // updated on each Get; drives LRU eviction
 	HitCount       int64
+
+	// Intrusive bookkeeping owned by InMemoryCache. The recency order used to
+	// be recovered by scanning the whole map on every eviction (O(MaxSize) per
+	// insert, under the exclusive lock); these links make it O(1).
+	key      string
+	prev     *CacheEntry // towards the most recently used end
+	next     *CacheEntry // towards the least recently used end
+	heapIdx  int         // position in the expiry heap, -1 when not queued
+	memBytes int64       // this entry's contribution to Stats().MemoryUsage
 }
 
 // QueryCache interface for different cache implementations
@@ -70,6 +87,13 @@ type CacheStats struct {
 //
 // One plugin may serve many figo.Figo instances — the cache key covers everything
 // that changes the rendered output, so instances never collide.
+//
+// The key includes the render CONTEXT, fingerprinted by contents. A context
+// whose contents cannot be fingerprinted — notably a *gorm.DB, which is a large
+// graph of mutable connection state rather than a description of the query —
+// makes the render bypass the cache entirely: nothing is stored and nothing is
+// served. Keying such a context by its pointer address instead used to serve
+// one table's SQL for another table's request.
 type CachePlugin struct {
 	mu      sync.RWMutex
 	cache   QueryCache
@@ -264,15 +288,21 @@ func (p *CachePlugin) GetCachedSqlString(f figo.Figo, ctx any, conditionType ...
 		}
 	}()
 
-	if cache == nil || !enabled {
+	var key string
+	if cache != nil && enabled {
+		key = generateCacheKey(f, "sql", ctx, conditionType...)
+	}
+
+	// An empty key means the render context cannot be fingerprinted by
+	// contents (see writeCtxFingerprint) — bypass the cache rather than serve
+	// another context's SQL.
+	if key == "" {
 		sql := f.GetSqlString(ctx, conditionType...)
-		if sql == "" {
+		if sql == "" && !emptyRenderSucceeded(f, ctx, conditionType...) {
 			renderErr = errRenderFailed
 		}
 		return sql
 	}
-
-	key := generateCacheKey(f, "sql", ctx, conditionType...)
 
 	// Try to get from cache
 	if cached, found := cache.Get(key); found {
@@ -287,21 +317,58 @@ func (p *CachePlugin) GetCachedSqlString(f figo.Figo, ctx any, conditionType ...
 	// rendered SQL belongs to the NEW state and storing it under the OLD key
 	// would poison the cache — verify and skip caching.
 	//
-	// An empty render is never cached either: "" means the render failed
-	// (hook veto, no adapter, unsupported expression) or the requested
-	// segment is empty. Caching it served the empty string as a hit for the
-	// whole TTL — even after a transient veto lifted.
+	// A FAILED render is never cached: "" from a veto, a missing adapter or an
+	// unsupported expression must not be served as a hit for the whole TTL —
+	// not even after a transient veto lifts. An empty render that SUCCEEDED
+	// (an ORDERBY segment with no sort=, a JOIN segment with no load=) is a
+	// perfectly good value and is cached like any other; it used to be
+	// re-rendered forever and counted as an error on every call.
 	sql := f.GetSqlString(ctx, conditionType...)
+	cacheable := sql != ""
 	if sql == "" {
-		// A failed render is observable in the monitor's ErrorCount instead
-		// of counting as an ordinary miss (mirrors GetCachedQuery).
-		renderErr = errRenderFailed
+		if emptyRenderSucceeded(f, ctx, conditionType...) {
+			cacheable = true
+		} else {
+			// A failed render is observable in the monitor's ErrorCount
+			// instead of counting as an ordinary miss (mirrors GetCachedQuery).
+			renderErr = errRenderFailed
+		}
 	}
-	if sql != "" && generateCacheKey(f, "sql", ctx, conditionType...) == key {
+	if cacheable && generateCacheKey(f, "sql", ctx, conditionType...) == key {
 		cache.Set(key, sql, ttl)
 	}
 
 	return sql
+}
+
+// emptyRenderSucceeded reports whether an empty SQL render was a SUCCESSFUL
+// render of a legitimately empty segment rather than a failure.
+//
+// figo.GetSqlString collapses both into "": it discards the adapter's ok flag,
+// so the plugin cannot tell "the ORDERBY segment of a query with no sort= is
+// empty" (ok=true) from "the render failed" (ok=false). Conflating them charged
+// one ErrorCount per call for a healthy query — an operator alarming on that
+// counter saw a 100% error rate for a working endpoint — and made the segment
+// permanently uncacheable on the sql path while GetCachedQuery cached the
+// identical state happily.
+//
+// The probe asks the adapter directly, which runs no hooks. That is exactly why
+// it is skipped whenever any plugin is registered: a BeforeQuery veto also
+// renders "", the hookless probe would report success, and caching "" would
+// then serve the vetoed result for the whole TTL. With no plugin able to veto,
+// "" from GetSqlString can only have come from the adapter, so the probe's ok
+// flag is the answer. (A figo.Figo that surfaced the flag directly would make
+// the probe unnecessary.)
+func emptyRenderSucceeded(f figo.Figo, ctx any, conditionType ...string) bool {
+	if pm := f.GetPluginManager(); pm != nil && len(pm.ListPlugins()) > 0 {
+		return false
+	}
+	adapter := f.GetAdapterObject()
+	if adapter == nil {
+		return false
+	}
+	sql, ok := adapter.GetSqlString(f, ctx, conditionType...)
+	return ok && sql == ""
 }
 
 // GetCachedQuery retrieves the query from cache or renders it via f.GetQuery.
@@ -325,15 +392,19 @@ func (p *CachePlugin) GetCachedQuery(f figo.Figo, ctx any, conditionType ...stri
 		}
 	}()
 
-	if cache == nil || !enabled {
+	var key string
+	if cache != nil && enabled {
+		key = generateCacheKey(f, "query", ctx, conditionType...)
+	}
+
+	// See GetCachedSqlString: an unfingerprintable ctx bypasses the cache.
+	if key == "" {
 		q := f.GetQuery(ctx, conditionType...)
 		if q == nil {
 			renderErr = errRenderFailed
 		}
 		return q
 	}
-
-	key := generateCacheKey(f, "query", ctx, conditionType...)
 
 	// Try to get from cache. Hits are served as a defensive copy — the cached
 	// entry is shared across callers, and one caller mutating the returned
@@ -395,58 +466,304 @@ func copyArgsSlice(args []any) []any {
 	return out
 }
 
+// byteWriter is the sink the key/fingerprint writers render into: both
+// *strings.Builder and *cacheKeyBuf satisfy it, so a fingerprint can be
+// streamed straight into the key buffer instead of being materialized as an
+// intermediate string first.
+type byteWriter interface {
+	io.Writer
+	WriteString(string) (int, error)
+	WriteByte(byte) error
+}
+
+// cacheKeyBuf accumulates the cache key's components. Every component is
+// terminated with "|<len>;" — a SUFFIX length delimiter. It is exactly as
+// unambiguous as the old "<len>:<component>|" prefix form (decode from the
+// right instead of the left), but the length is only known after the component
+// has been written, which is what lets components be written STREAMING
+// (fmt.Fprintf directly into this buffer) rather than being built as a dozen
+// separate strings first. Key generation runs on every cached render and used
+// to cost more than the render it replaces.
+type cacheKeyBuf struct {
+	buf   []byte
+	start int // offset of the component currently being written
+}
+
+func (k *cacheKeyBuf) Write(p []byte) (int, error) {
+	k.buf = append(k.buf, p...)
+	return len(p), nil
+}
+
+func (k *cacheKeyBuf) WriteString(s string) (int, error) {
+	k.buf = append(k.buf, s...)
+	return len(s), nil
+}
+
+func (k *cacheKeyBuf) WriteByte(c byte) error {
+	k.buf = append(k.buf, c)
+	return nil
+}
+
+// end closes the component currently being written.
+func (k *cacheKeyBuf) end() {
+	n := len(k.buf) - k.start
+	k.buf = append(k.buf, '|')
+	k.buf = strconv.AppendInt(k.buf, int64(n), 10)
+	k.buf = append(k.buf, ';')
+	k.start = len(k.buf)
+}
+
+// addString writes a whole component in one go.
+func (k *cacheKeyBuf) addString(s string) {
+	k.buf = append(k.buf, s...)
+	k.end()
+}
+
+func (k *cacheKeyBuf) reset() {
+	k.buf = k.buf[:0]
+	k.start = 0
+}
+
+var keyBufPool = sync.Pool{New: func() any { return &cacheKeyBuf{buf: make([]byte, 0, 512)} }}
+
+// cacheKeyPrefix namespaces the key; an empty key means "not cacheable".
+const cacheKeyPrefix = "figo:"
+
+// cacheKeyHashBytes is how much of the digest lands in the key.
+const cacheKeyHashBytes = 16
+
 // generateCacheKey creates a unique cache key for a query. kind ("sql"/"query")
 // keeps the two result types in separate slots — otherwise GetCachedSqlString and
 // GetCachedQuery share a key and clobber each other's entries. The key covers
 // everything that changes the rendered output: the adapter type, the custom
-// naming func, and the global regex SQL operator. It reads the instance through
-// its public getters, so the snapshot is not atomic under concurrent mutation —
-// the key re-check in the render wrappers guards against caching a torn result.
+// naming func, the registered plugin set, the render context and the global
+// regex SQL operator. It reads the instance through its public getters, so the
+// snapshot is not atomic under concurrent mutation — the key re-check in the
+// render wrappers guards against caching a torn result.
+//
+// It returns "" when the render CONTEXT cannot be keyed by contents (see
+// writeCtxFingerprint); the render wrappers then bypass the cache entirely
+// rather than key on a pointer address.
 func generateCacheKey(f figo.Figo, kind string, ctx any, conditionType ...string) string {
+	k := keyBufPool.Get().(*cacheKeyBuf)
+	defer func() {
+		if cap(k.buf) > 64<<10 {
+			k.buf = make([]byte, 0, 512) // don't pool a pathological buffer
+		}
+		k.reset()
+		keyBufPool.Put(k)
+	}()
+
+	// ctx first: an unkeyable ctx aborts before the expensive components.
+	if !writeCtxFingerprint(k, ctx) {
+		return ""
+	}
+	k.end()
+
 	clauses := f.GetClauses()
 	preloads := f.GetPreloads()
 
-	components := []string{
-		kind,
-		f.GetDSL(),
-		// %#v keeps value types in the key: a = int64(1) and a = "1" render
-		// different SQL and must not share a cache slot (%v printed both as
-		// "1", colliding when instances share one cache). %#v alone is not
-		// enough for numeric types — it renders int(1), int64(1) and float64(1)
-		// identically as "1" — so append an explicit type signature of every
-		// clause/preload value to keep those from colliding.
-		fmt.Sprintf("%#v", clauses),
-		valueTypeSignature(clauses),
-		fmt.Sprintf("%#v", preloads),
-		preloadValueTypeSignature(preloads),
-		fmt.Sprintf("%v", f.GetPage()),
-		fmt.Sprintf("%v", f.GetSort()),
-		// Ignore/whitelist policy needs no key component: FieldsPlugin prunes
-		// expressions before they enter the clause tree, so the clauses
-		// component above already reflects it.
-		fmt.Sprintf("%v", f.GetSelectFields()),
-		namingFingerprint(f),
-		// Contents, not %T%+v: adapter configuration changes the rendered
-		// SQL — e.g. RawAdapter{Dialect: PostgresDialect} vs the MySQL
-		// default must not share a cache slot — and %+v printed pointer
-		// fields (like *SQLDialect) as bare addresses, keying on WHERE the
-		// config lived instead of what it said.
-		adapterFingerprint(f.GetAdapterObject()),
-		figo.GetRegexSQLOperator(),
-		fmt.Sprintf("%v", ctx),
-		fmt.Sprintf("%v", conditionType),
+	k.addString(kind)
+	k.addString(f.GetDSL())
+	// The clause and preload trees are rendered by CONTENTS (see
+	// writeClauseFingerprint), not with %#v: %#v printed a clause payload's
+	// POINTER as its heap address and a CustomExpr.Handler as its CODE
+	// pointer, which is shared by every closure minted from one function
+	// literal — so two per-tenant handlers rendering different WHEREs shared
+	// a cache slot and one tenant was served the other's SQL. An unkeyable
+	// payload now makes the whole key "" and the render bypasses the cache.
+	// The value-type signature stays: the content walk renders int64(1) and
+	// float64(1) alike when they are not held in an interface.
+	if !writeClauseFingerprint(k, clauses) {
+		return ""
+	}
+	k.end()
+	writeValueTypeSignature(k, clauses)
+	k.end()
+	if !writeClauseFingerprint(k, preloads) {
+		return ""
+	}
+	k.end()
+	writePreloadValueTypeSignature(k, preloads)
+	k.end()
+	page := f.GetPage()
+	fmt.Fprintf(k, "%d/%d", page.Skip, page.Take)
+	k.end()
+	fmt.Fprintf(k, "%v", f.GetSort())
+	k.end()
+	// Ignore/whitelist policy needs no key component: FieldsPlugin prunes
+	// expressions before they enter the clause tree, so the clauses
+	// component above already reflects it.
+	fmt.Fprintf(k, "%v", f.GetSelectFields())
+	k.end()
+	writeNamingFingerprint(k, f)
+	k.end()
+	// Contents, not %T%+v: adapter configuration changes the rendered
+	// SQL — e.g. RawAdapter{Dialect: PostgresDialect} vs the MySQL
+	// default must not share a cache slot — and %+v printed pointer
+	// fields (like *SQLDialect) as bare addresses, keying on WHERE the
+	// config lived instead of what it said.
+	writeAdapterFingerprint(k, f.GetAdapterObject())
+	k.end()
+	k.addString(figo.GetRegexSQLOperator())
+	// The plugin set changes the rendered output too: a BeforeQuery hook can
+	// veto the render outright. Without this component an entry warmed by a
+	// plugin-free instance was served to an instance whose authorization hook
+	// denies — and the hook never ran at all, because hits skip it.
+	writePluginFingerprint(k, f)
+	k.end()
+	// conditionType: the element COUNT plus a length delimiter per element.
+	// A single %v of the slice erased the element boundaries, so
+	// []string{"where","select"} and []string{"where select"} shared a key.
+	k.addString(strconv.Itoa(len(conditionType)))
+	for _, c := range conditionType {
+		k.addString(c)
 	}
 
-	// Length-prefix every component before joining: a plain "|" join let a
-	// "|" inside a %v-rendered component shift the boundaries, so ctx
-	// `users|[where]` with no conditionType collided with ctx `users` plus
-	// conditionType `where]|[`.
-	var content strings.Builder
-	for _, c := range components {
-		fmt.Fprintf(&content, "%d:%s|", len(c), c)
+	// SHA-256 truncated to 128 bits: same key length as the previous md5, but
+	// ~3.5x faster here (hardware-accelerated) and without md5's practical
+	// collision construction — the DSL that feeds this content is untrusted.
+	hash := sha256.Sum256(k.buf)
+	out := make([]byte, len(cacheKeyPrefix)+hex.EncodedLen(cacheKeyHashBytes))
+	copy(out, cacheKeyPrefix)
+	hex.Encode(out[len(cacheKeyPrefix):], hash[:cacheKeyHashBytes])
+	return string(out)
+}
+
+// ctxFingerprintBudget bounds the node count of the ctx content walk. Exceeding
+// the budget means "cannot be keyed by contents", which fails safe (no caching)
+// instead of falling back to an address.
+//
+// It was 64, which is a handful of nodes: enough for the small contexts the raw
+// adapter documents (nil, a table-name string, a RawContext) but NOT for
+// map[string]adapters.MongoJoin, the documented ctx of the Mongo aggregate path
+// — a MongoJoin entry costs 6 nodes, so 11 joins already went over and the
+// whole aggregate path silently stopped caching. 512 admits ~85 joins while
+// still aborting a *gorm.DB (a graph of thousands of nodes, most of it live
+// connection-pool state that differs between identical requests) after a few
+// dozen.
+const ctxFingerprintBudget = 512
+
+// NOTE for future passes: there used to be a sync.Map memo here that remembered
+// ctx TYPES whose walk came back unsound, so the aborted walk ran once per type
+// instead of once per render. It was removed because unsoundness is a property
+// of the VALUE, not of the type: one oversized (or too deeply nested) context
+// value permanently and silently switched the cache off for every later value
+// of that type — process-wide, including for CachePlugins constructed
+// afterwards with their own InMemoryCache — and a bypassed render reports
+// neither a hit nor a miss, so Stats() showed an IDLE cache rather than a
+// disabled one. Re-adding a per-type memo re-opens that: the budget itself is
+// what bounds the cost of an unkeyable context (at most ctxFingerprintBudget
+// nodes per render), and a *gorm.DB aborts after ~23 of them.
+
+// writeCtxFingerprint renders the render context by CONTENTS with its dynamic
+// type, exactly as writeAdapterFingerprint does for the adapter. It reports
+// whether the fingerprint is sound.
+//
+// The old encoding was fmt.Sprintf("%v", ctx), which printed a pointer ctx as
+// its ADDRESS. On the GORM path ctx is a *gorm.DB whose fields are all
+// pointers, so the model/table, the WHERE scopes and the session options never
+// reached the key — and GormAdapter{} is an empty struct, so ctx was the only
+// per-request discriminator. An in-place Model switch served the previous
+// table's SQL, a tenant scope added with Where was silently dropped, and heap
+// address reuse across per-request handles served the wrong table for 5-24% of
+// cached renders. This is the same defect round 3 fixed for the adapter
+// component; the contents treatment simply was never applied to ctx.
+//
+// The type prefix matters on its own: "{users}" (a string) and
+// RawContext{Table:"users"} print identically under %v and shared a key.
+func writeCtxFingerprint(w byteWriter, ctx any) bool {
+	if ctx == nil {
+		_, _ = w.WriteString("<nil>")
+		return true
 	}
-	hash := md5.Sum([]byte(content.String()))
-	return fmt.Sprintf("figo:%x", hash)
+	_, _ = w.WriteString(reflect.TypeOf(ctx).String())
+	vw := valueWalker{b: w, budget: ctxFingerprintBudget, strict: true}
+	vw.write(reflect.ValueOf(ctx), 0)
+	// Decided per VALUE, never remembered per type: see the note above
+	// ctxFingerprintBudget. A big context value must not disable caching for
+	// the small ones that follow it.
+	return !vw.unsound
+}
+
+// clauseFingerprintBudget / clauseFingerprintDepth bound the clause-tree content
+// walk. They are far more generous than the ctx budget because the clause tree
+// is the query: LimitsPlugin's default ceiling is 200 expression nodes and a
+// simple leaf costs ~5 walked nodes, so 16384 nodes leaves three orders of
+// magnitude of headroom, and 64 levels of depth cover ~20 nested groups (the
+// parser emits flat n-ary and/or nodes, so nesting only comes from explicit
+// parentheses). Exceeding either bound fails safe — no caching — rather than
+// truncating the fingerprint, which would let two different trees share a key.
+const (
+	clauseFingerprintBudget = 1 << 14
+	clauseFingerprintDepth  = 64
+)
+
+// writeClauseFingerprint renders a clause tree (or the preload map) by CONTENTS
+// and reports whether the fingerprint is sound.
+//
+// The old encoding was fmt.Fprintf("%#v", clauses), which prints what a payload
+// IS only for scalars. For a pointer it prints the heap ADDRESS, so two
+// instances holding equal-valued but separately allocated payloads never shared
+// a slot (a 0% hit rate) while address reuse across requests collided unrelated
+// payloads into one. Worse, for a func it prints the CODE pointer, which every
+// closure minted from the same function literal shares regardless of what it
+// captured: a per-tenant figo.CustomExpr.Handler factory produced byte-identical
+// keys for handlers rendering `tenant_id = 'acme'` and `tenant_id = 'globex'`,
+// and one shared CachePlugin then served acme's WHERE to globex. That is the
+// same defect hunt #6's H0 fixed for the render context and round 3 fixed for
+// the adapter and naming components; this is the clause component.
+//
+// A func (or chan, or unsafe.Pointer) cannot be fingerprinted by contents at
+// all, so a clause carrying a live one is NOT CACHEABLE: strict mode marks the
+// walk unsound, generateCacheKey returns "" and the render bypasses the cache
+// entirely. Sampling a Handler's behaviour the way writeNamingFingerprint
+// samples a naming func is not an option here — the probe would have to call
+// application code with fabricated arguments, and the handler is free to have
+// side effects.
+func writeClauseFingerprint(w byteWriter, v any) bool {
+	vw := valueWalker{
+		b:        w,
+		budget:   clauseFingerprintBudget,
+		maxDepth: clauseFingerprintDepth,
+		strict:   true,
+	}
+	vw.write(reflect.ValueOf(v), 0)
+	return !vw.unsound
+}
+
+// writePluginFingerprint keys the registered plugin set by name+version in
+// registration order (the order every hook dispatch uses).
+//
+// Limitation, mirroring writeNamingFingerprint's: two instances holding
+// DIFFERENTLY CONFIGURED plugins of the same name and version still share a
+// key. Fingerprinting plugin state itself is not an option — a MetricsPlugin's
+// counters change on every call, which would make every key unique — and that
+// case stays covered by the documented caveat that a cache hit skips
+// BeforeQuery. What this component fixes is the stronger failure: a DIFFERENT
+// plugin set (notably "no plugins at all" vs "a plugin that vetoes") sharing
+// one slot.
+func writePluginFingerprint(w byteWriter, f figo.Figo) {
+	pm := f.GetPluginManager()
+	if pm == nil {
+		_, _ = w.WriteString("<nil>")
+		return
+	}
+	for _, p := range pm.ListPlugins() {
+		if p == nil {
+			_, _ = w.WriteString("<nil>,")
+			continue
+		}
+		name, version := p.Name(), p.Version()
+		_, _ = w.WriteString(strconv.Itoa(len(name)))
+		_ = w.WriteByte(':')
+		_, _ = w.WriteString(name)
+		_ = w.WriteByte('@')
+		_, _ = w.WriteString(strconv.Itoa(len(version)))
+		_ = w.WriteByte(':')
+		_, _ = w.WriteString(version)
+		_ = w.WriteByte(',')
+	}
 }
 
 // namingFingerprint keys the naming strategy by BEHAVIOR rather than function
@@ -462,10 +779,11 @@ func generateCacheKey(f figo.Figo, kind string, ctx any, conditionType ...string
 // Limitation: behavior can only be sampled, not proven equal. A pathological
 // naming func that ignores its input (or its captured state) on every probe
 // string while still renaming real clause columns differently could collide.
-func namingFingerprint(f figo.Figo) string {
+func writeNamingFingerprint(w byteWriter, f figo.Figo) {
 	fn := f.GetNamingFunc()
 	if fn == nil {
-		return "<nil>"
+		_, _ = w.WriteString("<nil>")
+		return
 	}
 	probes := []string{"FigoProbe", "user.createdAt", "AbCd_ef"}
 	if sel := f.GetSelectFields(); len(sel) > 0 {
@@ -481,12 +799,13 @@ func namingFingerprint(f figo.Figo) string {
 			probes = append(probes, col.Name)
 		}
 	}
-	var b strings.Builder
 	for _, probe := range probes {
 		out := fn(probe)
-		fmt.Fprintf(&b, "%d:%s,", len(out), out)
+		_, _ = w.WriteString(strconv.Itoa(len(out)))
+		_ = w.WriteByte(':')
+		_, _ = w.WriteString(out)
+		_ = w.WriteByte(',')
 	}
-	return b.String()
 }
 
 // adapterFingerprint renders the adapter's configuration by CONTENTS,
@@ -496,88 +815,189 @@ func namingFingerprint(f figo.Figo) string {
 // reuse across per-request dialect copies (the customization pattern
 // adapters/dialect.go recommends) collided fresh configs into stale slots.
 func adapterFingerprint(a figo.Adapter) string {
-	if a == nil {
-		return "<nil>"
-	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "%T", a)
-	writeValueContents(&b, reflect.ValueOf(a), make(map[uintptr]bool), 0)
+	writeAdapterFingerprint(&b, a)
 	return b.String()
 }
 
-// writeValueContents renders v recursively with pointers dereferenced and map
-// entries in deterministic order. seen guards against pointer cycles; depth
-// bounds pathological nesting. Funcs have no comparable contents and key by
-// code pointer (the best identity available).
-func writeValueContents(b *strings.Builder, v reflect.Value, seen map[uintptr]bool, depth int) {
-	if depth > 10 {
-		b.WriteString("<deep>")
+func writeAdapterFingerprint(w byteWriter, a figo.Adapter) {
+	if a == nil {
+		_, _ = w.WriteString("<nil>")
 		return
 	}
+	_, _ = w.WriteString(reflect.TypeOf(a).String())
+	writeValueContents(w, reflect.ValueOf(a), 0)
+}
+
+// writeValueContents renders v recursively with pointers dereferenced and map
+// entries in deterministic order, with no bound on the graph size (the adapter
+// path: adapters are small configuration structs).
+func writeValueContents(b byteWriter, v reflect.Value, depth int) {
+	vw := valueWalker{b: b, budget: -1}
+	vw.write(v, depth)
+}
+
+// valueWalker renders a value by CONTENTS. seen guards against pointer cycles;
+// depth bounds pathological nesting (maxDepth, or defaultWalkDepth when 0);
+// budget bounds the total node count when >= 0 (-1 is unlimited).
+//
+// strict mode is for values whose fingerprint must be SOUND or not used at all
+// (the render context). In strict mode anything that can only be keyed by an
+// address (a non-nil func, chan or unsafe pointer) and any truncation (depth or
+// budget) marks the walk unsound, so the caller can bypass the cache instead of
+// keying on WHERE a value lives rather than what it says. Outside strict mode
+// those cases keep the historical behavior: funcs key by code pointer (the best
+// identity available) and deep graphs truncate with a marker.
+type valueWalker struct {
+	b        byteWriter
+	seen     map[uintptr]bool // lazily allocated: most values contain no pointers
+	budget   int
+	maxDepth int // 0 = defaultWalkDepth
+	strict   bool
+	unsound  bool
+}
+
+// defaultWalkDepth is the historical bound, kept for the adapter and context
+// walks (small configuration structs). The clause tree needs a deeper one — see
+// clauseFingerprintDepth.
+const defaultWalkDepth = 10
+
+func (w *valueWalker) write(v reflect.Value, depth int) {
+	if w.unsound {
+		return
+	}
+	if w.budget >= 0 {
+		if w.budget == 0 {
+			w.unsound = true
+			return
+		}
+		w.budget--
+	}
+	limit := w.maxDepth
+	if limit == 0 {
+		limit = defaultWalkDepth
+	}
+	if depth > limit {
+		if w.strict {
+			w.unsound = true
+			return
+		}
+		_, _ = w.b.WriteString("<deep>")
+		return
+	}
+	b := w.b
 	switch v.Kind() {
 	case reflect.Invalid:
-		b.WriteString("<nil>")
+		_, _ = b.WriteString("<nil>")
 	case reflect.Pointer:
 		if v.IsNil() {
-			b.WriteString("<nil>")
+			_, _ = b.WriteString("<nil>")
 			return
 		}
-		if p := v.Pointer(); seen[p] {
-			b.WriteString("<cycle>")
-			return
-		} else {
-			seen[p] = true
+		p := v.Pointer()
+		if w.seen == nil {
+			w.seen = make(map[uintptr]bool)
 		}
-		b.WriteByte('&')
-		writeValueContents(b, v.Elem(), seen, depth+1)
+		if w.seen[p] {
+			_, _ = b.WriteString("<cycle>")
+			return
+		}
+		w.seen[p] = true
+		_ = b.WriteByte('&')
+		w.write(v.Elem(), depth+1)
 	case reflect.Interface:
 		if v.IsNil() {
-			b.WriteString("<nil>")
+			_, _ = b.WriteString("<nil>")
 			return
 		}
-		fmt.Fprintf(b, "(%s)", v.Elem().Type())
-		writeValueContents(b, v.Elem(), seen, depth+1)
+		_ = b.WriteByte('(')
+		_, _ = b.WriteString(v.Elem().Type().String())
+		_ = b.WriteByte(')')
+		w.write(v.Elem(), depth+1)
 	case reflect.Struct:
-		b.WriteByte('{')
+		_ = b.WriteByte('{')
 		for i := 0; i < v.NumField(); i++ {
-			b.WriteString(v.Type().Field(i).Name)
-			b.WriteByte(':')
-			writeValueContents(b, v.Field(i), seen, depth+1)
-			b.WriteByte(';')
+			if w.unsound {
+				return
+			}
+			_, _ = b.WriteString(v.Type().Field(i).Name)
+			_ = b.WriteByte(':')
+			w.write(v.Field(i), depth+1)
+			_ = b.WriteByte(';')
 		}
-		b.WriteByte('}')
+		_ = b.WriteByte('}')
 	case reflect.Slice, reflect.Array:
-		b.WriteByte('[')
+		_ = b.WriteByte('[')
 		for i := 0; i < v.Len(); i++ {
-			writeValueContents(b, v.Index(i), seen, depth+1)
-			b.WriteByte(';')
+			if w.unsound {
+				return
+			}
+			w.write(v.Index(i), depth+1)
+			_ = b.WriteByte(';')
 		}
-		b.WriteByte(']')
+		_ = b.WriteByte(']')
 	case reflect.Map:
 		entries := make([]string, 0, v.Len())
 		iter := v.MapRange()
 		for iter.Next() {
+			if w.unsound {
+				return
+			}
 			var e strings.Builder
-			writeValueContents(&e, iter.Key(), seen, depth+1)
+			// maxDepth must travel with the sub-walker: the preload map's
+			// values are clause trees, and a default-depth sub-walk would
+			// truncate them (and, in strict mode, refuse to key them).
+			sub := valueWalker{b: &e, seen: w.seen, budget: w.budget, maxDepth: w.maxDepth, strict: w.strict}
+			sub.write(iter.Key(), depth+1)
+			// The key's rendered LENGTH is appended below, because "key=value"
+			// alone is ambiguous when a key can contain '=':
+			// map{"a=b":"c"} and map{"a":"b=c"} both rendered "a=b=c" and
+			// shared a cache slot. The preload map's keys are relation names
+			// and a ctx map's keys are application-supplied, so this is a
+			// wrong-serve path, not a theoretical one.
+			klen := e.Len()
 			e.WriteByte('=')
-			writeValueContents(&e, iter.Value(), seen, depth+1)
+			sub.write(iter.Value(), depth+1)
+			e.WriteByte('|')
+			e.WriteString(strconv.Itoa(klen))
+			w.seen, w.budget, w.unsound = sub.seen, sub.budget, sub.unsound
 			entries = append(entries, e.String())
 		}
 		sort.Strings(entries)
-		b.WriteString("map[")
+		_, _ = b.WriteString("map[")
 		for _, e := range entries {
-			b.WriteString(e)
-			b.WriteByte(';')
+			_, _ = b.WriteString(e)
+			_ = b.WriteByte(';')
 		}
-		b.WriteByte(']')
+		_ = b.WriteByte(']')
 	case reflect.Func, reflect.Chan, reflect.UnsafePointer:
 		if v.IsNil() {
-			b.WriteString("<nil>")
+			_, _ = b.WriteString("<nil>")
+			return
+		}
+		if w.strict {
+			// Only an address is available, which is exactly what this
+			// fingerprint exists to avoid.
+			w.unsound = true
 			return
 		}
 		fmt.Fprintf(b, "%s@%x", v.Kind(), v.Pointer())
+	case reflect.String:
+		// Scalar fast paths: these render identically to %v but skip fmt's
+		// reflection dispatch, which dominated the fingerprint cost.
+		_, _ = b.WriteString(v.String())
+	case reflect.Bool:
+		if v.Bool() {
+			_, _ = b.WriteString("true")
+		} else {
+			_, _ = b.WriteString("false")
+		}
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		_, _ = b.WriteString(strconv.FormatInt(v.Int(), 10))
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr:
+		_, _ = b.WriteString(strconv.FormatUint(v.Uint(), 10))
 	default:
-		// Scalars (and strings). fmt renders a reflect.Value operand as the
+		// Remaining scalars. fmt renders a reflect.Value operand as the
 		// value it holds, so unexported fields print fine here too.
 		fmt.Fprintf(b, "%v", v)
 	}
@@ -587,25 +1007,22 @@ func writeValueContents(b *strings.Builder, v reflect.Value, seen map[uintptr]bo
 // expression trees, in order. It exists because the cache key's %#v encoding
 // collapses int(1)/int64(1)/float64(1) to the same text; appending this makes
 // two clauses that differ only in a value's numeric type produce distinct keys.
-func valueTypeSignature(exprs []figo.Expr) string {
-	var b strings.Builder
+func writeValueTypeSignature(b byteWriter, exprs []figo.Expr) {
 	for _, e := range exprs {
-		appendValueTypes(&b, e)
-		b.WriteByte('|')
+		appendValueTypes(b, e)
+		_ = b.WriteByte('|')
 	}
-	return b.String()
 }
 
-// preloadValueTypeSignature does the same across all preload expression lists,
-// keyed by relation name so two preloads can't swap type signatures unnoticed.
-func preloadValueTypeSignature(preloads map[string][]figo.Expr) string {
-	var b strings.Builder
+// writePreloadValueTypeSignature does the same across all preload expression
+// lists, keyed by relation name so two preloads can't swap type signatures
+// unnoticed.
+func writePreloadValueTypeSignature(b byteWriter, preloads map[string][]figo.Expr) {
 	for _, name := range sortedKeys2(preloads) {
-		b.WriteString(name)
-		b.WriteByte(':')
-		b.WriteString(valueTypeSignature(preloads[name]))
+		_, _ = b.WriteString(name)
+		_ = b.WriteByte(':')
+		writeValueTypeSignature(b, preloads[name])
 	}
-	return b.String()
 }
 
 // sortedKeys2 returns the map keys in deterministic order (the key must be
@@ -619,8 +1036,8 @@ func sortedKeys2(m map[string][]figo.Expr) []string {
 	return keys
 }
 
-func appendValueTypes(b *strings.Builder, e figo.Expr) {
-	writeT := func(v any) { b.WriteString(fmt.Sprintf("%T,", v)) }
+func appendValueTypes(b byteWriter, e figo.Expr) {
+	writeT := func(v any) { fmt.Fprintf(b, "%T,", v) }
 	writeList := func(vs []any) {
 		for _, v := range vs {
 			writeT(v)
@@ -680,10 +1097,24 @@ func appendValueTypes(b *strings.Builder, e figo.Expr) {
 	}
 }
 
-// InMemoryCache implements QueryCache using in-memory storage
+// InMemoryCache implements QueryCache using in-memory storage.
+//
+// Besides the map it keeps two indexes, both maintained incrementally so that
+// no operation scans the whole cache while holding the lock:
+//   - an intrusive LRU list (mru/lru) so eviction picks its victim in O(1)
+//     instead of scanning every entry on every insert at capacity;
+//   - a min-heap of the entries that have an expiry, so expired entries are
+//     reclaimed in O(log n) each without a sweep — TTL used to free nothing at
+//     all unless a CleanupInterval goroutine was configured, because Get only
+//     drops the key it was handed and an attacker-chosen key space is never
+//     requested twice.
 type InMemoryCache struct {
 	mu       sync.RWMutex
 	entries  map[string]*CacheEntry
+	mru      *CacheEntry // most recently used (head of the LRU list)
+	lru      *CacheEntry // least recently used (tail) — the eviction victim
+	expiry   expiryHeap
+	memBytes int64 // sum of the live entries' estimates; Stats() is O(1)
 	config   CacheConfig
 	hits     int64
 	misses   int64
@@ -704,6 +1135,93 @@ func NewInMemoryCache(config CacheConfig) *InMemoryCache {
 	}
 
 	return cache
+}
+
+// expiryHeap orders entries by ExpiresAt, soonest first. Only entries with a
+// non-zero ExpiresAt are queued (TTL <= 0 never expires).
+type expiryHeap []*CacheEntry
+
+func (h expiryHeap) Len() int           { return len(h) }
+func (h expiryHeap) Less(i, j int) bool { return h[i].ExpiresAt.Before(h[j].ExpiresAt) }
+func (h expiryHeap) Swap(i, j int)      { h[i], h[j] = h[j], h[i]; h[i].heapIdx = i; h[j].heapIdx = j }
+func (h *expiryHeap) Push(x interface{}) {
+	e := x.(*CacheEntry)
+	e.heapIdx = len(*h)
+	*h = append(*h, e)
+}
+func (h *expiryHeap) Pop() interface{} {
+	old := *h
+	n := len(old)
+	e := old[n-1]
+	old[n-1] = nil
+	e.heapIdx = -1
+	*h = old[:n-1]
+	return e
+}
+
+// lruPushFront makes e the most recently used entry. Caller holds c.mu.
+func (c *InMemoryCache) lruPushFront(e *CacheEntry) {
+	e.prev = nil
+	e.next = c.mru
+	if c.mru != nil {
+		c.mru.prev = e
+	}
+	c.mru = e
+	if c.lru == nil {
+		c.lru = e
+	}
+}
+
+// lruUnlink removes e from the recency list. Caller holds c.mu.
+func (c *InMemoryCache) lruUnlink(e *CacheEntry) {
+	if e.prev != nil {
+		e.prev.next = e.next
+	} else if c.mru == e {
+		c.mru = e.next
+	}
+	if e.next != nil {
+		e.next.prev = e.prev
+	} else if c.lru == e {
+		c.lru = e.prev
+	}
+	e.prev, e.next = nil, nil
+}
+
+// removeEntryLocked drops e from the map and both indexes. Caller holds c.mu.
+func (c *InMemoryCache) removeEntryLocked(e *CacheEntry) {
+	delete(c.entries, e.key)
+	c.lruUnlink(e)
+	if e.heapIdx >= 0 && e.heapIdx < len(c.expiry) {
+		heap.Remove(&c.expiry, e.heapIdx)
+		e.heapIdx = -1
+	}
+	c.memBytes -= e.memBytes
+}
+
+// reapExpiredLocked drops entries whose TTL has lapsed, oldest expiry first.
+// max <= 0 reaps everything due; a positive max bounds the work one call can do
+// so a mass expiry can't stall a single Set inside the exclusive lock (the
+// remainder is reaped by the next call — the amortized cost is O(1) per insert
+// either way). Caller holds c.mu.
+func (c *InMemoryCache) reapExpiredLocked(now time.Time, max int) {
+	for n := 0; len(c.expiry) > 0 && (max <= 0 || n < max); n++ {
+		top := c.expiry[0]
+		if top.ExpiresAt.IsZero() || !now.After(top.ExpiresAt) {
+			return
+		}
+		c.removeEntryLocked(top)
+	}
+}
+
+// entryMemEstimate is the rough per-entry accounting Stats().MemoryUsage
+// reports (keys + string payloads + fixed overhead), computed once at insert
+// so Stats does not have to walk the map.
+func entryMemEstimate(key string, value interface{}) int64 {
+	mem := int64(len(key)) + 64 // fixed bookkeeping estimate per entry
+	if s, ok := value.(string); ok {
+		return mem + int64(len(s))
+	}
+	return mem + 100 // opaque non-string payload estimate
 }
 
 // Close properly stops the cache and cleans up resources
@@ -727,41 +1245,58 @@ func (c *InMemoryCache) Get(key string) (interface{}, bool) {
 	// Check if expired (a zero ExpiresAt never expires: TTL <= 0). Delete it
 	// here so expired entries don't linger (and inflate Size) when no
 	// periodic cleanup runs — e.g. CleanupInterval <= 0.
-	if !entry.ExpiresAt.IsZero() && time.Now().After(entry.ExpiresAt) {
-		delete(c.entries, key)
+	now := time.Now()
+	if !entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt) {
+		c.removeEntryLocked(entry)
 		c.misses++
 		return nil, false
 	}
 
 	entry.HitCount++
-	entry.LastAccessedAt = time.Now()
+	entry.LastAccessedAt = now
+	c.lruUnlink(entry)
+	c.lruPushFront(entry)
 	c.hits++
 	return entry.Data, true
 }
 
-// Set stores a value in the cache
+// Set stores a value in the cache.
+//
+// It does NOT consult config.Enabled: the flag only ever made an injected cache
+// whose config omitted Enabled silently write-dead (every Set a no-op, Get
+// still counting misses, nothing ever erroring), and CachePlugin already gates
+// on its own Enabled before calling here.
 func (c *InMemoryCache) Set(key string, value interface{}, ttl time.Duration) {
-	if !c.config.Enabled {
-		return
-	}
-
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	now := time.Now()
+	// Reclaim what the TTL has already invalidated. Without this, expired
+	// entries were freed only by a Get on the SAME key or by the optional
+	// cleanup goroutine, so a workload of distinct keys (one per untrusted
+	// filter string) grew the map for the life of the process while Stats()
+	// reported the cache as empty.
+	c.reapExpiredLocked(now, 32)
+
+	if old, exists := c.entries[key]; exists {
+		// Overwriting an existing key doesn't grow the map, so it must never
+		// evict an unrelated entry.
+		c.removeEntryLocked(old)
+	}
 	// Check size limit. MaxSize <= 0 means unlimited; without this guard a
 	// zero MaxSize would evict on every Set, pinning the cache to one entry.
-	// Overwriting an existing key doesn't grow the map, so it must never
-	// evict an unrelated entry.
-	if _, exists := c.entries[key]; !exists && c.config.MaxSize > 0 && len(c.entries) >= c.config.MaxSize {
+	if c.config.MaxSize > 0 && len(c.entries) >= c.config.MaxSize {
 		c.evictLRU()
 	}
 
-	now := time.Now()
 	entry := &CacheEntry{
 		Data:           value,
 		CreatedAt:      now,
 		LastAccessedAt: now,
 		HitCount:       0,
+		key:            key,
+		heapIdx:        -1,
+		memBytes:       entryMemEstimate(key, value),
 	}
 	// TTL <= 0 means "never expires" (zero ExpiresAt). Storing now.Add(0)
 	// created entries that were already expired on arrival, so an enabled
@@ -770,13 +1305,20 @@ func (c *InMemoryCache) Set(key string, value interface{}, ttl time.Duration) {
 		entry.ExpiresAt = now.Add(ttl)
 	}
 	c.entries[key] = entry
+	c.lruPushFront(entry)
+	c.memBytes += entry.memBytes
+	if !entry.ExpiresAt.IsZero() {
+		heap.Push(&c.expiry, entry)
+	}
 }
 
 // Delete removes a value from the cache
 func (c *InMemoryCache) Delete(key string) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	delete(c.entries, key)
+	if e, ok := c.entries[key]; ok {
+		c.removeEntryLocked(e)
+	}
 }
 
 // Clear removes all entries from the cache
@@ -784,16 +1326,26 @@ func (c *InMemoryCache) Clear() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.entries = make(map[string]*CacheEntry)
+	c.mru, c.lru = nil, nil
+	c.expiry = nil
+	c.memBytes = 0
 }
 
 // Stats returns cache performance statistics. Size counts only LIVE entries:
-// with no periodic cleanup, expired entries linger in the map until a Get
-// touches them, and counting those reported a fuller cache than callers can
-// ever hit. MemoryUsage stays a rough estimate (keys + string payloads + a
-// fixed per-entry overhead), not an exact accounting.
+// expired entries that no Get has touched are reclaimed here first, so the
+// numbers describe what callers can actually hit. MemoryUsage stays a rough
+// estimate (keys + string payloads + a fixed per-entry overhead), not an exact
+// accounting.
+//
+// It takes the exclusive lock (Get needs one anyway) and both figures are
+// maintained incrementally, so a metrics loop no longer walks every entry
+// inside the lock — that scan cost milliseconds on a large cache and blocked
+// every concurrent Get for its duration.
 func (c *InMemoryCache) Stats() CacheStats {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	c.reapExpiredLocked(time.Now(), 0)
 
 	total := c.hits + c.misses
 	hitRate := float64(0)
@@ -801,47 +1353,29 @@ func (c *InMemoryCache) Stats() CacheStats {
 		hitRate = float64(c.hits) / float64(total)
 	}
 
-	now := time.Now()
-	size := 0
-	var mem int64
-	for key, entry := range c.entries {
-		if !entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt) {
-			continue
-		}
-		size++
-		mem += int64(len(key)) + 64 // fixed bookkeeping estimate per entry
-		if s, ok := entry.Data.(string); ok {
-			mem += int64(len(s))
-		} else {
-			mem += 100 // opaque non-string payload estimate
-		}
-	}
-
 	return CacheStats{
 		Hits:        c.hits,
 		Misses:      c.misses,
-		Size:        size,
+		Size:        len(c.entries),
 		HitRate:     hitRate,
-		MemoryUsage: mem,
+		MemoryUsage: c.memBytes,
 	}
 }
 
 // evictLRU removes the least recently used entry (by last access time, not
 // creation time — otherwise a hot early entry would be evicted before a cold
 // later one, i.e. FIFO rather than LRU).
+//
+// The victim is the tail of the recency list. The previous implementation
+// scanned the entire map on every insert at capacity — O(MaxSize) of CPU inside
+// the exclusive lock per cache miss, so configuring MORE cache made every miss
+// slower — and it used the zero value of the key as its "nothing chosen yet"
+// sentinel, which made an empty-string key either shield the true victim or
+// skip the eviction altogether (the cache then grew past MaxSize without
+// bound). Caller holds c.mu.
 func (c *InMemoryCache) evictLRU() {
-	var oldestKey string
-	var oldestTime time.Time
-
-	for key, entry := range c.entries {
-		if oldestKey == "" || entry.LastAccessedAt.Before(oldestTime) {
-			oldestKey = key
-			oldestTime = entry.LastAccessedAt
-		}
-	}
-
-	if oldestKey != "" {
-		delete(c.entries, oldestKey)
+	if c.lru != nil {
+		c.removeEntryLocked(c.lru)
 	}
 }
 
@@ -860,17 +1394,12 @@ func (c *InMemoryCache) cleanup() {
 	}
 }
 
-// cleanupExpired removes expired entries
+// cleanupExpired removes expired entries. It walks the expiry heap rather than
+// the whole map, so the lock is held for O(expired) work instead of O(size).
 func (c *InMemoryCache) cleanupExpired() {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-
-	now := time.Now()
-	for key, entry := range c.entries {
-		if !entry.ExpiresAt.IsZero() && now.After(entry.ExpiresAt) {
-			delete(c.entries, key)
-		}
-	}
+	c.reapExpiredLocked(time.Now(), 0)
 }
 
 // Stop stops the cleanup goroutine. Safe to call multiple times (and alongside

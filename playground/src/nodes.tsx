@@ -146,6 +146,15 @@ export function SortNode({ id, data }: NodeProps) {
   )
 }
 
+/**
+ * `min={0}` on a number input is validation-only — the browser still lets a
+ * negative value through, and figo normalises `take:-3` to "no limit" without a
+ * diagnostic. Clamp on the way in so the node can never hold a negative bound.
+ */
+function nonNegative(raw: string): number {
+  return Math.max(0, Number(raw) || 0)
+}
+
 export function PageNode({ id, data }: NodeProps) {
   const { updateNodeData } = useReactFlow()
   return (
@@ -162,7 +171,7 @@ export function PageNode({ id, data }: NodeProps) {
             type="number"
             min={0}
             value={Number(data.skip ?? 0)}
-            onChange={(e) => updateNodeData(id, { skip: Number(e.target.value) })}
+            onChange={(e) => updateNodeData(id, { skip: nonNegative(e.target.value) })}
           />
         </label>
         <label>
@@ -172,7 +181,7 @@ export function PageNode({ id, data }: NodeProps) {
             type="number"
             min={0}
             value={Number(data.take ?? 20)}
-            onChange={(e) => updateNodeData(id, { take: Number(e.target.value) })}
+            onChange={(e) => updateNodeData(id, { take: nonNegative(e.target.value) })}
           />
         </label>
       </div>

@@ -170,11 +170,12 @@ func parsedExprLooksClean(e figo.Expr) bool {
 	case figo.RegexExpr:
 		return cleanParsedField(x.Field) && cleanParsedValue(x.Value)
 	case figo.InExpr:
-		return cleanParsedField(x.Field) && cleanParsedValues(x.Values)
+		return cleanParsedField(x.Field) && cleanParsedValues(x.Values) && !foldedDelimiter(x.Values, "[")
 	case figo.NotInExpr:
-		return cleanParsedField(x.Field) && cleanParsedValues(x.Values)
+		return cleanParsedField(x.Field) && cleanParsedValues(x.Values) && !foldedDelimiter(x.Values, "[")
 	case figo.BetweenExpr:
-		return cleanParsedField(x.Field) && cleanParsedValue(x.Low) && cleanParsedValue(x.High)
+		return cleanParsedField(x.Field) && cleanParsedValue(x.Low) && cleanParsedValue(x.High) &&
+			!foldedDelimiter([]any{x.Low}, "(")
 	case figo.IsNullExpr:
 		return cleanParsedField(x.Field)
 	case figo.NotNullExpr:
@@ -226,6 +227,78 @@ func cleanParsedValues(vs []any) bool {
 	return true
 }
 
+// foldedDelimiter reports the parse artifact of an UNCLOSED list or range: the
+// parser folds the opening delimiter into the first element rather than
+// diagnosing it, so `x<in>[1,2` becomes In(x, ["[1", 2]) and `x<bet>(1..2`
+// becomes Between(x, "(1", 2) with no BuildE diagnostic at all. A well-formed
+// list has its delimiter stripped, so a leading '[' / '(' on the FIRST value
+// marks input the gate must keep rejecting. (A quoted value that genuinely
+// starts with the delimiter, `x<in>["[a",2]`, is balanced and never reaches
+// the gate.)
+func foldedDelimiter(values []any, open string) bool {
+	if len(values) == 0 {
+		return false
+	}
+	s, ok := values[0].(string)
+	return ok && strings.HasPrefix(s, open)
+}
+
+// bracketSwallowsTail reports whether input carries an unmatched '[' OUTSIDE
+// quotes with more input after it. That is the exact tokenizer state in which
+// the token holding the bracket never ends: bracket depth stays above zero, so
+// the token runs to end-of-input and absorbs every following token — connector
+// and all. `not name=[x and tenant_id=42` parses to Not(Eq(name, "[x and
+// tenant_id=42")): the tenant conjunct is GONE, and the parser emits no
+// diagnostic for it, so neither parserAcceptsCleanly (which only sees a
+// plausible-looking one-clause tree) nor BuildE can tell. Hunt #8 P8-1 — strict
+// mode accepted that input and returned another tenant's row. So this class
+// stays UNGATED, exactly as it was before the gate was widened.
+//
+// Whitespace is the discriminator, and it is not a heuristic: connectors are
+// whitespace-delimited, so if any whitespace follows the unmatched '[', at
+// least one token the parser would otherwise have read separately has been
+// absorbed. With no whitespace after it nothing can have been swallowed, so
+// `status=[draft` and `x<in>[1,2` remain gate-eligible — the first is the
+// hunt-#7 A5/A7-1 acceptance (a lone bracket genuinely part of a value) and the
+// second is still rejected, by foldedDelimiter, which is the check that exists
+// for unclosed lists. Parens are deliberately not treated this way: an
+// unmatched '(' in a value does NOT extend the token (`b=(x and c=3` parses to
+// two clauses), and gating it is what makes `phone=^(555` acceptable.
+func bracketSwallowsTail(input string) bool {
+	depth := 0
+	inQuote := false
+	outermostOpen := -1
+	for i, char := range input {
+		if char == '"' {
+			inQuote = !inQuote
+			continue
+		}
+		if inQuote {
+			continue
+		}
+		switch char {
+		case '[':
+			if depth == 0 {
+				outermostOpen = i
+			}
+			depth++
+		case ']':
+			// An unmatched closer is a separate (gate-eligible) class and must
+			// not cancel a later opener: `b=x]y[z and c=3` swallows too.
+			if depth > 0 {
+				depth--
+				if depth == 0 {
+					outermostOpen = -1
+				}
+			}
+		}
+	}
+	if depth == 0 || outermostOpen < 0 {
+		return false
+	}
+	return strings.ContainsAny(input[outermostOpen+1:], " \t\r\n\v\f")
+}
+
 // doubledEqualsValue reports the parse artifact of a doubled equality
 // operator: the parser folds the second '=' into the value (`a==b` becomes
 // Eq(a, "=b")), so an unquoted equality value starting with '=' marks input
@@ -242,16 +315,32 @@ func validateDSLSyntax(input string) error {
 }
 
 // validateDSLSyntaxClassified reports the first validation failure plus
-// whether that failure class is gate-ELIGIBLE. Quote, doubled-equality and
-// trailing-operator checks over-approximate the parser's grammar and may be
-// overridden by the parse-validity gate when the core parser accepts the
-// input as-is. Paren/bracket imbalance and dangling/leading connectors are
-// never gated: the parser silently ignores stray parens and drops dangling
-// connectors, so "parses cleanly" proves nothing for those classes.
+// whether that failure class is gate-ELIGIBLE. Quote, paren, bracket,
+// doubled-equality and trailing-operator checks all over-approximate the
+// parser's grammar and may be overridden by the parse-validity gate when the
+// core parser accepts the input as-is.
+//
+// Paren/bracket imbalance used to be ungated on the argument that "the parser
+// silently ignores stray parens, so parses-cleanly proves nothing". That is
+// stale: the parser now DIAGNOSES genuine imbalance ("1 unclosed '(' group(s)
+// auto-closed", "unmatched ')' ignored", "unclosed load= directive"), which
+// parserAcceptsCleanly checks via BuildE — so it distinguishes a structural
+// imbalance from a bracket that is merely part of an unquoted VALUE. Ungated,
+// a lone bracket in a value (phone=^(555, code=x], qty>2]) was rejected
+// outright in strict mode and silently REWRITTEN in repair mode: the fixers
+// delete an unmatched closer wherever it sits and append the missing one at
+// end-of-input, so `code=x]` queried `x` and `qty>2]` flipped the bound
+// argument from string "2]" to int64 2, turning a 0-row query into a
+// full-table scan.
+//
+// Only the dangling/leading connector checks stay ungated (see
+// basicSyntaxChecks): a dangling `and` is silently DROPPED by the parser, so
+// "parses cleanly" really does prove nothing there — plus the one bracket state
+// where "parses cleanly" is actively misleading (bracketSwallowsTail).
 func validateDSLSyntaxClassified(input string) (error, bool) {
 	// Validate parentheses with position tracking
 	if err := validateParenthesesWithPosition(input); err != nil {
-		return err, false
+		return err, true
 	}
 
 	// Validate quotes with position tracking
@@ -261,7 +350,11 @@ func validateDSLSyntaxClassified(input string) (error, bool) {
 
 	// Validate brackets for load expressions
 	if err := validateBrackets(input); err != nil {
-		return err, false
+		// One bracket state must NEVER be gated: an unmatched '[' with more
+		// input after it does not merely look imbalanced, it deletes the rest
+		// of the query (bracketSwallowsTail). The gate cannot see that — the
+		// parser folds the whole tail into one value and reports nothing.
+		return err, !bracketSwallowsTail(input)
 	}
 
 	// Validate basic syntax patterns
@@ -279,8 +372,14 @@ var syntaxRepairs = []struct {
 	{regexp.MustCompile(`\s+and\s*$`), "", "Remove trailing AND"},
 	{regexp.MustCompile(`\s+or\s*$`), "", "Remove trailing OR"},
 	{regexp.MustCompile(`\s+not\s*$`), "", "Remove trailing NOT"},
-	{regexp.MustCompile(`^\s*and\b`), "", "Remove leading AND"},
-	{regexp.MustCompile(`^\s*or\b`), "", "Remove leading OR"},
+	// A TOKEN boundary, not a regex word boundary: `\b` also fires on a FIELD
+	// NAME that merely starts with and/or followed by a non-word byte, and
+	// figo supports dot-segmented identifiers. `or.id=5 and tenant_id=42` was
+	// rewritten to `.id=5 and tenant_id=42` — silently filtering a DIFFERENT
+	// column — and `or=5` to `=5`, an unfiltered scan. Only whitespace (or
+	// end-of-input) can end a connector token.
+	{regexp.MustCompile(`^\s*and(\s|$)`), "", "Remove leading AND"},
+	{regexp.MustCompile(`^\s*or(\s|$)`), "", "Remove leading OR"},
 }
 
 // attemptInputRepair tries to fix common malformed input patterns
@@ -327,6 +426,15 @@ func attemptInputRepair(input string) (string, error) {
 	// Validate the fixed input
 	if err := validateDSLSyntax(fixed); err != nil {
 		return original, fmt.Errorf("repair failed validation: %w", err)
+	}
+
+	// A repair is only worth accepting if what it produced actually parses
+	// cleanly. Balanced-looking output is not enough: closing `t>"` into
+	// `t>""` satisfies every structural check while parsing to the empty
+	// value parsedExprLooksClean exists to refuse, so repair emitted exactly
+	// the artifact the strict path rejects.
+	if !parserAcceptsCleanly(fixed) {
+		return original, fmt.Errorf("repair produced input the parser does not accept cleanly")
 	}
 
 	return fixed, nil
@@ -415,30 +523,33 @@ func validateParenthesesWithPosition(expr string) error {
 	return nil
 }
 
-// validateQuotes checks if quotes are properly matched
+// validateQuotes checks if quotes are properly matched.
+//
+// The core parser has exactly ONE quote rune, the double quote. Modelling the
+// apostrophe as a second
+// quote character invented state the parser does not have: a possessive
+// apostrophe (name=O'Brien, note=don't) opened a "quote" that was never
+// closed, and fixUnmatchedQuotes then appended a closing apostrophe at end-of-input
+// — landing inside whatever token happened to be last. `a=b' and (c=1` became
+// `a=b' and (c=1')`, corrupting an UNRELATED predicate (int64 1 -> string
+// "1'"), and `note=don't and b=` FABRICATED the predicate b = "'" out of a
+// missing operand.
 func validateQuotes(expr string) bool {
 	inQuotes := false
-	quoteChar := rune(0)
 
 	for _, char := range expr {
-		if char == '"' || char == '\'' {
-			if !inQuotes {
-				inQuotes = true
-				quoteChar = char
-			} else if char == quoteChar {
-				inQuotes = false
-				quoteChar = 0
-			}
+		if char == '"' {
+			inQuotes = !inQuotes
 		}
 	}
 
 	return !inQuotes // All quotes properly closed
 }
 
-// validateQuotesWithPosition checks quotes with detailed error reporting
+// validateQuotesWithPosition checks quotes with detailed error reporting,
+// modelling the parser's single quote rune (see validateQuotes).
 func validateQuotesWithPosition(expr string) error {
 	inQuotes := false
-	quoteChar := rune(0)
 	line := 1
 	column := 1
 	var quoteStartPos int
@@ -451,14 +562,12 @@ func validateQuotesWithPosition(expr string) error {
 			column++
 		}
 
-		if char == '"' || char == '\'' {
+		if char == '"' {
 			if !inQuotes {
 				inQuotes = true
-				quoteChar = char
 				quoteStartPos = i
-			} else if char == quoteChar {
+			} else {
 				inQuotes = false
-				quoteChar = 0
 			}
 		}
 	}
@@ -573,8 +682,10 @@ var basicSyntaxChecks = []struct {
 	{regexp.MustCompile(`=\s*$`), "incomplete equality expression", "Add value after =", true},
 	{regexp.MustCompile(`>\s*$`), "incomplete greater than expression", "Add value after >", true},
 	{regexp.MustCompile(`<\s*$`), "incomplete less than expression", "Add value after <", true},
-	{regexp.MustCompile(`^\s*and\b`), "expression starts with AND", "Remove AND or add field before it", false},
-	{regexp.MustCompile(`^\s*or\b`), "expression starts with OR", "Remove OR or add field before it", false},
+	// Token boundary, not `\b` — see syntaxRepairs: `or.id=5` and `and-x=1`
+	// are legal DSL naming real columns, not dangling connectors.
+	{regexp.MustCompile(`^\s*and(\s|$)`), "expression starts with AND", "Remove AND or add field before it", false},
+	{regexp.MustCompile(`^\s*or(\s|$)`), "expression starts with OR", "Remove OR or add field before it", false},
 }
 
 // validateBasicSyntax checks for common syntax errors
@@ -707,36 +818,22 @@ func fixUnmatchedParentheses(input string) string {
 	return result.String()
 }
 
-// fixUnmatchedQuotes attempts to fix unmatched quotes
+// fixUnmatchedQuotes closes a dangling '"' at end-of-input. Only '"' is a
+// quote to the core parser (see validateQuotes) — appending an apostrophe closed a
+// quote the parser never opened and corrupted an unrelated predicate's value.
 func fixUnmatchedQuotes(input string) string {
 	inQuotes := false
-	quoteChar := rune(0)
-	result := strings.Builder{}
 
 	for _, char := range input {
-		if char == '"' || char == '\'' {
-			if !inQuotes {
-				inQuotes = true
-				quoteChar = char
-				result.WriteRune(char)
-			} else if char == quoteChar {
-				inQuotes = false
-				quoteChar = 0
-				result.WriteRune(char)
-			} else {
-				result.WriteRune(char)
-			}
-		} else {
-			result.WriteRune(char)
+		if char == '"' {
+			inQuotes = !inQuotes
 		}
 	}
 
-	// Add missing closing quote
-	if inQuotes {
-		result.WriteRune(quoteChar)
+	if !inQuotes {
+		return input
 	}
-
-	return result.String()
+	return input + "\""
 }
 
 // fixUnmatchedBrackets attempts to fix unmatched brackets, leaving brackets

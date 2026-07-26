@@ -1,15 +1,19 @@
 name: Go tests
 
+# `**.md` is deliberately NOT ignored any more. README.md and
+# PLUGIN_SYSTEM_GUIDE.md are now machine-checked by examples/doccontract, which
+# reads them and fails when a claim the code no longer honours reappears. Ignoring
+# .md meant a doc-only edit ran no check at all — and a doc-only edit
+# reintroducing a false contract is exactly what that package exists to catch.
+# playground/README.md is still covered by the playground/** entry.
 on:
   push:
     branches: [main]
     paths-ignore:
       - "playground/**"
-      - "**.md"
   pull_request:
     paths-ignore:
       - "playground/**"
-      - "**.md"
 
 jobs:
   test:
@@ -21,6 +25,9 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Build
+        run: go build ./...
+
       - name: Vet
         run: go vet ./...
 
@@ -29,3 +36,15 @@ jobs:
 
       - name: Test (race detector)
         run: go test -race ./...
+
+      # examples/example_usage.go is the one end-to-end artifact a new user copies,
+      # and CI only ever COMPILED it. Compiling is close to no coverage here: every
+      # failure mode it has is a runtime one, and the Elasticsearch adapter reports
+      # a query it could not render as ok=true with a fail-closed match_none body —
+      # so a broken example still prints nine tidy documents and "All examples
+      # completed!". verifyexample asserts on the claims the output itself makes.
+      # `shell: bash` is required for pipefail, or the pipe would hide a crash in
+      # the example and only the verifier's exit status would count.
+      - name: Run and verify the end-to-end example
+        shell: bash
+        run: go run ./examples/ | go run ./examples/verifyexample

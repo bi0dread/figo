@@ -11,6 +11,15 @@ import (
 // clauses (e.g. ScopePlugin's mandatory tenant filter) that are not part of
 // the user's input, and counting or validating them wrongly rejected
 // legitimate DSL that was within limits on its own.
+//
+// REPEAT INVOCATION: because the filters are kept, every registered ExprFilter
+// runs once per inspection Build IN ADDITION to the caller's own Build — with
+// both LimitsPlugin and ValidationPlugin registered, three times per parse.
+// An ExprFilter must therefore be a pure function of the expression it is
+// given: it must not count, log, mutate external state, or assume it sees each
+// expression exactly once. (Reducing the count needs a core change — one
+// shared parsed tree handed to the AfterParse hooks instead of a clone-and-
+// rebuild per plugin — so it is documented rather than worked around here.)
 func cloneForInspection(f figo.Figo) figo.Figo {
 	c := f.Clone()
 	src := f.GetPluginManager()

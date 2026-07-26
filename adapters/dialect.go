@@ -3,6 +3,7 @@ package adapters
 import (
 	figo "github.com/bi0dread/figo/v4"
 
+	"fmt"
 	"strings"
 )
 
@@ -97,6 +98,36 @@ func (d *SQLDialect) quoteIdent(ident string) string {
 	return q + strings.ReplaceAll(ident, q, q+q) + q
 }
 
+// validateIdent rejects identifiers that quoting cannot turn into executable
+// SQL. quoteIdent doubles the quote rune — that is the injection defense and it
+// holds — but two classes of input survive it and still produce a syntax error
+// at the engine, with BuildE nil and ok=true so the caller cannot tell:
+//
+//   - C0 control bytes. A NUL in particular is the only byte of 0x00-0x7f that
+//     makes the rendered statement unparseable (`a<NUL>b` -> SQLite
+//     "unrecognized token"), and drivers that pass identifiers to the engine as
+//     C strings may instead TRUNCATE the name and read a different column.
+//   - an empty name or an empty dot segment ("", "...", reached from DSL as
+//     `...<0` / `sort=...:asc`), which render as zero-length delimited
+//     identifiers -- a bare quoted empty string, or one per dot segment --
+//     turns into a constant column.
+//
+// Failing closed here matches the rest of the adapter: an unrenderable input is
+// an error, never SQL that means something else.
+func validateIdent(kind, name string) error {
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c < 0x20 || c == 0x7f {
+			return fmt.Errorf("raw adapter: %s %q contains control byte 0x%02x", kind, name, c)
+		}
+	}
+	for _, seg := range strings.Split(name, ".") {
+		if seg == "" {
+			return fmt.Errorf("raw adapter: %s %q has an empty name segment", kind, name)
+		}
+	}
+	return nil
+}
+
 // escapeString escapes a value for embedding in a single-quoted SQL string
 // literal. Single quotes are doubled per ANSI SQL; backslashes are doubled
 // only on dialects that treat them as escapes.
@@ -109,8 +140,11 @@ func (d *SQLDialect) escapeString(s string) string {
 
 // numberPlaceholders rewrites ?-style binds to $1..$N, skipping quoted
 // regions (string literals and quoted identifiers) so a literal '?' inside
-// them is never renumbered.
-func numberPlaceholders(sql string) string {
+// them is never renumbered. On dialects where '\' escapes inside a string
+// literal (EscapeBackslash), a backslash consumes the next byte: a CustomExpr
+// fragment containing \' otherwise flipped the scanner out of the literal and
+// every following placeholder was mis-numbered.
+func numberPlaceholders(d *SQLDialect, sql string) string {
 	var b strings.Builder
 	b.Grow(len(sql) + 8)
 
@@ -120,6 +154,12 @@ func numberPlaceholders(sql string) string {
 	inBacktick := false
 	for i := 0; i < len(sql); i++ {
 		ch := sql[i]
+		if ch == '\\' && inSingle && d.EscapeBackslash && i+1 < len(sql) {
+			b.WriteByte(ch)
+			i++
+			b.WriteByte(sql[i])
+			continue
+		}
 		if ch == '\'' && !inDouble && !inBacktick {
 			inSingle = !inSingle
 		} else if ch == '"' && !inSingle && !inBacktick {
@@ -150,12 +190,24 @@ func itoa(n int) string {
 	return string(digits)
 }
 
-// rawDialectOf resolves the dialect for rendering: the RawAdapter's dialect
-// when one is configured on the instance, MySQL otherwise (also the fallback
-// for the package-level Build* helpers used without a raw adapter).
+// rawDialectOf resolves the dialect from the INSTANCE's adapter. It is for the
+// receiver-less package-level Build* helpers only — the RawAdapter methods
+// thread their own receiver's dialect instead, because an instance built with
+// nil (or with a different adapter, or via SetAdapterObject after the fact)
+// carries no RawAdapter to read, and the resulting mix of MySQL quoting with
+// the receiver's $n placeholders is valid on no engine.
+//
+// Both the value and the pointer form are accepted: *RawAdapter satisfies
+// figo.Adapter through the value receivers, so asserting only the value type
+// silently fell back to MySQL for a caller who wrote Build(&RawAdapter{...}).
 func rawDialectOf(f figo.Figo) *SQLDialect {
-	if ra, ok := f.GetAdapterObject().(RawAdapter); ok {
+	switch ra := f.GetAdapterObject().(type) {
+	case RawAdapter:
 		return ra.dialect()
+	case *RawAdapter:
+		if ra != nil {
+			return ra.dialect()
+		}
 	}
 	return MySQLDialect
 }

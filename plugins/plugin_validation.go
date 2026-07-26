@@ -125,8 +125,12 @@ func (p *ValidationPlugin) Validate(field string, value any) error {
 }
 
 // validateAs runs every rule whose Field matches: verbatim, as "*", or (when
-// fn is non-nil) in its naming-converted form — so the same registration
-// spelling works for ValidationPlugin and FieldsPlugin alike.
+// fn is non-nil) in its naming-converted, case-folded or table-qualified form
+// — so the same registration spelling works for ValidationPlugin and
+// FieldsPlugin alike. Rules are a DENY control, so they match on the same
+// canonical form FieldsPlugin's ignore list uses (newDenyMatcher): matching by
+// raw string equality let `Password="x"` and `probe_users.password="x"` switch
+// a rule on `password` off while hitting that very column.
 //
 // A matching rule with neither a Handler nor a registered validator for its
 // Rule name FAILS the validation: silently skipping it (the old behavior)
@@ -147,7 +151,7 @@ func (p *ValidationPlugin) validateAs(fn figo.NamingFunc, field string, value an
 	for _, rule := range rules {
 		match := rule.Field == field || rule.Field == "*"
 		if !match && fn != nil {
-			match = fn(rule.Field) == field
+			match = newDenyMatcher([]string{rule.Field}, fn)(field)
 		}
 		if !match {
 			continue
@@ -235,13 +239,21 @@ func (v RequiredValidator) Validate(field, rule string, value any) error {
 }
 func (v RequiredValidator) GetRuleName() string { return "required" }
 
+// The string-shaped built-ins FAIL CLOSED on a value of another dynamic type.
+// The DSL's literal form decides the parsed Go type (email=12345 is an int64,
+// email=2024-01-31 a time.Time), so skipping the check for "not a string"
+// let the caller of an untrusted DSL switch the rule off by choosing the
+// literal form — the same way a typo in a rule name used to, which :162-165
+// already refuses.
 type MinLengthValidator struct{}
 
 func (v MinLengthValidator) Validate(field, rule string, value any) error {
-	if str, ok := value.(string); ok {
-		if len(str) < 3 { // Example minimum length
-			return fmt.Errorf("field %s must be at least 3 characters", field)
-		}
+	str, ok := value.(string)
+	if !ok {
+		return fmt.Errorf("field %s must be a string", field)
+	}
+	if len(str) < 3 { // Example minimum length
+		return fmt.Errorf("field %s must be at least 3 characters", field)
 	}
 	return nil
 }
@@ -250,10 +262,12 @@ func (v MinLengthValidator) GetRuleName() string { return "min_length" }
 type EmailValidator struct{}
 
 func (v EmailValidator) Validate(field, rule string, value any) error {
-	if str, ok := value.(string); ok {
-		if !strings.Contains(str, "@") {
-			return fmt.Errorf("field %s must be a valid email", field)
-		}
+	str, ok := value.(string)
+	if !ok {
+		return fmt.Errorf("field %s must be a valid email", field)
+	}
+	if !strings.Contains(str, "@") {
+		return fmt.Errorf("field %s must be a valid email", field)
 	}
 	return nil
 }

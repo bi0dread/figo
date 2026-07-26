@@ -99,13 +99,18 @@ func TestAuditPlugin(t *testing.T) {
 		q := f.GetQuery(RawContext{Table: "t"}).(SQLQuery)
 
 		h := ap.History()
-		require.Len(t, h, 3)
-		assert.Equal(t, "parse", h[0].Kind)
+		// A "parse-attempt" entry (the DSL as received, recorded in
+		// BeforeParse) now precedes every "parse" entry.
+		require.Len(t, h, 4)
+		assert.Equal(t, "parse-attempt", h[0].Kind)
 		assert.Equal(t, `id=1`, h[0].DSL)
-		assert.Equal(t, "query", h[1].Kind)
-		assert.Equal(t, sql, h[1].Result, "GetSqlString render is captured verbatim")
+		assert.Equal(t, "parse", h[1].Kind)
+		assert.Equal(t, `id=1`, h[1].DSL)
 		assert.Equal(t, "query", h[2].Kind)
-		assert.Equal(t, q.SQL, h[2].Result, "GetQuery captures the parameterized SQL")
+		assert.Equal(t, sql, h[2].Result, "GetSqlString render is captured verbatim")
+		assert.Equal(t, "query", h[3].Kind)
+		assert.Equal(t, q.SQL, h[3].Result, "GetQuery captures the parameterized SQL")
+		assert.Equal(t, q.Args, h[3].Args, "the bound values are recorded, not just the shape")
 	})
 
 	t.Run("HistoryIsBounded", func(t *testing.T) {
@@ -119,7 +124,11 @@ func TestAuditPlugin(t *testing.T) {
 
 		h := ap.History()
 		require.Len(t, h, 2, "history must stay at its bound")
-		assert.Equal(t, `b=2`, h[0].DSL, "oldest entries evicted first")
+		// Each parse records two entries (attempt + parse), so the bound of 2
+		// leaves exactly the last call's pair.
+		assert.Equal(t, "parse-attempt", h[0].Kind, "oldest entries evicted first")
+		assert.Equal(t, `c=3`, h[0].DSL)
+		assert.Equal(t, "parse", h[1].Kind)
 		assert.Equal(t, `c=3`, h[1].DSL)
 
 		ap.Clear()

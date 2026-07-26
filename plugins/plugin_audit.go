@@ -29,6 +29,14 @@ import (
 // case AddFiltersFromString rolls it back and returns the error. All
 // AfterParse hooks run regardless of each other's errors, so the attempt is
 // recorded consistently whatever order the plugins were registered in.
+//
+// A "parse-attempt" entry records the DSL exactly as the CALLER sent it,
+// before any BeforeParse hook has seen it. Without it, DSL rejected in
+// BeforeParse (SyntaxPlugin's strict mode) left no trace at all — malformed
+// and probing input was the one thing invisible to the trail — and with repair
+// enabled the only recorded DSL was the REPAIRED string, never what arrived.
+// BeforeParse hooks DO short-circuit on the first error, so register the
+// AuditPlugin BEFORE any plugin that can reject or rewrite in BeforeParse.
 type AuditPlugin struct {
 	mu      sync.RWMutex
 	logger  *slog.Logger
@@ -38,9 +46,10 @@ type AuditPlugin struct {
 
 // AuditEntry is one recorded parse or render event
 type AuditEntry struct {
-	Kind   string    // "parse" or "query"
-	DSL    string    // the parsed DSL (Kind "parse")
+	Kind   string    // "parse-attempt", "parse" or "query"
+	DSL    string    // the DSL: as received (Kind "parse-attempt"), as parsed (Kind "parse"), or the instance's current DSL (Kind "query")
 	Result string    // the rendered SQL / query description (Kind "query")
+	Args   []any     // the bound parameters, when the render was parameterized (Kind "query")
 	Ctx    string    // render context (Kind "query")
 	At     time.Time // when the event was recorded
 }
@@ -66,8 +75,16 @@ func (p *AuditPlugin) Initialize(figo.Figo) error { return nil }
 // BeforeQuery implements Plugin
 func (p *AuditPlugin) BeforeQuery(figo.Figo, any) error { return nil }
 
-// BeforeParse implements Plugin
-func (p *AuditPlugin) BeforeParse(_ figo.Figo, dsl string) (string, error) { return dsl, nil }
+// BeforeParse records the DSL as received and passes it through unchanged.
+// This is the only entry that survives a rejection or a rewrite by another
+// plugin's BeforeParse hook (see the type comment).
+func (p *AuditPlugin) BeforeParse(_ figo.Figo, dsl string) (string, error) {
+	p.record(AuditEntry{Kind: "parse-attempt", DSL: dsl, At: time.Now()})
+	if p.logger != nil {
+		p.logger.Info("figo: dsl received", "dsl", dsl)
+	}
+	return dsl, nil
+}
 
 // AfterParse records the parsed DSL
 func (p *AuditPlugin) AfterParse(_ figo.Figo, dsl string) error {
@@ -78,20 +95,34 @@ func (p *AuditPlugin) AfterParse(_ figo.Figo, dsl string) error {
 	return nil
 }
 
-// AfterQuery records the rendered statement
-func (p *AuditPlugin) AfterQuery(_ figo.Figo, ctx any, result interface{}) error {
+// AfterQuery records the rendered statement.
+//
+// On the parameterized path the SQL alone answers "what SHAPE ran?" but not
+// "what did it run against?" — the tenant id and the searched term live in
+// Args, so they are recorded alongside it. A Query type this plugin does not
+// model is printed with its CONTENTS (%+v): the old "%T" default rendered
+// Mongo and Elasticsearch entries as the bare string "adapters.MongoFindQuery",
+// which is zero information. The instance's DSL is carried onto the entry so a
+// rendered statement can be tied back to the parse it came from.
+func (p *AuditPlugin) AfterQuery(f figo.Figo, ctx any, result interface{}) error {
 	entry := AuditEntry{Kind: "query", Ctx: fmt.Sprintf("%v", ctx), At: time.Now()}
+	if f != nil {
+		entry.DSL = f.GetDSL()
+	}
 	switch r := result.(type) {
 	case string:
 		entry.Result = r
 	case figo.SQLQuery:
 		entry.Result = r.SQL
+		if len(r.Args) > 0 {
+			entry.Args = append([]any(nil), r.Args...)
+		}
 	default:
-		entry.Result = fmt.Sprintf("%T", r)
+		entry.Result = fmt.Sprintf("%+v", r)
 	}
 	p.record(entry)
 	if p.logger != nil {
-		p.logger.Info("figo: query rendered", "result", entry.Result, "ctx", entry.Ctx)
+		p.logger.Info("figo: query rendered", "result", entry.Result, "args", entry.Args, "ctx", entry.Ctx)
 	}
 	return nil
 }

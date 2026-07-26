@@ -27,11 +27,17 @@ func stageValue(pipe mongo.Pipeline, op string) (any, int) {
 // A2: the aggregation pipeline (the load= path) must carry sort= and page= as
 // $sort/$skip/$limit stages with BuildMongoFindOptions semantics.
 func TestMongoAggregatePipelineIncludesSortSkipLimit(t *testing.T) {
+	// Every relation needs a MongoJoin now: the old fallback emitted a $lookup
+	// with empty localField/foreignField that MongoDB rejects (error 40352), so
+	// the builder fails closed instead (hunt #6 H13).
+	joins := map[string]MongoJoin{
+		"orders": {From: "orders", LocalField: "_id", ForeignField: "user_id", As: "orders"},
+	}
 	t.Run("sort skip limit appended in order", func(t *testing.T) {
 		f := New()
 		require.NoError(t, f.AddFiltersFromString(`a=1 load=[orders:id=2] sort=id:desc page=skip:10,take:5`))
 		f.Build(MongoAdapter{})
-		pipe, err := BuildMongoAggregatePipeline(f, nil)
+		pipe, err := BuildMongoAggregatePipeline(f, joins)
 		require.NoError(t, err)
 
 		sortVal, sortIdx := stageValue(pipe, "$sort")
@@ -60,7 +66,7 @@ func TestMongoAggregatePipelineIncludesSortSkipLimit(t *testing.T) {
 		f := New()
 		require.NoError(t, f.AddFiltersFromString(`a=1 load=[orders:id=2] page=skip:0,take:0`))
 		f.Build(MongoAdapter{})
-		pipe, err := BuildMongoAggregatePipeline(f, nil)
+		pipe, err := BuildMongoAggregatePipeline(f, joins)
 		require.NoError(t, err)
 		_, limitIdx := stageValue(pipe, "$limit")
 		assert.Equal(t, -1, limitIdx, "take:0 must not render $limit: %v", pipe)
@@ -72,7 +78,7 @@ func TestMongoAggregatePipelineIncludesSortSkipLimit(t *testing.T) {
 		f := New()
 		require.NoError(t, f.AddFiltersFromString(`a=1 load=[orders:id=2] sort=id:asc page=skip:3,take:7`))
 		f.Build(MongoAdapter{})
-		q, ok := MongoAdapter{}.GetQuery(f, nil, "AGG")
+		q, ok := MongoAdapter{}.GetQuery(f, joins, "AGG")
 		require.True(t, ok)
 		agg, ok := q.(MongoAggregateQuery)
 		require.True(t, ok)

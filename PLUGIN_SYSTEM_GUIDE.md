@@ -136,8 +136,11 @@ package main
 
 import (
     "fmt"
+    "log"
     "strings"
+
     "github.com/bi0dread/figo/v4"
+    "github.com/bi0dread/figo/v4/adapters"
 )
 
 type IdToIddPlugin struct {
@@ -227,7 +230,25 @@ func (p *IdToIddPlugin) replaceIdWithIdd(dsl string) string {
 func (p *IdToIddPlugin) Enable() { p.enabled = true }
 func (p *IdToIddPlugin) Disable() { p.enabled = false }
 func (p *IdToIddPlugin) IsEnabled() bool { return p.enabled }
+
+func main() {
+    f := figo.New()
+    if err := f.RegisterPlugin(NewIdToIddPlugin()); err != nil {
+        log.Fatal(err)
+    }
+    if err := f.AddFiltersFromString("id=1"); err != nil {
+        log.Fatal(err)
+    }
+    f.Build(adapters.RawAdapter{})
+
+    fmt.Println(f.GetSqlString(adapters.RawContext{Table: "users"}))
+    // SELECT * FROM `users` WHERE `idd` = 1 LIMIT 20
+}
 ```
+
+The block above is a runnable `package main` — drop it in `main.go` and
+`go run .`. The plugin type itself is backend-agnostic; only `func main` pulls
+in the `adapters` import.
 
 ## Built-in Plugins
 
@@ -372,9 +393,27 @@ if err != nil {
 
 ### 2. Plugin Manager
 
+> **`GetPluginManager()` always returns a usable manager and never returns
+> `nil`.** On an instance that has never registered a plugin you get an empty
+> manager, and the same holds for a `Clone()` of one and after
+> `SetPluginManager(nil)`. So code that introspects plugins on an arbitrary
+> instance — a health endpoint, a
+> `for _, p := range f.GetPluginManager().ListPlugins()` loop — needs no nil
+> check.
+>
+> The trap to avoid is the other direction: `f.GetPluginManager() == nil` is
+> never true, so it cannot mean "no plugins configured". Ask the manager
+> instead — `len(manager.ListPlugins()) == 0`, or
+> `_, ok := manager.GetPlugin("my-plugin")` for a specific one.
+
 ```go
-// Get plugin manager
+// Never nil — an instance with no plugins gets an empty manager.
 manager := f.GetPluginManager()
+
+// "Are any plugins configured?" is a question for the manager, not a nil check.
+if len(manager.ListPlugins()) == 0 {
+    return // nothing registered on this instance
+}
 
 // List all plugins
 plugins := manager.ListPlugins()
@@ -493,36 +532,42 @@ func (p *OptimizationPlugin) AfterParse(f figo.Figo, dsl string) error {
 
 ### Unit Testing
 ```go
-func TestMyPlugin(t *testing.T) {
-    plugin := NewMyPlugin()
-    
+func TestIdToIddPlugin(t *testing.T) {
+    plugin := NewIdToIddPlugin()
+
     // Test initialization
     f := figo.New()
     err := plugin.Initialize(f)
     assert.NoError(t, err)
-    
+
     // Test BeforeParse
     modifiedDSL, err := plugin.BeforeParse(f, "id=1")
     assert.NoError(t, err)
     assert.Equal(t, "idd=1", modifiedDSL)
-    
+
     // Test other hooks...
 }
 ```
 
 ### Integration Testing
+
+`ctx` is adapter-specific and is **required**: `RawAdapter` needs a table name
+(`"users"` or `adapters.RawContext{Table: "users"}`). A `ctx` the adapter cannot
+use makes the render fail, and `GetSqlString` reports that as `""` — so
+asserting on `GetSqlString(nil)` here would compare against the empty string.
+
 ```go
 func TestPluginIntegration(t *testing.T) {
     f := figo.New()
-    plugin := NewMyPlugin()
+    plugin := NewIdToIddPlugin()
     f.RegisterPlugin(plugin)
-    
+
     // Test with real queries
     f.AddFiltersFromString("id=1")
     f.Build(adapters.RawAdapter{})
-    
+
     // Verify plugin effects
-    sql := f.GetSqlString(nil)
+    sql := f.GetSqlString(adapters.RawContext{Table: "users"})
     assert.Contains(t, sql, "idd")
 }
 ```

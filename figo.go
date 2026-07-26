@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -124,6 +125,17 @@ const (
 	OperationNotNull  Operation = "<notnull>"
 )
 
+// operationDirective marks a parser node standing in for a consumed
+// sort=/page=/load= directive. It is internal (never produced by parseToken,
+// never rendered) and exists so the precedence pass can see WHERE a directive
+// sat in the token stream: a directive is not an operand, so the connector
+// written next to it ("a=1 and sort=id:asc") joins nothing. Without the marker
+// that connector reached reduceBinary unpaired and BuildE reported a
+// "dangling connector" for input the built query expressed in full — including
+// figo's own canonical examples — and a "not" written before a bare directive
+// jumped onto the FOLLOWING predicate and inverted it.
+const operationDirective Operation = "\x00directive"
+
 // AdapterType removed: adapters are selected via Adapter objects
 
 // Page is the pagination state: Skip rows to offset, Take rows to return.
@@ -168,6 +180,28 @@ type ExprFilter interface {
 // instance's lock (calling back into read methods is safe).
 type ClauseFinalizer interface {
 	FinalizeClauses(f Figo, clauses []Expr) []Expr
+}
+
+// PreloadFinalizer is an optional interface a Plugin may implement to
+// transform each preloaded relation's condition list at the end of every
+// Build, the way ClauseFinalizer transforms the top-level clauses.
+//
+// It exists because the two policy hooks were asymmetric: ExprFilter already
+// ran over preload conditions (so FieldsPlugin's pruning reached them), but
+// nothing could ADD to them, so a mandatory filter was structurally confined
+// to the top level. On GORM a preload is issued as a SEPARATE query, so a
+// ScopePlugin tenant filter guarded the parent rows and not the children.
+//
+// FinalizePreloads runs once per Build, after all ExprFilters and before
+// FinalizeClauses, outside the instance's lock. relation is the name as it
+// appeared in load=[relation:...]; returning an empty list drops the preload —
+// EXCEPT for a relation that was already unconditioned ("load=[Orders:]"),
+// where an empty result is a no-op and the relation is still preloaded. An
+// unconditioned preload has no conditions to remove, so "empty" cannot mean
+// "the finalizer removed them all" there, and treating it that way made merely
+// registering a plugin delete the preload.
+type PreloadFinalizer interface {
+	FinalizePreloads(f Figo, relation string, conditions []Expr) []Expr
 }
 
 // PluginManager manages plugins. Hooks run in REGISTRATION ORDER — the order
@@ -254,6 +288,20 @@ func (pm *PluginManager) ListPlugins() []Plugin {
 // user plugin code executes — a hook that calls back into the manager
 // (Register/Unregister/List) must not deadlock.
 
+// hasPlugins reports whether any plugin is registered. Build uses it to treat
+// an EMPTY manager exactly like no manager at all: GetPluginManager constructs
+// one lazily (so the documented ListPlugins/GetPlugin calls no longer panic on a
+// fresh instance), and without this a read-only-looking getter changed what the
+// next Build produced.
+func (pm *PluginManager) hasPlugins() bool {
+	if pm == nil {
+		return false
+	}
+	pm.mu.RLock()
+	defer pm.mu.RUnlock()
+	return len(pm.order) > 0
+}
+
 // ExecuteBeforeQuery executes all plugins' BeforeQuery hooks
 func (pm *PluginManager) ExecuteBeforeQuery(f Figo, ctx any) error {
 	for _, plugin := range pm.ListPlugins() {
@@ -274,15 +322,34 @@ func (pm *PluginManager) ExecuteAfterQuery(f Figo, ctx any, result any) error {
 	return nil
 }
 
-// ExecuteBeforeParse executes all plugins' BeforeParse hooks
+// ExecuteBeforeParse executes all plugins' BeforeParse hooks. Like
+// ExecuteAfterParse, every hook runs even when an earlier one errors: stopping
+// at the first error made observer plugins registration-order-dependent — an
+// AuditPlugin registered after a rejecting SyntaxPlugin never saw the rejected
+// DSL at all, so probing input was the one thing invisible to the audit trail.
+//
+// BeforeParse also TRANSFORMS the string, so this is not quite AfterParse's
+// shape: once a hook errors its output is discarded and the remaining hooks are
+// fed the last good DSL, which keeps them observing what the caller actually
+// sent rather than a half-applied rewrite. The first error is still the one
+// returned, and an error still rejects the DSL.
 func (pm *PluginManager) ExecuteBeforeParse(f Figo, dsl string) (string, error) {
 	modifiedDSL := dsl
+	var firstErr error
 	for _, plugin := range pm.ListPlugins() {
-		var err error
-		modifiedDSL, err = plugin.BeforeParse(f, modifiedDSL)
+		out, err := plugin.BeforeParse(f, modifiedDSL)
 		if err != nil {
-			return "", fmt.Errorf("plugin %s BeforeParse error: %w", plugin.Name(), err)
+			if firstErr == nil {
+				firstErr = fmt.Errorf("plugin %s BeforeParse error: %w", plugin.Name(), err)
+			}
+			continue
 		}
+		if firstErr == nil {
+			modifiedDSL = out
+		}
+	}
+	if firstErr != nil {
+		return "", firstErr
 	}
 	return modifiedDSL, nil
 }
@@ -315,6 +382,17 @@ func (pm *PluginManager) ExecuteExprFilters(f Figo, e Expr) Expr {
 		}
 	}
 	return e
+}
+
+// ExecutePreloadFinalizers runs every registered plugin that implements
+// PreloadFinalizer over one relation's condition list.
+func (pm *PluginManager) ExecutePreloadFinalizers(f Figo, relation string, conds []Expr) []Expr {
+	for _, plugin := range pm.ListPlugins() {
+		if fin, ok := plugin.(PreloadFinalizer); ok {
+			conds = fin.FinalizePreloads(f, relation, conds)
+		}
+	}
+	return conds
 }
 
 // ExecuteClauseFinalizers runs every registered plugin that implements
@@ -532,10 +610,20 @@ type GeoDistanceExpr struct {
 }
 
 // CustomExpr represents custom operations. The SQL adapters (raw and GORM)
-// invoke Handler with the Field exactly as held here (unquoted, not renamed),
+// invoke Handler with the Field exactly as held here (unquoted, unvalidated),
 // the Operator and the Value; it returns a SQL fragment with '?' placeholders
-// plus its bind args. The handler owns identifier quoting/naming. The MongoDB
-// and Elasticsearch adapters reject CustomExpr — its output is a SQL fragment.
+// plus its bind args. The handler owns identifier QUOTING. The MongoDB and
+// Elasticsearch adapters reject CustomExpr — its output is a SQL fragment.
+//
+// NAMING is not the handler's: AddFilter converts Field through the instance's
+// NamingFunc (per '.'-separated segment) before storing it, exactly as it does
+// for every other expression type — one statement must not contain two
+// spellings of the same identifier. So pass the ORIGINAL spelling
+// (CustomExpr{Field: "userName"} reaches a handler as "user_name" under the
+// default SnakeCaseNaming), and a handler that dispatches on the field name
+// should match the CONVERTED form. SetNamingFunc(NoChangeNaming) opts out.
+// Expressions handed to the adapters by other routes (Walk, a plugin's
+// FilterExpr) are rendered verbatim, unconverted.
 type CustomExpr struct {
 	Field    string
 	Operator string
@@ -570,6 +658,7 @@ type Figo interface {
 	GetNamingFunc() NamingFunc
 	SetPage(skip, take int)
 	SetPageString(v string)
+	SetPageStringE(v string) error
 	SetAdapterObject(adapter Adapter)
 	GetSelectFields() map[string]bool
 	GetClauses() []Expr
@@ -607,10 +696,32 @@ type figo struct {
 	dsl           string
 	namingFunc    NamingFunc // never nil; SnakeCaseNaming by default
 	adapterObj    Adapter
-	pageFromDSL   bool         // page came from a page= directive (vs SetPage), so a DSL replacement resets it
-	sortFromDSL   bool         // sort came from a sort= directive (vs SetSort), same rule as pageFromDSL
-	builtFromDSL  bool         // last Build materialized clause state from a DSL, so an empty-DSL rebuild must clear it
-	mu            sync.RWMutex // Mutex for concurrent access protection
+	pageFromDSL   pageOrigin // WHICH page components came from a page= directive (vs SetPage); a DSL replacement resets only those
+	sortFromDSL   bool       // sort came from a sort= directive (vs SetSort), same rule as pageFromDSL
+	builtFromDSL  bool       // last Build materialized clause state from a DSL, so an empty-DSL rebuild must clear it
+
+	// selectFieldsAsked is the projection the CALLER asked for, kept apart from
+	// the projection actually rendered. FieldsPlugin prunes the projection from
+	// a ClauseFinalizer, through the same public SetSelectFields the caller
+	// uses, so the pruned set used to overwrite the request permanently: once
+	// the whitelist narrowed it, widening the policy and rebuilding still
+	// rendered the narrowed set. Each Build now restores the request before the
+	// finalizers run, so pruning shapes one render instead of the instance.
+	// clausesAsked is the caller/DSL-derived clause list, kept apart from the
+	// list actually rendered — the same split selectFieldsAsked makes for the
+	// projection, and for the same reason. A ClauseFinalizer may legitimately
+	// replace the render with the never-true OrExpr{} (FieldsPlugin does this
+	// when every projected column is forbidden), but `f.clauses = finalized`
+	// made that pill the instance's authoritative list, so on a DSL-less
+	// instance it became the INPUT to the next render and no public call could
+	// recover it (AddFilter only appends, so the result stayed 1=0 forever).
+	// Each Build now re-derives the render from this list.
+	clausesAsked []Expr
+
+	selectFieldsAsked map[string]bool
+	inFinalize        bool // true while ClauseFinalizers run: SetSelectFields then writes the render only
+
+	mu sync.RWMutex // Mutex for concurrent access protection
 }
 
 // New constructs a new instance. Supply the adapter when you build:
@@ -619,7 +730,38 @@ func New() Figo {
 	return &figo{page: Page{
 		Skip: 0,
 		Take: 20,
-	}, preloads: make(map[string][]Expr), selectFields: make(map[string]bool), clauses: make([]Expr, 0), namingFunc: SnakeCaseNaming}
+	}, preloads: make(map[string][]Expr), selectFields: make(map[string]bool), selectFieldsAsked: make(map[string]bool), clauses: make([]Expr, 0), namingFunc: SnakeCaseNaming}
+}
+
+// pageOrigin records WHICH components of the Page a page= directive actually
+// supplied. It used to be a single bool set on the mere PRESENCE of the token,
+// before any segment was validated, so a partial or malformed directive claimed
+// the caller's whole SetPage value: "page=skip:5" + SetPage(0,100) built
+// {5,100} the first time and {5,20} the second, because the rebuild reset the
+// Take the DSL never mentioned. Resetting per component keeps Build idempotent
+// and leaves SetPage owning everything the DSL did not set. (sort= has always
+// gated its ownership flag on a segment actually parsing — see :1032.)
+type pageOrigin uint8
+
+const (
+	pageSkipFromDSL pageOrigin = 1 << iota
+	pageTakeFromDSL
+)
+
+// resetDSLPage restores the components a page= directive owns to New()'s
+// defaults, leaving caller-owned components untouched. f.mu must be held.
+func (f *figo) resetDSLPage() {
+	if f.pageFromDSL == 0 {
+		return
+	}
+	def := Page{Skip: 0, Take: 20} // New()'s default
+	if f.pageFromDSL&pageSkipFromDSL != 0 {
+		f.page.Skip = def.Skip
+	}
+	if f.pageFromDSL&pageTakeFromDSL != 0 {
+		f.page.Take = def.Take
+	}
+	f.pageFromDSL = 0
 }
 
 func (p *Page) validate() {
@@ -688,6 +830,14 @@ func addDiag(diags *[]error, format string, args ...any) {
 // recorded into diags so BuildE can report what the built query does NOT
 // include.
 func (f *figo) parseDSL(expr string, diags *[]error) *Node {
+	return f.parseDSLDepth(expr, diags, 0)
+}
+
+// parseDSLDepth is parseDSL with the load= nesting level. loadDepth > 0 means
+// the input is the CONTENT of a load=[...] directive, where a further load= is
+// not representable and must be skipped without being parsed (see the branch
+// below).
+func (f *figo) parseDSLDepth(expr string, diags *[]error, loadDepth int) *Node {
 	root := &Node{Value: "root", Expression: make([]Expr, 0)}
 	stack := []*Node{root}
 	current := root
@@ -761,6 +911,18 @@ func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 				if expr[j] == ']' {
 					if bracketDepth > 0 {
 						bracketDepth--
+						j++
+						// The list value is complete, so the token ends here —
+						// exactly as a closing QUOTE at depth 0 ends it above.
+						// Continuing instead absorbed a glued connector into the
+						// value: "age<in>[1,2]and x=1" tokenized as
+						// "age<in>[1,2]and", binding the garbage members "[1" and
+						// "2]and" and silently downgrading the connector to AND,
+						// with no diagnostic at all.
+						if bracketDepth == 0 {
+							break
+						}
+						continue
 					}
 					j++
 					continue
@@ -790,12 +952,43 @@ func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 					if parenDepth > 0 {
 						parenDepth--
 						j++
+						// Same rule as ']' above: once the value's own
+						// parenthesis is closed the token is complete.
+						// "price<bet>(10..20)and b=2" used to keep scanning and
+						// produce the token "price<bet>(10..20)and", whose bounds
+						// typed as the strings "(10" and "20)and" while the OR/AND
+						// connector was swallowed — silently, diag=nil.
+						if parenDepth == 0 {
+							break
+						}
 						continue
 					}
 					break
 				}
 
+				// "<null>" and "<notnull>" take no value and end in '>', so they
+				// are self-delimiting: the token ends right after the operator.
+				// Without this a glued keyword was absorbed into the token —
+				// "deleted_at<null>or tenant_id=7" turned the OR into an implicit
+				// AND, and "a<null>b=2 and c=3" dropped b=2 entirely — in both
+				// cases with no diagnostic, because the operator still matched.
+				if expr[j] == '>' && ff == -1 && bracketDepth == 0 && parenDepth == 0 {
+					if tok := expr[i : j+1]; strings.HasSuffix(tok, string(OperationIsNull)) || strings.HasSuffix(tok, string(OperationNotNull)) {
+						j++
+						break
+					}
+				}
+
 				j++
+			}
+			// A quote that never closed swallows the rest of the DSL into one
+			// token, which can WIDEN the query ("not name=\"x and tenant_id=5"
+			// negates one bogus predicate instead of two real ones). The value is
+			// still bound (dropping the token would widen further), but BuildE
+			// must say so: the spaced form was already diagnosed, the unspaced
+			// form was silent.
+			if ff == 1 {
+				addDiag(diags, "unterminated '\"' in %q (rest of the input was absorbed into one value)", strings.TrimSpace(expr[i:j]))
 			}
 			token := strings.TrimSpace(expr[i:j])
 			if token != "" {
@@ -823,8 +1016,14 @@ func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 				// these keywords (sortOrder, pageCount, loadedAt) are parsed as
 				// filters rather than swallowed as sort/page/load directives.
 				if strings.HasPrefix(token, string(OperationSort)+"=") || strings.HasPrefix(token, string(OperationPage)+"=") || strings.HasPrefix(token, string(OperationLoad)+"=") {
+					// Record the directive's POSITION in the token stream (see
+					// operationDirective): it is not an operand, so the precedence
+					// pass has to absorb the connector written next to it and any
+					// "not" written in front of it. Every branch below advances i
+					// and continues, so this is the single place to mark it.
+					current.Children = append(current.Children, &Node{Operator: operationDirective, Value: token, Parent: current})
+
 					if strings.HasPrefix(token, string(OperationLoad)+"=") {
-						k := j - 1
 						loadLabel := fmt.Sprintf("%v=[", string(OperationLoad))
 						// Without the '[' there is no bracket to balance: the scan
 						// below starts at bracketCount 1 and would hunt a ']' all
@@ -836,17 +1035,59 @@ func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 							i = j
 							continue
 						}
-						bracketCount := 1
-						for k < len(expr) && bracketCount > 0 {
+						// Where does the directive END? The tokenizer above already
+						// answered that: it tracked bracket depth AND quote state,
+						// and the ']'-at-depth-0 break means the token stops
+						// exactly at the directive's own closing bracket. So take
+						// its answer (j) whenever it finished balanced.
+						//
+						// Re-deriving the end here with a second, QUOTE-BLIND scan
+						// truncated the directive at a ']' written inside a quoted
+						// value: `load=[Orders:name="a]b"] and tenant_id=7` closed
+						// the balance early, parsing resumed mid-value and
+						// tenant_id was never parsed at all — an empty WHERE that
+						// matches every row under Build(), i.e. the H6 failure mode
+						// re-entered through the H6 fix itself. The rescan is kept
+						// only for a token the tokenizer could NOT close (an
+						// unterminated quote, or a '[' with no matching ']'), where
+						// there is no trustworthy end and the balancer's verdict is
+						// what produces the "unclosed load=" diagnostic. Starting
+						// it at the directive's own '[' — not at j-1, the token's
+						// last byte — is what H6 fixed: with a keyword glued to the
+						// closing bracket ("load=[Orders:id=1]and tenant_id=7") a
+						// scan from j-1 hunted for a ']' after the directive had
+						// already closed and swallowed every remaining filter.
+						k := j
+						bracketCount := bracketDepth
+						if bracketDepth != 0 || ff == 1 {
+							k = i + len(loadLabel)
+							bracketCount = 1
+							for k < len(expr) && bracketCount > 0 {
 
-							switch expr[k] {
-							case '[':
-								bracketCount++
-							case ']':
-								bracketCount--
+								switch expr[k] {
+								case '[':
+									bracketCount++
+								case ']':
+									bracketCount--
+								}
+								k++
+
 							}
-							k++
+						}
 
+						// A load= inside a load= is not representable, and its
+						// content was discarded anyway — so do not PARSE it.
+						// Recursing was the entire cost: each level re-parsed the
+						// whole remaining nesting on a scratch instance, so a
+						// ~36 KB filter of nested load= burned 2 s of CPU and
+						// ~167 MB of LIVE heap to produce one clause and one empty
+						// preload. No QueryLimits setting could reject it either,
+						// because limits measure the built tree AfterParse and that
+						// tree is trivial.
+						if loadDepth > 0 {
+							addDiag(diags, "nested load= inside load=[...] is not supported and was ignored (%q)", token)
+							i = k
+							continue
 						}
 
 						v := strings.TrimSpace(expr[i:k])
@@ -902,18 +1143,18 @@ func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 							// Preloads have no sort/page/nested-load representation,
 							// so those directives are dropped with a diagnostic.
 							scratch := &figo{preloads: make(map[string][]Expr), selectFields: make(map[string]bool), namingFunc: f.namingFunc}
-							loadRootNode := scratch.parseDSL(loadContent, diags)
+							loadRootNode := scratch.parseDSLDepth(loadContent, diags, loadDepth+1)
 							if scratch.sort != nil {
 								addDiag(diags, "sort= inside load=[%s:...] is not supported and was ignored", table)
 							}
-							if scratch.pageFromDSL {
+							if scratch.pageFromDSL != 0 {
 								// Presence is tracked by flag: comparing the page
 								// against its zero value missed page=skip:0,take:0.
 								addDiag(diags, "page= inside load=[%s:...] is not supported and was ignored", table)
 							}
-							if len(scratch.preloads) > 0 {
-								addDiag(diags, "nested load= inside load=[%s:...] is not supported and was ignored", table)
-							}
+							// (A nested load= is reported by the depth guard above,
+							// which skips it without parsing, so scratch.preloads
+							// can no longer become non-empty.)
 							expressionParser(loadRootNode, diags)
 							loadExpr := getFinalExpr(*loadRootNode)
 							if loadExpr != nil {
@@ -939,12 +1180,13 @@ func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 						pageLabel := fmt.Sprintf("%v=", string(OperationPage))
 						content := token[strings.Index(token, pageLabel)+len(pageLabel):]
 
-						// Record that a page= directive appeared, whatever its
-						// value: BuildE resets a DSL-derived page when the DSL is
-						// replaced (a SetPage value is kept), and the load= scratch
-						// parse uses it to detect page= even at skip:0,take:0.
-						f.pageFromDSL = true
-
+						// Ownership is claimed per COMPONENT, and only once a
+						// segment actually parses (see pageOrigin): flagging the
+						// whole Page on the mere presence of the token handed a
+						// malformed "page=garbage" — and a partial "page=skip:5" —
+						// control of a caller's SetPage Take, which the next
+						// rebuild then reset. sort= has always gated its flag the
+						// same way (:1032).
 						pageContent := strings.Split(content, ",")
 
 						for _, s := range pageContent {
@@ -965,8 +1207,10 @@ func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 								switch field {
 								case "skip":
 									f.page.Skip = int(parseInt)
+									f.pageFromDSL |= pageSkipFromDSL
 								case "take":
 									f.page.Take = int(parseInt)
+									f.pageFromDSL |= pageTakeFromDSL
 								default:
 									addDiag(diags, "unknown page= key %q (expected skip or take)", field)
 								}
@@ -1030,6 +1274,14 @@ func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 						// directive whose every segment was malformed used to
 						// replace an earlier VALID sort with an empty one.
 						if len(c) > 0 {
+							// Last-wins is a defensible policy; discarding a
+							// fully VALID earlier directive without saying so is
+							// not — BuildE promises a nil error means the built
+							// query expresses all of the input, and the columns
+							// are expressible (sort=a:asc,b:desc keeps both).
+							if f.sortFromDSL {
+								addDiag(diags, "sort= directive %q overrides an earlier sort= in the same DSL", token)
+							}
 							sortExpr := OrderBy{
 								Columns: c,
 							}
@@ -1063,31 +1315,46 @@ func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 						}
 						if nextStart < len(expr) {
 							nextEnd := nextStart
-							nextFF := -1
-							for nextEnd < len(expr) {
-								if expr[nextEnd] == '"' && nextFF == -1 {
-									nextFF = 1
+							var nextToken string
+							// Take the operator by LONGEST MATCH rather than by
+							// scanning to the next space. The scan below stops only
+							// at whitespace and quotes, so a half-spaced predicate
+							// ("price =10", "price <in>[10,15]", or a spaced
+							// "tag <null>" that merely happens to sit before ')')
+							// produced a token that failed the exact-match list and
+							// was dropped WHOLE — widening a conjunct. The operator
+							// spellings are self-delimiting, so matching them
+							// directly ends the token in exactly the right place.
+							if op := matchOperatorPrefix(expr[nextStart:]); op != "" {
+								nextToken = op
+								nextEnd = nextStart + len(op)
+							} else {
+								nextFF := -1
+								for nextEnd < len(expr) {
+									if expr[nextEnd] == '"' && nextFF == -1 {
+										nextFF = 1
+										nextEnd++
+										continue
+									}
+									if expr[nextEnd] == '"' && nextFF == 1 {
+										nextFF = 0
+										nextEnd++
+										break
+									}
+									if expr[nextEnd] != '"' && nextFF == 1 {
+										nextEnd++
+										continue
+									}
+									if isDSLSpace(expr[nextEnd]) && nextFF == -1 {
+										break
+									}
+									if isDSLSpace(expr[nextEnd]) && nextFF == 0 {
+										break
+									}
 									nextEnd++
-									continue
 								}
-								if expr[nextEnd] == '"' && nextFF == 1 {
-									nextFF = 0
-									nextEnd++
-									break
-								}
-								if expr[nextEnd] != '"' && nextFF == 1 {
-									nextEnd++
-									continue
-								}
-								if isDSLSpace(expr[nextEnd]) && nextFF == -1 {
-									break
-								}
-								if isDSLSpace(expr[nextEnd]) && nextFF == 0 {
-									break
-								}
-								nextEnd++
+								nextToken = strings.TrimSpace(expr[nextStart:nextEnd])
 							}
-							nextToken := strings.TrimSpace(expr[nextStart:nextEnd])
 							// Combine with both simple and complex operators
 							if nextToken == ">" || nextToken == "<" || nextToken == "=" || nextToken == "!=" || nextToken == ">=" || nextToken == "<=" || nextToken == "=^" || nextToken == "!=^" || nextToken == ".=^" || nextToken == "=~" || nextToken == "!=~" || nextToken == "<in>" || nextToken == "<nin>" || nextToken == "<bet>" || nextToken == "<null>" || nextToken == "<notnull>" {
 								combinedToken = token + " " + nextToken
@@ -1248,7 +1515,7 @@ func (f *figo) parseDSL(expr string, diags *[]error) *Node {
 					// there through a %v round-trip destroyed quoted-string typing
 					// ("0123" became int64 123), nulls and dates.
 					convertedField := f.parsFieldsName(field)
-					clauseExpr := getClausesFromOperation(operator, convertedField, valueStr)
+					clauseExpr := getClausesFromOperation(operator, convertedField, valueStr, diags)
 					if clauseExpr == nil {
 						addDiag(diags, "invalid value %q for operator %q on field %q", valueStr, operator, field)
 						// The node used to be appended anyway, carrying a nil
@@ -1383,6 +1650,27 @@ func isSimpleFieldName(token string) bool {
 	return true
 }
 
+// spacedOperators lists the operator spellings the "field <op> value"
+// leniency recognizes, LONGEST FIRST so matchOperatorPrefix takes the longest
+// match ("<notnull>" before "<null>" before "<", "!=~" before "!=").
+var spacedOperators = []string{
+	"<notnull>", "<null>", "<bet>", "<nin>", "<in>",
+	"!=~", "!=^", ".=^",
+	">=", "<=", "!=", "=^", "=~",
+	">", "<", "=",
+}
+
+// matchOperatorPrefix returns the longest operator spelling s starts with, or
+// "" if it starts with none.
+func matchOperatorPrefix(s string) string {
+	for _, op := range spacedOperators {
+		if strings.HasPrefix(s, op) {
+			return op
+		}
+	}
+	return ""
+}
+
 func parseToken(token string) (Operation, string, string) {
 	// Order matters: place custom multi-char markers first
 	operators := []Operation{
@@ -1489,12 +1777,23 @@ func parseScalarLiteral(raw string) any {
 		if isAllDigits(s) {
 			return s
 		}
-		if f64, err := strconv.ParseFloat(s, 64); err == nil {
-			// NaN/Inf have no SQL/BSON/JSON literal — keep the raw text as a
-			// string (the same policy as oversized integers) rather than emit
-			// a value no backend can render.
-			if !math.IsNaN(f64) && !math.IsInf(f64, 0) {
-				return f64
+		// strconv.ParseFloat accepts GO's literal grammar, not SQL/JSON's:
+		// digit separators ("1_000") and hex floats ("0x1p4") sailed past the
+		// isAllDigits guard above and degraded to a lossy float64, so
+		// "id=9_007_199_254_740_993" bound 9007199254740992 and returned a
+		// DIFFERENT record with BuildE nil. ParseInt above uses an explicit
+		// base 10 and already rejects them, which is why this was the only
+		// leak. Such literals stay strings, like oversized integers.
+		// (The check gates only the FLOAT path — month names such as
+		// "September 5, 2024" contain a 'p' and must still reach parseDate.)
+		if !strings.ContainsAny(s, "_xXpP") {
+			if f64, err := strconv.ParseFloat(s, 64); err == nil {
+				// NaN/Inf have no SQL/BSON/JSON literal — keep the raw text as a
+				// string (the same policy as oversized integers) rather than emit
+				// a value no backend can render.
+				if !math.IsNaN(f64) && !math.IsInf(f64, 0) {
+					return f64
+				}
 			}
 		}
 		if dateVal, err := parseDate(s); err == nil {
@@ -1502,6 +1801,21 @@ func parseScalarLiteral(raw string) any {
 		}
 	}
 	return s
+}
+
+// isNumericLiteral / isStringLiteral classify a typed DSL literal for the
+// <bet> bound-compatibility check.
+func isNumericLiteral(v any) bool {
+	switch v.(type) {
+	case int64, float64:
+		return true
+	}
+	return false
+}
+
+func isStringLiteral(v any) bool {
+	_, ok := v.(string)
+	return ok
 }
 
 func isAllDigits(s string) bool {
@@ -1520,7 +1834,7 @@ func isAllDigits(s string) bool {
 // parseListLiteral parses a list literal like [1,2,"x"] or ["a,b","c"].
 // Parenthesized lists (<in>(1,2)) are accepted too — leaving the parens in
 // place corrupted the first and last element into "(1" and "2)".
-func parseListLiteral(raw string) []any {
+func parseListLiteral(raw string, diags *[]error) []any {
 	s := strings.TrimSpace(raw)
 	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
 		s = strings.TrimPrefix(s, "[")
@@ -1536,12 +1850,26 @@ func parseListLiteral(raw string) []any {
 	parts := splitOutsideQuotes(s, ',')
 	vals := make([]any, 0, len(parts))
 	for _, p := range parts {
+		// A blank part (leading/trailing/doubled comma) is a separator
+		// artifact, not a value: it used to be typed as "" and injected into
+		// the predicate, so `name<in>["alice",]` matched every empty-string row
+		// as well and the mirrored `<nin>` silently HID them — both with a nil
+		// diagnostic. An explicit empty-string member is still spellable as "",
+		// so skipping blanks loses no expressiveness. (The empty LIST is
+		// already special-cased above, yielding the fail-closed 1=0 sentinel.)
+		if strings.TrimSpace(p) == "" {
+			addDiag(diags, "empty element in list %q ignored (write \"\" for an explicit empty string)", raw)
+			continue
+		}
 		vals = append(vals, parseScalarLiteral(p))
+	}
+	if len(vals) == 0 {
+		return nil
 	}
 	return vals
 }
 
-func getClausesFromOperation(o Operation, field string, value any) Expr {
+func getClausesFromOperation(o Operation, field string, value any, diags *[]error) Expr {
 	// The DSL parser passes the raw literal (quotes intact) so each literal
 	// is typed exactly once, here. Programmatic callers may pass an already
 	// typed value, which is used as-is.
@@ -1562,12 +1890,12 @@ func getClausesFromOperation(o Operation, field string, value any) Expr {
 	}
 	list := func() []any {
 		if isRaw {
-			return parseListLiteral(rawStr)
+			return parseListLiteral(rawStr, diags)
 		}
 		if vals, ok := value.([]any); ok {
 			return vals
 		}
-		return parseListLiteral(fmt.Sprintf("%v", value))
+		return parseListLiteral(fmt.Sprintf("%v", value), diags)
 	}
 
 	switch o {
@@ -1618,7 +1946,27 @@ func getClausesFromOperation(o Operation, field string, value any) Expr {
 		if idx := indexOutsideQuotes(s, ".."); idx > 0 {
 			low := strings.TrimSpace(s[:idx])
 			high := strings.TrimSpace(s[idx+2:])
-			return BetweenExpr{Field: field, Low: parseScalarLiteral(low), High: parseScalarLiteral(high)}
+			// Only the LOW bound was ever checked (that is all `idx > 0` says).
+			// An absent or malformed HIGH bound was handed to parseScalarLiteral
+			// and became a string: `<bet>(5..)` bound "" and `<bet>(5....100)`
+			// bound "..100". SQLite, MySQL and BSON all order every number below
+			// every string, so the ceiling evaporated and the range silently
+			// became `>= low` — with BuildE returning nil. Reject both, exactly
+			// as an empty LOW bound already is; a leading '.' also catches
+			// `(1...5)`, whose "high" is the unintended 0.5.
+			if low == "" || high == "" || strings.HasPrefix(high, ".") {
+				return nil
+			}
+			lowVal, highVal := parseScalarLiteral(low), parseScalarLiteral(high)
+			// A number paired with a string is the same silent widening one step
+			// later (`<bet>(10..abc)` renders BETWEEN 10 AND 'abc'), so fail
+			// closed on mixed kinds rather than emit a comparison whose meaning
+			// depends on the engine's type ordering.
+			if isNumericLiteral(lowVal) != isNumericLiteral(highVal) &&
+				(isStringLiteral(lowVal) || isStringLiteral(highVal)) {
+				return nil
+			}
+			return BetweenExpr{Field: field, Low: lowVal, High: highVal}
 		}
 		return nil
 	case OperationILike:
@@ -1661,6 +2009,38 @@ func expressionParser(node *Node, diags *[]error) {
 	}
 }
 
+// nextSlotKind classifies what a non-operand slot's right-hand neighbour
+// contributes: see nextItemKind.
+type nextSlotKind int
+
+const (
+	nextIsNothing nextSlotKind = iota
+	nextIsOperand
+	nextIsConnector
+)
+
+// nextItemKind reports what the next child that CONTRIBUTES to the item list is
+// — an operand, an and/or connector, or nothing at all — plus that connector's
+// operation. Slots contributing neither (another directive, a group that
+// produced no expression) are skipped: each reconciles its own neighbours. A
+// "not" counts as an operand, because it binds the expression that follows it,
+// so a connector written before it is not dangling.
+func nextItemKind(children []*Node, from int) (nextSlotKind, Operation) {
+	for _, child := range children[from:] {
+		switch {
+		case child.Operator == operationDirective:
+			continue
+		case child.Operator == OperationAnd || child.Operator == OperationOr:
+			return nextIsConnector, child.Operator
+		case child.Operator == OperationNot:
+			return nextIsOperand, OperationNot
+		case len(child.Expression) > 0:
+			return nextIsOperand, ""
+		}
+	}
+	return nextIsNothing, ""
+}
+
 // buildExpressionTreeWithPrecedence builds a proper expression tree respecting operator precedence
 func buildExpressionTreeWithPrecedence(children []*Node, diags *[]error) Expr {
 	if len(children) == 0 {
@@ -1670,7 +2050,79 @@ func buildExpressionTreeWithPrecedence(children []*Node, diags *[]error) Expr {
 	// Build a list of expressions and operators in order
 	var items []any // Can be Expr or Operation
 
-	for _, child := range children {
+	// Set when a non-operand slot left the connector written AFTER it
+	// ("sort=id:asc and a=1") as the one to absorb.
+	absorbNextConnector := false
+
+	// absorbAroundNonOperand is shared by the two kinds of slot that occupy a
+	// token position without contributing an operand: a sort=/page=/load=
+	// directive, and a parenthesized group that produced no expression. Both
+	// have to reconcile the connectors written around them, and they used to do
+	// it differently — the directive branch dropped the preceding connector
+	// UNCONDITIONALLY (so "a=1 or sort=id:asc b=2" lost the user's only
+	// connector and rendered a AND b, silently narrowing a disjunction with no
+	// diagnostic on any channel) while the group branch absorbed nothing (so
+	// "a=1 or (sort=id:asc) or b=2" left a connector unpaired and BuildE
+	// reported a "dangling connector" error for valid DSL — the very symptom
+	// M12 was filed for, surviving in the parenthesized spelling).
+	//
+	// The rule: absorb a connector only when it would otherwise DANGLE.
+	//   * one operand on each side  -> the connector is the user's operator; keep it.
+	//   * connectors on both sides  -> exactly one must go. Drop the AND and keep
+	//     the OR, which is the pairing the precedence reduction below would have
+	//     produced anyway (its AND pass finds no operand to pair with the second
+	//     connector and drops it), so the parse is unchanged and only the
+	//     spurious diagnostic is gone.
+	//   * nothing left to pair with -> drop it (leading "sort=x and a=1",
+	//     trailing "a=1 or sort=x").
+	absorbAroundNonOperand := func(idx int) {
+		prevOp, hasPrevOp := OperationAnd, false
+		if n := len(items); n > 0 {
+			if op, isOp := items[n-1].(Operation); isOp && (op == OperationAnd || op == OperationOr) {
+				prevOp, hasPrevOp = op, true
+			}
+		}
+		kind, nextOp := nextItemKind(children, idx+1)
+		switch {
+		case hasPrevOp && kind == nextIsConnector:
+			if prevOp == OperationOr && nextOp == OperationAnd {
+				absorbNextConnector = true
+				return
+			}
+			items = items[:len(items)-1]
+		case hasPrevOp && kind == nextIsNothing:
+			items = items[:len(items)-1]
+		case !hasPrevOp && len(items) == 0 && kind == nextIsConnector:
+			absorbNextConnector = true
+		}
+	}
+
+	for idx, child := range children {
+		// A sort=/page=/load= directive occupies a token slot but is not an
+		// operand (see operationDirective). It has to reconcile the connectors
+		// written around it (absorbAroundNonOperand) and swallow any "not"
+		// written in front of it, which otherwise jumped onto the NEXT predicate
+		// and inverted a filter the user never negated ("not sort=id:asc and
+		// a=1" rendered NOT(a=1); round 4 fixed only the parenthesized form).
+		if child.Operator == operationDirective {
+			for len(items) > 0 {
+				op, isOp := items[len(items)-1].(Operation)
+				if !isOp || op != OperationNot {
+					break
+				}
+				items = items[:len(items)-1]
+				addDiag(diags, "dropped 'not' preceding a %q directive", child.Value)
+			}
+			absorbAroundNonOperand(idx)
+			continue
+		}
+		if absorbNextConnector {
+			absorbNextConnector = false
+			if child.Operator == OperationAnd || child.Operator == OperationOr {
+				continue
+			}
+		}
+
 		// Add expressions from this child
 		if len(child.Expression) > 0 {
 			items = append(items, child.Expression[len(child.Expression)-1])
@@ -1692,6 +2144,12 @@ func buildExpressionTreeWithPrecedence(children []*Node, diags *[]error) Expr {
 				items = items[:len(items)-1]
 				addDiag(diags, "dropped 'not' preceding a group with no conditions")
 			}
+			// A group that produced no expression occupies the same non-operand
+			// slot as a bare directive, so it reconciles the connectors around it
+			// the same way — without this, "a=1 or (sort=id:asc) or b=2" left the
+			// second "or" unpaired and BuildE reported a dangling connector for
+			// valid DSL (M12 in its parenthesized spelling).
+			absorbAroundNonOperand(idx)
 		}
 		// Add operators
 		if child.Operator == OperationAnd || child.Operator == OperationOr || child.Operator == OperationNot {
@@ -1911,11 +2369,28 @@ func (f *figo) AddFiltersFromString(input string) error {
 	// An empty (or blank) input clears the stored DSL: the documented contract
 	// is "replaces the existing DSL", and the previous silent no-op made it
 	// impossible to ever clear filters through this API. Parse hooks are
-	// skipped — there is nothing to parse. The next Build drops the cleared
-	// DSL's materialized state.
+	// skipped — there is nothing to parse.
+	//
+	// The cleared DSL's materialized state is dropped HERE rather than at the
+	// next Build. Deferring it made the wipe retroactive: `builtFromDSL` is
+	// instance-wide, so an AddFilter made AFTER the DSL was cleared — the case
+	// BuildE's own comment and README Pattern A promise is kept — was wiped
+	// along with the stale DSL clauses, and a per-request tenant scope added to
+	// a cloned template silently vanished into an unfiltered scan.
 	if strings.TrimSpace(input) == "" {
 		f.mu.Lock()
 		f.dsl = ""
+		if f.builtFromDSL {
+			f.clauses = []Expr{}
+			f.clausesAsked = nil
+			f.preloads = make(map[string][]Expr)
+			if f.sortFromDSL {
+				f.sort = nil
+				f.sortFromDSL = false
+			}
+			f.resetDSLPage()
+			f.builtFromDSL = false
+		}
 		f.mu.Unlock()
 		return nil
 	}
@@ -1949,13 +2424,25 @@ func (f *figo) AddFiltersFromString(input string) error {
 
 	// Execute AfterParse plugin hooks (error returned unwrapped, as above).
 	if pm != nil {
-		err := pm.ExecuteAfterParse(f, input)
-		if err != nil {
-			f.mu.Lock()
-			f.dsl = prevDSL
-			f.mu.Unlock()
+		// The rollback must also run when a hook PANICS. ExecuteAfterParse
+		// deliberately runs every hook and joins their errors, so a panic in a
+		// later hook (a ValidationRule handler with an unchecked type
+		// assertion, say) unwound past the error path, threw away an earlier
+		// plugin's rejection and left the rejected DSL armed for the next
+		// Build — breaking the guide's invariant that "a rejected DSL can never
+		// be built later". Roll back first, then let the panic continue.
+		committed := false
+		defer func() {
+			if !committed {
+				f.mu.Lock()
+				f.dsl = prevDSL
+				f.mu.Unlock()
+			}
+		}()
+		if err := pm.ExecuteAfterParse(f, input); err != nil {
 			return err
 		}
+		committed = true
 	}
 
 	return nil
@@ -1967,7 +2454,19 @@ func (f *figo) AddFiltersFromString(input string) error {
 func (f *figo) AddFilter(exp Expr) {
 	f.mu.RLock()
 	pm := f.pluginManager
+	naming := f.namingFunc
 	f.mu.RUnlock()
+
+	// Field names are converted HERE, on the way in and exactly once, so one
+	// statement can no longer contain two spellings of the same identifier:
+	// the DSL converts at parse time (:1250) and the adapters then render every
+	// field verbatim (hunt #1 deliberately removed GORM's render-time second
+	// conversion), so a programmatic EqExpr{Field: "userName"} used to reach
+	// SQL as "userName" while AddSelectFields("userName") reached it as
+	// "user_name" — one statement filtering a column that does not exist.
+	// Converting before the plugin filters run also matches the DSL path, where
+	// FieldsPlugin sees already-converted names.
+	exp = NormalizeExprFields(exp, naming)
 
 	// Filters run outside the lock (see Build).
 	if pm != nil {
@@ -1980,6 +2479,9 @@ func (f *figo) AddFilter(exp Expr) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.clauses = append(f.clauses, exp)
+	if !f.inFinalize {
+		f.clausesAsked = append(f.clausesAsked, exp)
+	}
 }
 
 func (f *figo) AddSelectFields(fields ...string) {
@@ -1988,6 +2490,9 @@ func (f *figo) AddSelectFields(fields ...string) {
 
 	for _, field := range fields {
 		f.selectFields[field] = true
+		if !f.inFinalize {
+			f.selectFieldsAsked[field] = true
+		}
 	}
 }
 
@@ -2004,15 +2509,31 @@ func (f *figo) SetSelectFields(fields ...string) {
 	for _, field := range fields {
 		f.selectFields[field] = true
 	}
+	// A finalizer pruning the projection must not erase what the caller asked
+	// for — the next Build re-derives the render from the request.
+	if !f.inFinalize {
+		f.selectFieldsAsked = make(map[string]bool, len(fields))
+		for _, field := range fields {
+			f.selectFieldsAsked[field] = true
+		}
+	}
 }
 
 func (f *figo) GetClauses() []Expr {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	// Return a copy to avoid race conditions
+	// Return a DEEP copy. Copying only the outer slice left every node's
+	// reference-typed fields aliasing the live instance, so a caller inspecting
+	// the snapshot could reach through it and rewrite the query being rendered:
+	// snap[0].(InExpr).Values[0] = 999 turned IN (1,2,3) into IN (999,2,3) on
+	// the instance itself — a data race as well as a correctness hole, and the
+	// exact independence Clone documents at README:746. Replacing a whole
+	// element was already a no-op; only the partial aliasing was the trap.
 	result := make([]Expr, len(f.clauses))
-	copy(result, f.clauses)
+	for i, e := range f.clauses {
+		result[i] = cloneExpr(e)
+	}
 	return result
 }
 
@@ -2020,7 +2541,48 @@ func (f *figo) GetPreloads() map[string][]Expr {
 	f.mu.RLock()
 	defer f.mu.RUnlock()
 
-	// Return a copy so callers can't race with (or mutate) internal state.
+	// Deep copy, for the reason spelled out in GetClauses: copying the outer
+	// slice alone left each expression's Values/Operands aliasing the live
+	// preload conditions.
+	result := make(map[string][]Expr, len(f.preloads))
+	for k, exprs := range f.preloads {
+		cp := make([]Expr, len(exprs))
+		for i, e := range exprs {
+			cp[i] = cloneExpr(e)
+		}
+		result[k] = cp
+	}
+	return result
+}
+
+// ClausesForRender and PreloadsForRender are the READ-ONLY snapshots the
+// in-tree adapters render from. They copy the outer slice/map — so a concurrent
+// append cannot be observed mid-render — but do NOT deep-copy the nodes, which
+// is what GetClauses/GetPreloads add for PUBLIC callers (a caller inspecting a
+// snapshot could otherwise reach through it and rewrite the query being
+// rendered). That guarantee costs O(total bound-value size) per call, and a
+// render calls it more than once (the raw SELECT takes one snapshot for the
+// WHERE and one inside buildOrderBy, the Mongo aggregate three): with a
+// DSL-supplied 20k-element <in> list it turned a ~2us pipeline build into
+// ~400us of pure copying, output byte-identical. A renderer only reads, so it
+// must not pay for it.
+//
+// Deliberately NOT part of the Figo interface: an out-of-tree implementation
+// stays compilable, and an adapter reaches these with a type assertion
+// (`if r, ok := f.(interface{ ClausesForRender() []Expr }); ok`), falling back
+// to GetClauses. Whatever is returned must be treated as immutable: mutating a
+// node mutates the live instance. Use GetClauses/GetPreloads for anything else.
+func (f *figo) ClausesForRender() []Expr {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	result := make([]Expr, len(f.clauses))
+	copy(result, f.clauses)
+	return result
+}
+
+func (f *figo) PreloadsForRender() map[string][]Expr {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
 	result := make(map[string][]Expr, len(f.preloads))
 	for k, exprs := range f.preloads {
 		cp := make([]Expr, len(exprs))
@@ -2057,7 +2619,41 @@ func (f *figo) GetSort() *OrderBy {
 func (f *figo) SetSort(sort *OrderBy) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.sort = cloneOrderBy(sort)
+	c := cloneOrderBy(sort)
+	if c != nil && f.namingFunc != nil {
+		// Column names are converted on the way in, for the reason spelled out
+		// in AddFilter: a sort= directive converts at :1023 and the adapters
+		// render the stored name verbatim, so SetSort("userName") used to emit
+		// ORDER BY "userName" next to a projection of "user_name".
+		//
+		// Conversion goes through normalizeFieldName — the SAME per-'.'-segment
+		// helper AddFilter uses — because a dotted name is a QUALIFIED path.
+		// Handing the whole string to the naming func folded the qualifier into
+		// the column (SnakeCaseNaming turns '.' into '_'), so "orders.user_name"
+		// became the nonexistent "orders_user_name" in ORDER BY while the WHERE
+		// from the same string still said "orders"."user_name": two spellings of
+		// one identifier in one statement, on already-snake input, and on
+		// SQLite a silently unsorted (hence differently paginated) result.
+		//
+		// A name already present in the stored sort is kept as-is: a plugin
+		// finalizer that PRUNES the sort (FieldsPlugin re-sets the survivors
+		// through this same method) hands back columns that are already in
+		// converted form, and a non-idempotent naming func would otherwise
+		// convert them a second time on every Build ("t_id" -> "t_t_id").
+		var existing map[string]bool
+		if f.sort != nil {
+			existing = make(map[string]bool, len(f.sort.Columns))
+			for _, col := range f.sort.Columns {
+				existing[col.Name] = true
+			}
+		}
+		for i := range c.Columns {
+			if !existing[c.Columns[i].Name] {
+				c.Columns[i].Name = normalizeFieldName(c.Columns[i].Name, f.namingFunc)
+			}
+		}
+	}
+	f.sort = c
 	f.sortFromDSL = false
 }
 
@@ -2069,39 +2665,82 @@ func (f *figo) SetPage(skip, take int) {
 	f.page.validate()
 	// The page now belongs to the caller, not the DSL: it must survive a
 	// DSL replacement (the DSL-origin flag would reset it on rebuild).
-	f.pageFromDSL = false
+	f.pageFromDSL = 0
 }
 
+// SetPageString applies a "skip:N,take:N" string. Whatever parses is applied;
+// anything that does not is DISCARDED SILENTLY — use SetPageStringE to find
+// out. It is kept for compatibility only.
 func (f *figo) SetPageString(v string) {
+	_ = f.SetPageStringE(v)
+}
+
+// SetPageStringE is SetPageString with the input it could not use reported.
+// Valid segments are still applied (the same "build what parsed, report the
+// rest" contract as BuildE), so a non-nil error means the resulting Page does
+// not express all of the input.
+//
+// It exists because SetPageString normalized garbage into a plausible-looking
+// page and had no diagnostic channel at all: "garbage" and "skip:abc" both
+// silently left the {0,20} default, an unknown key was ignored, and
+// "skip:-4,take:-9" clamped to {0,0} — a Take of 0 meaning "no LIMIT", i.e.
+// the opposite of the tiny page the caller asked for.
+func (f *figo) SetPageStringE(v string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
-	pageContent := strings.Split(v, ",")
+	if strings.TrimSpace(v) == "" {
+		return nil
+	}
 
-	for _, s := range pageContent {
+	var errs []error
+	applied := false
+
+	for _, s := range strings.Split(v, ",") {
+		if strings.TrimSpace(s) == "" {
+			errs = append(errs, fmt.Errorf("empty page segment in %q (expected skip:N or take:N)", v))
+			continue
+		}
 		pageSplit := strings.Split(s, ":")
 		if len(pageSplit) != 2 {
+			errs = append(errs, fmt.Errorf("malformed page segment %q (expected skip:N or take:N)", s))
 			continue
 		}
 
-		field := pageSplit[0]
-		value := pageSplit[1]
+		field := strings.TrimSpace(pageSplit[0])
+		value := strings.TrimSpace(pageSplit[1])
 
-		parseInt, parsErr := strconv.ParseInt(value, 10, 64)
-		if parsErr == nil {
-			switch field {
-			case "skip":
-				f.page.Skip = int(parseInt)
-			case "take":
-				f.page.Take = int(parseInt)
-			}
-
-			f.page.validate()
-			// Caller-owned now — see SetPage.
-			f.pageFromDSL = false
+		if field != "skip" && field != "take" {
+			errs = append(errs, fmt.Errorf("unknown page key %q (expected skip or take)", field))
+			continue
 		}
 
+		parseInt, parsErr := strconv.ParseInt(value, 10, 64)
+		if parsErr != nil {
+			errs = append(errs, fmt.Errorf("invalid page value %q for %q (expected an integer)", value, field))
+			continue
+		}
+		if parseInt < 0 {
+			// validate() clamps a negative to 0. For take that silently turns
+			// "give me fewer rows" into "no LIMIT at all", so say so.
+			errs = append(errs, fmt.Errorf("negative page value %d for %q was clamped to 0", parseInt, field))
+		}
+
+		switch field {
+		case "skip":
+			f.page.Skip = int(parseInt)
+		case "take":
+			f.page.Take = int(parseInt)
+		}
+		f.page.validate()
+		applied = true
 	}
+
+	if applied {
+		// Caller-owned now — see SetPage.
+		f.pageFromDSL = 0
+	}
+	return errors.Join(errs...)
 }
 
 func (f *figo) GetSelectFields() map[string]bool {
@@ -2186,6 +2825,23 @@ func (f *figo) GetSqlString(ctx any, conditionType ...string) string {
 // GetQuery delegates to the configured adapter to obtain a typed query object.
 // Plugin BeforeQuery/AfterQuery hooks run around the render exactly as in
 // GetSqlString (an error from either vetoes the result: nil is returned).
+//
+// When the configured ADAPTER cannot render, the result is never an untyped
+// nil: the documented retrieval pattern asserts on the concrete type
+// (`f.GetQuery(ctx).(figo.SQLQuery)`), and a type assertion on a nil interface
+// PANICS. That turned an adapter-side render refusal — reachable straight from
+// untrusted DSL now that the SQL adapters validate identifiers, e.g.
+// "?filter=a%00b=1" — into a crashed request goroutine, with BuildE reporting
+// nothing. A refusal is answered with a fail-closed Query instead: the value the
+// adapter supplied if it supplied one (an adapter reporting ok=false must return
+// either nil or a fail-closed value, never a partial render), otherwise
+// failClosedQuery, whose SQL cannot select a row in any position.
+//
+// Two cases deliberately keep returning nil, because neither is reachable from
+// query input and in-tree callers signal on them: a hook VETO (the plugin
+// author's explicit decision, and the documented BeforeQuery/AfterQuery
+// contract), and no adapter configured at all (a programming error — the same
+// answer GetSqlString's "" gives).
 func (f *figo) GetQuery(ctx any, conditionType ...string) Query {
 	f.mu.RLock()
 	adapter := f.adapterObj
@@ -2198,7 +2854,8 @@ func (f *figo) GetQuery(ctx any, conditionType ...string) Query {
 		}
 	}
 	if adapter != nil {
-		if q, ok := adapter.GetQuery(f, ctx, conditionType...); ok {
+		q, ok := adapter.GetQuery(f, ctx, conditionType...)
+		if ok {
 			if pm != nil {
 				if err := pm.ExecuteAfterQuery(f, ctx, q); err != nil {
 					return nil
@@ -2206,9 +2863,23 @@ func (f *figo) GetQuery(ctx any, conditionType ...string) Query {
 			}
 			return q
 		}
+		if q != nil {
+			return q
+		}
+		return failClosedQuery()
 	}
 	return nil
 }
+
+// failClosedSQL is the SQL text of the fail-closed Query GetQuery hands back
+// when the adapter refused to render. "1=0" cannot return a row in any of the
+// three positions callers use a rendered query in: executed on its own it is a
+// syntax error, appended after a WHERE keyword it matches nothing, and
+// concatenated in place of a whole WHERE clause it is a syntax error again. An
+// empty string would be silently match-EVERYTHING in the last of those.
+const failClosedSQL = "1=0"
+
+func failClosedQuery() Query { return SQLQuery{SQL: failClosedSQL} }
 
 // GetDSL returns the current DSL string
 func (f *figo) GetDSL() string {
@@ -2251,17 +2922,20 @@ func (f *figo) BuildE(adapter Adapter) error {
 		// with no DSL, SetPage, SetSort — is kept.
 		if f.builtFromDSL {
 			f.clauses = []Expr{}
+			f.clausesAsked = nil
 			f.preloads = make(map[string][]Expr)
 			if f.sortFromDSL {
 				f.sort = nil
 				f.sortFromDSL = false
 			}
-			if f.pageFromDSL {
-				f.page = Page{Skip: 0, Take: 20} // New()'s default
-				f.pageFromDSL = false
-			}
+			f.resetDSLPage()
 			f.builtFromDSL = false
 		}
+		// Re-derive this render from the caller's clause list, so a previous
+		// Build's finalizer output (notably the never-true pill) is not the
+		// input to this one. The DSL path below gets this for free by
+		// re-parsing; this is the only path where the pill could survive.
+		f.clauses = append([]Expr(nil), f.clausesAsked...)
 		f.mu.Unlock()
 		// Even with no DSL, clause finalizers must run (a ScopePlugin's
 		// mandatory filter applies to unfiltered queries too).
@@ -2281,10 +2955,7 @@ func (f *figo) BuildE(adapter Adapter) error {
 		f.sort = nil
 		f.sortFromDSL = false
 	}
-	if f.pageFromDSL {
-		f.page = Page{Skip: 0, Take: 20} // New()'s default
-		f.pageFromDSL = false
-	}
+	f.resetDSLPage()
 	f.builtFromDSL = true
 
 	var diags []error
@@ -2300,6 +2971,13 @@ func (f *figo) BuildE(adapter Adapter) error {
 	f.preloads = make(map[string][]Expr)
 	pm := f.pluginManager
 	f.mu.Unlock()
+
+	// An empty manager dispatches nothing, so it must not take the plugin path
+	// at all: GetPluginManager creates the manager on first call, and a getter
+	// must not change what the next Build produces.
+	if !pm.hasPlugins() {
+		pm = nil
+	}
 
 	// From here on user plugin code runs with the instance state already
 	// cleared — a panicking hook must leave it fail-closed, not filter-less.
@@ -2332,12 +3010,40 @@ func (f *figo) BuildE(adapter Adapter) error {
 				preloads[table] = kept
 			}
 		}
+		// Preload finalizers run after pruning, so a mandatory condition a
+		// plugin adds here cannot be pruned away by the same Build. Relations
+		// are visited in sorted order to keep the dispatch deterministic.
+		rels := make([]string, 0, len(preloads))
+		for table := range preloads {
+			rels = append(rels, table)
+		}
+		sort.Strings(rels)
+		for _, table := range rels {
+			before := preloads[table]
+			final := pm.ExecutePreloadFinalizers(f, table, before)
+			// Only a finalizer that actually EMPTIED a non-empty list drops the
+			// relation. An unconditioned preload ("load=[Orders:]", or a segment
+			// whose filter yielded no conditions) legitimately carries zero
+			// conditions — the pruning loop above skips it for exactly that
+			// reason (:1105-1113) — so treating "came back empty" as "drop it"
+			// deleted it merely because a plugin manager existed: registering ANY
+			// plugin, even one implementing no finalizer at all, silently stopped
+			// preloading the relation on every adapter with no diagnostic.
+			if len(final) == 0 && len(before) > 0 {
+				delete(preloads, table)
+			} else {
+				preloads[table] = final
+			}
+		}
 	}
 
 	f.mu.Lock()
 	if finalExpr != nil {
 		f.clauses = append(f.clauses, finalExpr)
 	}
+	// The freshly parsed tree, plus any programmatic clauses that survived it,
+	// is what the caller asked for; finalizer output must not join it.
+	f.clausesAsked = append([]Expr(nil), f.clauses...)
 	f.preloads = preloads
 	f.mu.Unlock()
 
@@ -2358,6 +3064,12 @@ func (f *figo) guardPluginPanic() {
 		f.mu.Lock()
 		f.clauses = []Expr{OrExpr{}}
 		f.preloads = make(map[string][]Expr)
+		// Per-Build finalizer state must not survive the panic either: a stuck
+		// inFinalize silently ignored every later SetSelectFields, so the caller
+		// could not narrow the projection after recovering (see finalizeClauses,
+		// which also unwinds it — this is the belt to that braces, and covers a
+		// panic raised anywhere else under the guard).
+		f.inFinalize = false
 		f.mu.Unlock()
 		panic(r)
 	}
@@ -2369,22 +3081,53 @@ func (f *figo) guardPluginPanic() {
 func (f *figo) finalizeClauses() {
 	f.mu.RLock()
 	pm := f.pluginManager
-	sortOrigin := f.sortFromDSL
 	f.mu.RUnlock()
-	if pm == nil {
+	// An empty manager has no finalizer to run, and must leave no trace: see
+	// hasPlugins (GetPluginManager creates the manager lazily, and a getter must
+	// not change what the next Build produces).
+	if !pm.hasPlugins() {
 		return
 	}
+
+	f.mu.Lock()
+	sortOrigin := f.sortFromDSL
+	// Re-derive this render's projection from the caller's request, so a
+	// finalizer's pruning applies to this Build only and never accumulates
+	// across rebuilds (it used to be sticky: widening the policy and
+	// rebuilding still yielded the previously narrowed projection).
+	f.selectFields = make(map[string]bool, len(f.selectFieldsAsked))
+	for k, v := range f.selectFieldsAsked {
+		f.selectFields[k] = v
+	}
+	f.inFinalize = true
+	f.mu.Unlock()
+
+	// Both fields below are per-CALL state, so they unwind with a panic instead
+	// of being restored on the normal return path only. A finalizer that panics
+	// and an application that recovers it — the case guardPluginPanic exists for
+	// — used to strand them: inFinalize stuck ON made every later
+	// SetSelectFields/AddSelectFields write the render but not the request, so
+	// the caller could no longer change the projection AT ALL (narrowing it to
+	// drop "password" was silently ignored and the wide projection kept
+	// rendering), and sortFromDSL stuck OFF left a DSL-derived sort marked
+	// caller-owned, so the previous DSL's sort= leaked into a later query that
+	// named no sort — exactly what the restore below exists to prevent.
+	defer func() {
+		f.mu.Lock()
+		f.inFinalize = false
+		// A finalizer that rewrites the sort (FieldsPlugin prunes forbidden
+		// columns) goes through the public SetSort, which marks the sort
+		// caller-owned. Restore where the sort actually came from: pruning a
+		// DSL-derived sort leaves it DSL-derived, so the next rebuild still
+		// clears it instead of leaking it into a later query.
+		f.sortFromDSL = sortOrigin
+		f.mu.Unlock()
+	}()
 
 	finalized := pm.ExecuteClauseFinalizers(f, f.GetClauses())
 
 	f.mu.Lock()
 	f.clauses = finalized
-	// A finalizer that rewrites the sort (FieldsPlugin prunes forbidden
-	// columns) goes through the public SetSort, which marks the sort
-	// caller-owned. Restore where the sort actually came from: pruning a
-	// DSL-derived sort leaves it DSL-derived, so the next rebuild still
-	// clears it instead of leaking it into a later query.
-	f.sortFromDSL = sortOrigin
 	f.mu.Unlock()
 }
 
@@ -2458,6 +3201,146 @@ func CloneExpr(e Expr) Expr {
 	return cloneExpr(e)
 }
 
+// NormalizeExprFields returns a copy of e with naming applied to the field
+// name of every leaf node (and to every OrderBy column), rebuilding the
+// logical structure around them. A nil naming func returns e unchanged.
+//
+// figo converts field names exactly ONCE, on the way in: the DSL parser does
+// it while parsing and AddFilter/SetSort do it for programmatic input, so
+// every adapter can render the stored name verbatim. Use this helper for any
+// expression that reaches an instance by another route — most notably a
+// plugin that INJECTS a clause from FinalizeClauses (a mandatory tenant scope,
+// say), which bypasses AddFilter and would otherwise contribute the one field
+// in the statement that is spelled differently from all the others.
+//
+// Values are shared with the input (only field names and the tree structure
+// are rebuilt); use CloneExpr first if you need full independence.
+func NormalizeExprFields(e Expr, naming func(string) string) Expr {
+	if naming == nil || e == nil {
+		return e
+	}
+	return normalizeExprFields(e, naming)
+}
+
+func normalizeExprFields(e Expr, naming func(string) string) Expr {
+	switch v := e.(type) {
+	case AndExpr:
+		return AndExpr{Operands: normalizeOperands(v.Operands, naming)}
+	case OrExpr:
+		return OrExpr{Operands: normalizeOperands(v.Operands, naming)}
+	case NotExpr:
+		return NotExpr{Operands: normalizeOperands(v.Operands, naming)}
+	case OrderBy:
+		cols := make([]OrderByColumn, len(v.Columns))
+		copy(cols, v.Columns)
+		for i := range cols {
+			cols[i].Name = normalizeFieldName(cols[i].Name, naming)
+		}
+		return OrderBy{Columns: cols}
+
+	// Leaf nodes — enumerated explicitly (the same list exprField carries) so
+	// a future Expr type with a Field is caught here rather than silently
+	// keeping the caller's spelling.
+	case EqExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case GteExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case GtExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case LtExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case LteExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case NeqExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case LikeExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case ILikeExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case RegexExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case InExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case NotInExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case BetweenExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case IsNullExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case NotNullExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case JsonPathExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case ArrayContainsExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case ArrayOverlapsExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case FullTextSearchExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case GeoDistanceExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	case CustomExpr:
+		v.Field = normalizeFieldName(v.Field, naming)
+		return v
+	default:
+		// Unknown type: pass through rather than dropping it.
+		return e
+	}
+}
+
+// normalizeFieldName applies naming to each '.'-separated segment of a field
+// name. A dotted name is a QUALIFIED path ("users.first_name", or a Mongo
+// embedded-document path) and the SQL adapters quote it segment by segment, so
+// converting the whole string at once would fold the qualifier into the column
+// (SnakeCaseNaming turns '.' into '_': "users_first_name", a column that does
+// not exist) and break the documented Walk/SetNodeField qualification recipe.
+func normalizeFieldName(field string, naming func(string) string) string {
+	if field == "" {
+		return field
+	}
+	if !strings.Contains(field, ".") {
+		return naming(field)
+	}
+	parts := strings.Split(field, ".")
+	for i, p := range parts {
+		if p == "" {
+			continue
+		}
+		parts[i] = naming(p)
+	}
+	return strings.Join(parts, ".")
+}
+
+func normalizeOperands(operands []Expr, naming func(string) string) []Expr {
+	if operands == nil {
+		return nil
+	}
+	out := make([]Expr, len(operands))
+	for i, o := range operands {
+		out[i] = normalizeExprFields(o, naming)
+	}
+	return out
+}
+
 // pruneExprFields removes every leaf whose field fails keep, rebuilding the
 // logical structure around the survivors. Dropping a leaf drops it from its
 // parent's operand list, so no dangling AND/OR/NOT is left behind.
@@ -2514,10 +3397,18 @@ func (f *figo) SetPluginManager(manager *PluginManager) {
 	f.pluginManager = manager
 }
 
-// GetPluginManager returns the current plugin manager
+// GetPluginManager returns the current plugin manager, creating it on first
+// use. It used to return a nil *PluginManager on any instance that had never
+// registered a plugin, and PluginManager's methods are not nil-receiver-safe,
+// so every call the docs show on the result (ListPlugins, GetPlugin, the
+// Execute* helpers) panicked on a fresh instance. Constructing it lazily here
+// mirrors what RegisterPlugin already does.
 func (f *figo) GetPluginManager() *PluginManager {
-	f.mu.RLock()
-	defer f.mu.RUnlock()
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.pluginManager == nil {
+		f.pluginManager = NewPluginManager()
+	}
 	return f.pluginManager
 }
 

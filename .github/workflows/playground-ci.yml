@@ -3,11 +3,31 @@ name: Playground CI
 # The Go workflow ignores playground/** and the deploy workflow only fires on
 # push to main — without this, a TypeScript error in a playground PR merged
 # silently and only surfaced when the main-branch deploy failed.
+#
+# It also runs on push to main: without that, a playground change pushed
+# straight to main was only ever compiled by the deploy job, so a failure showed
+# up as a failed deploy rather than as a failed check.
+#
+# The Go paths are here because of the cross-check step below: it compares the
+# TypeScript emitter against the real Go parser, so a change to EITHER side can
+# break it. `test.yml` ignores playground/**, so without these entries a parser
+# change that made the emitter's output unrenderable would run no check at all.
 on:
   pull_request:
     paths:
       - "playground/**"
       - ".github/workflows/playground-ci.yml"
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
+  push:
+    branches: [main]
+    paths:
+      - "playground/**"
+      - ".github/workflows/playground-ci.yml"
+      - "**.go"
+      - "go.mod"
+      - "go.sum"
 
 jobs:
   build:
@@ -22,6 +42,33 @@ jobs:
           node-version: 22
           cache: npm
           cache-dependency-path: playground/package-lock.json
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
       - run: npm ci
       # Same build the deploy runs: tsc --noEmit && vite build.
       - run: npm run build
+      # DSL-emitter regression checks (hunt #7). Compiled with the tsc that is
+      # already a devDependency so no test runner has to be added; the script
+      # throws on a failed check, which fails the step.
+      - name: DSL emitter regression
+        run: |
+          npx tsc src/dsl.hunt7.regression.ts \
+            --outDir node_modules/.cache/dsl-regression \
+            --target es2022 --module esnext --moduleResolution bundler --skipLibCheck
+          node node_modules/.cache/dsl-regression/dsl.hunt7.regression.js
+      # Cross-language check (hunt #8): dsl.ts is a SECOND implementation of "what
+      # DSL figo accepts", and the regression suite above only pins it against
+      # itself. This step enumerates the emitter's node/value space and feeds every
+      # emitted string through the real Go parser and all four adapters, so a
+      # divergence fails here instead of in a user's query. `shell: bash` is
+      # required for pipefail — without it the pipe would swallow a tsc/node
+      # failure and only the Go half's exit status would count.
+      - name: DSL emitter vs the Go parser
+        shell: bash
+        run: |
+          npx tsc src/dsl.crosscheck.ts \
+            --outDir node_modules/.cache/dsl-crosscheck \
+            --target es2022 --module esnext --moduleResolution bundler --skipLibCheck
+          node node_modules/.cache/dsl-crosscheck/dsl.crosscheck.js \
+            | (cd .. && go run ./examples/dslcheck)

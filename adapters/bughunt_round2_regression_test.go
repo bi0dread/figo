@@ -9,6 +9,7 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.mongodb.org/mongo-driver/bson"
 	"gorm.io/driver/sqlite"
 	"gorm.io/gorm"
 )
@@ -51,7 +52,11 @@ func TestRegr_MongoProjectionFromSelectFields(t *testing.T) {
 	f.Build(MongoAdapter{})
 	opts := BuildMongoFindOptions(f)
 	require.NotNil(t, opts.Projection, "projection must be set when select fields are present")
-	proj, _ := json.Marshal(opts.Projection)
+	// The projection is an ordered bson.D (a map marshalled its keys in random
+	// order), so render it the way the driver will rather than via json.Marshal,
+	// which would emit the Key/Value struct form.
+	proj, err := bson.MarshalExtJSON(opts.Projection, false, false)
+	require.NoError(t, err)
 	assert.Contains(t, string(proj), `"id":1`)
 	assert.Contains(t, string(proj), `"name":1`)
 }

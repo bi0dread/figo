@@ -154,9 +154,15 @@ func TestAuditRecordsRejectedParseRegardlessOfOrder(t *testing.T) {
 		if err := f.AddFiltersFromString("a=1 and b=2"); err == nil {
 			t.Fatal("expected the limits rejection")
 		}
+		// Two entries: the DSL as received (BeforeParse) and the parse attempt
+		// (AfterParse). Both are recorded whatever order the plugins were
+		// registered in, because LimitsPlugin rejects in AfterParse and every
+		// AfterParse hook runs regardless of the others' errors.
 		entries := audit.History()
-		if len(entries) != 1 || entries[0].Kind != "parse" || entries[0].DSL != "a=1 and b=2" {
-			t.Errorf("auditFirst=%v: history = %+v, want exactly one parse-attempt entry", auditFirst, entries)
+		if len(entries) != 2 ||
+			entries[0].Kind != "parse-attempt" || entries[0].DSL != "a=1 and b=2" ||
+			entries[1].Kind != "parse" || entries[1].DSL != "a=1 and b=2" {
+			t.Errorf("auditFirst=%v: history = %+v, want a parse-attempt and a parse entry", auditFirst, entries)
 		}
 	}
 }

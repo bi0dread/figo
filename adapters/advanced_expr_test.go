@@ -79,17 +79,21 @@ func TestMongoAdvancedOperators(t *testing.T) {
 
 	t.Run("FullTextSearchUsesText", func(t *testing.T) {
 		m := buildMongo(t, FullTextSearchExpr{Field: "content", Query: "machine learning"})
-		txt, ok := m["$text"].(bson.M)
+		// bson.D (ordered), not bson.M: a two-key $text sub-document marshalled
+		// its keys in random order, so identical figo state produced different
+		// wire bytes run to run (hunt #6 L7).
+		txt, ok := m["$text"].(bson.D)
 		require.True(t, ok, "got %#v", m)
-		assert.Equal(t, "machine learning", txt["$search"])
-		_, hasLang := txt["$language"]
+		assert.Equal(t, "machine learning", txt.Map()["$search"])
+		_, hasLang := txt.Map()["$language"]
 		assert.False(t, hasLang, "language omitted when unset")
 	})
 
 	t.Run("FullTextSearchCarriesLanguage", func(t *testing.T) {
 		m := buildMongo(t, FullTextSearchExpr{Query: "hola", Language: "es"})
-		txt := m["$text"].(bson.M)
-		assert.Equal(t, "es", txt["$language"])
+		txt := m["$text"].(bson.D)
+		assert.Equal(t, "es", txt.Map()["$language"])
+		assert.Equal(t, "$search", txt[0].Key, "key order must be fixed, not map-random")
 	})
 
 	t.Run("GeoDistanceUsesCenterSphereInRadians", func(t *testing.T) {

@@ -15,6 +15,15 @@ import (
 // diffing of generated queries. The raw adapter already sorts its JOINs.
 func TestMongoAggregatePipelineIsDeterministic(t *testing.T) {
 	const dsl = `load=[Orders:id=1|Items:id=2|Payments:id=3|Refunds:id=4]`
+	// Every relation needs a MongoJoin: the old fallback invented a $lookup with
+	// empty localField/foreignField that MongoDB rejects (error 40352), so the
+	// builder now fails closed instead (hunt #6 H13).
+	joins := map[string]MongoJoin{
+		"Orders":   {From: "Orders", LocalField: "_id", ForeignField: "order_id", As: "Orders"},
+		"Items":    {From: "Items", LocalField: "_id", ForeignField: "item_id", As: "Items"},
+		"Payments": {From: "Payments", LocalField: "_id", ForeignField: "payment_id", As: "Payments"},
+		"Refunds":  {From: "Refunds", LocalField: "_id", ForeignField: "refund_id", As: "Refunds"},
+	}
 
 	var first string
 	for i := 0; i < 50; i++ {
@@ -24,7 +33,7 @@ func TestMongoAggregatePipelineIsDeterministic(t *testing.T) {
 		}
 		f.Build(MongoAdapter{})
 
-		pipeline, err := BuildMongoAggregatePipeline(f, nil)
+		pipeline, err := BuildMongoAggregatePipeline(f, joins)
 		if err != nil {
 			t.Fatalf("BuildMongoAggregatePipeline: %v", err)
 		}
@@ -50,7 +59,11 @@ func TestMongoAggregatePipelineLookupsSortedByRelation(t *testing.T) {
 	}
 	f.Build(MongoAdapter{})
 
-	pipeline, err := BuildMongoAggregatePipeline(f, nil)
+	joins := map[string]MongoJoin{
+		"Zebras": {From: "Zebras", LocalField: "_id", ForeignField: "zebra_id", As: "Zebras"},
+		"Apples": {From: "Apples", LocalField: "_id", ForeignField: "apple_id", As: "Apples"},
+	}
+	pipeline, err := BuildMongoAggregatePipeline(f, joins)
 	if err != nil {
 		t.Fatalf("BuildMongoAggregatePipeline: %v", err)
 	}
