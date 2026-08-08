@@ -8,20 +8,31 @@ on:
       - ".github/workflows/deploy-playground.yml"
   workflow_dispatch:
 
-# Pages serves the gh-pages branch; the deploy step pushes the built site there.
+# Pages serves the uploaded artifact directly — there is no publishing SOURCE
+# BRANCH any more. Deleting gh-pages is what unpublished the site on 2026-07-28
+# (GitHub disables a Pages site when its source branch goes away, and pushing
+# the branch back does not re-enable it), and a branch nothing reads cannot do
+# that again.
+#
+# deploy-pages needs pages:write to publish and id-token:write to mint the OIDC
+# token the Pages API decodes to verify which repo, ref and workflow the
+# deployment came from. Nothing pushes to the repo now that the branch-publish
+# step is gone, so contents drops back to read.
 permissions:
-  contents: write
+  contents: read
+  pages: write
+  id-token: write
 
+# One deployment at a time, and never cancel one in flight: deploy-pages traps
+# SIGTERM and cancels the LIVE Pages deployment, so cancel-in-progress: true
+# aborts a production publish rather than merely abandoning a runner.
 concurrency:
   group: pages
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
-  deploy:
+  build:
     runs-on: ubuntu-latest
-    defaults:
-      run:
-        working-directory: playground
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -30,9 +41,23 @@ jobs:
           cache: npm
           cache-dependency-path: playground/package-lock.json
       - run: npm ci
+        working-directory: playground
       # serve under https://<owner>.github.io/<repo>/
       - run: npm run build -- --base="/${{ github.event.repository.name }}/"
-      - uses: peaceiris/actions-gh-pages@v4
+        working-directory: playground
+      # path is workspace-relative on purpose: upload-pages-artifact is a
+      # composite action, and neither a job-level working-directory nor
+      # defaults.run reaches the tar step inside it.
+      - uses: actions/upload-pages-artifact@v5
         with:
-          github_token: ${{ secrets.GITHUB_TOKEN }}
-          publish_dir: playground/dist
+          path: playground/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
