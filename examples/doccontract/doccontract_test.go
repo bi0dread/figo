@@ -123,6 +123,24 @@ func TestES8_ReadmeDocumentsFailClosedContract(t *testing.T) {
 	}
 }
 
+// TestPlaygroundReadmeDocumentsCrossCheck pins playground/README.md to the
+// cross-check that now exists: playground-ci.yml's "DSL emitter vs the Go
+// parser" step pipes the TS emitter's enumerated output through
+// examples/dslcheck. The README predates that step and still said "There is
+// no automated cross-check between the two" — a doc/CI contradiction of
+// exactly the kind this package exists to catch, just in the other direction
+// (the prose UNDERclaimed what the repo enforces, so a reader had no reason
+// to trust the emitter's output).
+func TestPlaygroundReadmeDocumentsCrossCheck(t *testing.T) {
+	body := readDoc(t, filepath.Join("playground", "README.md"))
+	if strings.Contains(body, "no automated cross-check") {
+		t.Error("playground/README.md still denies the dslcheck cross-check")
+	}
+	if !strings.Contains(body, "dslcheck") {
+		t.Error("playground/README.md does not mention the dslcheck cross-check")
+	}
+}
+
 // --------------------------------------------------------------------------
 // The pins: the code behaviour the docs now describe.
 // --------------------------------------------------------------------------

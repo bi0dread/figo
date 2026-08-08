@@ -56,6 +56,7 @@ func main() {
 	fmt.Println("\n📝 Example 3: Wildcard Search")
 	f3 := figo.New()
 	f3.AddFiltersFromString(`email =^ "%gmail%"`)
+	f3.GetSelectFields()
 	f3.Build(adapters.ElasticsearchAdapter{})
 
 	jsonStr3 := esQuery("Example 3", f3)
@@ -140,7 +141,7 @@ func main() {
 	fmt.Println("\n💡 Tips:")
 	fmt.Println("  - Use the DSL syntax for simple queries")
 	fmt.Println("  - Use the fluent builder for complex query construction")
-	fmt.Println("  - All queries are type-safe and validated")
-	fmt.Println("  - Supports all Elasticsearch query types")
+	fmt.Println("  - Anything unrenderable fails closed to a match-nothing query, never a wider one")
+	fmt.Println("  - Covers the DSL's operator set: term, terms, range, wildcard, and bool queries")
 	fmt.Println("  - Works with pagination, sorting, and field selection")
 }

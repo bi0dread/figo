@@ -35,8 +35,13 @@ import (
 // BeforeParse (SyntaxPlugin's strict mode) left no trace at all — malformed
 // and probing input was the one thing invisible to the trail — and with repair
 // enabled the only recorded DSL was the REPAIRED string, never what arrived.
-// BeforeParse hooks DO short-circuit on the first error, so register the
-// AuditPlugin BEFORE any plugin that can reject or rewrite in BeforeParse.
+// BeforeParse hooks do NOT short-circuit either: every hook runs even after
+// an earlier one errors, with the erroring hook's output discarded and later
+// hooks fed the last good DSL (see figo's ExecuteBeforeParse), so a rejecting
+// plugin cannot hide the attempt from this trail whatever the order. Order
+// still matters for REWRITERS: a repairing SyntaxPlugin registered ahead of
+// the AuditPlugin feeds it the repaired string, so register the AuditPlugin
+// first when "parse-attempt" must record the DSL exactly as it arrived.
 type AuditPlugin struct {
 	mu      sync.RWMutex
 	logger  *slog.Logger

@@ -27,8 +27,12 @@ Values follow figo's typing rules: numbers, booleans, `null`, and ISO dates stay
 everything else is double-quoted. Wrap a value in quotes yourself (`"0123"`) to force string
 typing. Nodes that don't reach the Query node are dimmed and excluded from the DSL.
 
-The generated strings were validated by hand against the actual Go parser
-(`figo.AddFiltersFromString` + the raw SQL adapter) when the playground was
-built — operator coverage, nested groups, preload filters, and the
-list/range/null forms. There is no automated cross-check between the two, so
-if they ever disagree, the Go parser is authoritative.
+The DSL emitter here is an independent TypeScript re-implementation
+(`src/dsl.ts`) — figo's Go code never runs in the browser. It is cross-checked
+automatically in CI: the "DSL emitter vs the Go parser" step of
+`.github/workflows/playground-ci.yml` enumerates the emitter's node/value
+space and feeds every emitted string through the real Go parser and all four
+adapters (`examples/dslcheck`), so a divergence fails the build instead of a
+user's query. The `=~` regex operator is exempt from the cross-check, and
+wherever the two implementations could ever disagree, the Go parser is
+authoritative.

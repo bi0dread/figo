@@ -48,6 +48,22 @@ func toGormClauseWithFigo(e figo.Expr, f figo.Figo) (clause.Expression, error) {
 		return parts, nil
 	}
 
+	// Filter-position identifiers get the same two refusals the SELECT list
+	// gets (see gormIdentScreen): a control byte or an empty dot-segment
+	// cannot be repaired by dialector quoting, and the raw adapter's
+	// validateIdent already fails closed on both in every position — this was
+	// the one position on this adapter that still handed them to the
+	// dialector. CustomExpr is exempt by contract (its handler receives the
+	// field verbatim, exactly like the raw adapter's CustomExpr path), and
+	// logical nodes have no field (ExprField returns "").
+	if _, isCustom := e.(figo.CustomExpr); !isCustom {
+		if field := figo.ExprField(e); field != "" {
+			if err := gormIdentScreen("filter field", field); err != nil {
+				return nil, err
+			}
+		}
+	}
+
 	switch x := e.(type) {
 	case figo.EqExpr:
 		return clause.Eq{Column: getFieldName(x.Field), Value: x.Value}, nil
@@ -259,6 +275,29 @@ func gormStatementContext(db *gorm.DB) context.Context {
 	return context.Background()
 }
 
+// gormIdentScreen refuses the two identifier classes quoting cannot repair —
+// a C0/DEL control byte and an empty name or dot-segment (the rationale is on
+// gormProjectionName below). It is shared by the SELECT-list screen there and
+// the filter-position screen in toGormClauseWithFigo; the raw adapter's
+// validateIdent refuses the same two classes in every identifier position.
+// what names the position for the error message.
+func gormIdentScreen(what, name string) error {
+	if name == "" {
+		return fmt.Errorf("gorm adapter: %s %q is empty", what, name)
+	}
+	for _, seg := range strings.Split(name, ".") {
+		if seg == "" {
+			return fmt.Errorf("gorm adapter: %s %q has an empty name segment", what, name)
+		}
+	}
+	for i := 0; i < len(name); i++ {
+		if c := name[i]; c < 0x20 || c == 0x7f {
+			return fmt.Errorf("gorm adapter: %s %q contains control byte 0x%02x", what, name, c)
+		}
+	}
+	return nil
+}
+
 // gormProjectionName screens one projection name for the SELECT list and
 // reports whether it is a BARE column identifier, optionally table-qualified
 // ("age", "users.age").
@@ -288,18 +327,8 @@ func gormStatementContext(db *gorm.DB) context.Context {
 //     zero-length delimited identifier, i.e. a CONSTANT column: "..." projected
 //     `.`.`.` and came back with rows and no error, a silently wrong result set.
 func gormProjectionName(name string) (bare bool, err error) {
-	if name == "" {
-		return false, fmt.Errorf("gorm adapter: select field %q is empty", name)
-	}
-	for _, seg := range strings.Split(name, ".") {
-		if seg == "" {
-			return false, fmt.Errorf("gorm adapter: select field %q has an empty name segment", name)
-		}
-	}
-	for i := 0; i < len(name); i++ {
-		if c := name[i]; c < 0x20 || c == 0x7f {
-			return false, fmt.Errorf("gorm adapter: select field %q contains control byte 0x%02x", name, c)
-		}
+	if err := gormIdentScreen("select field", name); err != nil {
+		return false, err
 	}
 	bare = true
 	for _, r := range name {

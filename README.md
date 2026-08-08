@@ -85,7 +85,6 @@ import (
 - [Concurrency](#concurrency)
 - [Testing](#testing)
 - [Status of features](#status-of-features)
-- [Contributing](#contributing)
 - [License](#license)
 
 ## Core concept: parse once, render per adapter
@@ -649,6 +648,7 @@ Cached rendering lives on the `CachePlugin` (see [Caching](#caching)): `cp.GetCa
 ```go
 SetPage(skip, take int)
 SetPageString(v string)             // "skip:10,take:5"
+SetPageStringE(v string) error      // same, but reports malformed/ignored segments (valid ones still apply)
 GetPage() Page                      // returns a copy — use SetPage to change it
 SetSort(sort *OrderBy)              // nil clears; copied in
 GetSort() *OrderBy                  // returns a copy
@@ -764,6 +764,8 @@ f.Build(adapters.RawAdapter{})
 ```
 
 Multiple scopes are ANDed in; `sp.AddScope(...)` adds more. Rebuilds never duplicate an already-present scope.
+
+> **Security note — preloads are NOT scoped by default.** The scope guards the top-level query only. A relation pulled in with `load=[Orders:...]` is fetched by a separate query on GORM (and is an unfiltered array on Mongo), so a child row belonging to another tenant comes back inside a correctly scoped parent. Which column scopes a child table is a property of that table and is not inferred from the parent — register it explicitly with `sp.AddPreloadScope("Orders", figo.EqExpr{Field: "tenant_id", Value: tenantID})`, or `sp.AddPreloadScopeAll(...)` to apply conditions to every preloaded relation.
 
 ## Auditing
 

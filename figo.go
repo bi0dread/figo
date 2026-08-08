@@ -825,6 +825,50 @@ func addDiag(diags *[]error, format string, args ...any) {
 	}
 }
 
+// Two resource caps are checked BEFORE the scanner sees a byte, so refusing a
+// hostile input never depends on surviving it. Every parser DoS to date was a
+// super-linear path reached by untrusted input (nested load= re-parsing burned
+// 2s CPU and 167MB heap on a 36KB filter; left-nested connector chains took
+// 12s at 50k conjuncts), and each was patched pointwise after the fact — but a
+// LimitsPlugin budget cannot protect the parse that MEASURES the query,
+// because limits run AfterParse on the built tree. These caps sit far above
+// everything the regression suite pins as supported (50k nested groups,
+// 20k-conjunct chains, 40k-deep not-runs — all under 200KB): they bound the
+// damage of the NEXT super-linear path, they do not police query size.
+const (
+	maxDSLBytes      = 1 << 20 // 1 MiB
+	maxDSLGroupDepth = 100_000
+)
+
+// dslResourceGuard reports why expr must not be parsed, or "" when it is
+// within the caps. The depth scan is quote-aware under the same rule as the
+// tokenizer (a bare '"' toggles, no escapes), so parens inside a string
+// literal do not count toward nesting.
+func dslResourceGuard(expr string) string {
+	if len(expr) > maxDSLBytes {
+		return fmt.Sprintf("DSL is %d bytes, over the %d-byte parser cap", len(expr), maxDSLBytes)
+	}
+	depth, inQuote := 0, false
+	for i := 0; i < len(expr); i++ {
+		switch expr[i] {
+		case '"':
+			inQuote = !inQuote
+		case '(':
+			if !inQuote {
+				depth++
+				if depth > maxDSLGroupDepth {
+					return fmt.Sprintf("DSL nests groups deeper than the %d-level parser cap", maxDSLGroupDepth)
+				}
+			}
+		case ')':
+			if !inQuote && depth > 0 {
+				depth--
+			}
+		}
+	}
+	return ""
+}
+
 // parseDSL scans the DSL into the Node tree. Malformed constructs are skipped
 // (never fatal) exactly as they always were; each skip is additionally
 // recorded into diags so BuildE can report what the built query does NOT
@@ -1583,8 +1627,33 @@ func ParseValue(str string) any {
 	return parseScalarLiteral(str)
 }
 
+// mayBeDate is a cheap shape gate in front of parseDate's layout probe. The
+// probe runs on EVERY unquoted literal that survives numeric typing —
+// including each element of an IN list — and trying 11 layouts against input
+// that cannot possibly be a date is pure waste. It is strictly conservative:
+// every layout below either starts with a digit and carries a '-' or '/'
+// separator, or starts with a month name (matched case-insensitively by
+// time.Parse) and carries a comma, and nothing under 10 or over 64 bytes
+// parses under any of them (the shortest is "2006-01-02", the longest a
+// nanosecond RFC3339 timestamp — fractions past 9 digits are a parse error).
+func mayBeDate(s string) bool {
+	if len(s) < 10 || len(s) > 64 {
+		return false
+	}
+	switch c := s[0]; {
+	case c >= '0' && c <= '9':
+		return strings.ContainsAny(s, "-/")
+	case (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'):
+		return strings.IndexByte(s, ',') >= 0
+	}
+	return false
+}
+
 // parseDate attempts to parse a string as a date using common formats
 func parseDate(s string) (time.Time, error) {
+	if !mayBeDate(s) {
+		return time.Time{}, fmt.Errorf("unable to parse date: %s", s)
+	}
 	// Common date formats to try
 	formats := []string{
 		time.RFC3339,           // 2006-01-02T15:04:05Z07:00
@@ -2959,10 +3028,21 @@ func (f *figo) BuildE(adapter Adapter) error {
 	f.builtFromDSL = true
 
 	var diags []error
-	root := f.parseDSL(f.dsl, &diags)
-	expressionParser(root, &diags)
-
-	finalExpr := getFinalExpr(*root)
+	var finalExpr Expr
+	guardTripped := false
+	if reason := dslResourceGuard(f.dsl); reason != "" {
+		// Refused unscanned, and fail closed: the pill renders 1=0 on every
+		// adapter, so an input too large to parse can only ever narrow the
+		// query, and the non-nil BuildE error tells a validating caller to
+		// reject it.
+		addDiag(&diags, "%s; the input was not parsed and the query matches nothing", reason)
+		finalExpr = OrExpr{}
+		guardTripped = true
+	} else {
+		root := f.parseDSL(f.dsl, &diags)
+		expressionParser(root, &diags)
+		finalExpr = getFinalExpr(*root)
+	}
 
 	// Detach the freshly parsed preloads so plugin filters can run on them
 	// outside the lock (concurrent readers see an empty map until the
@@ -2988,7 +3068,11 @@ func (f *figo) BuildE(adapter Adapter) error {
 	// this instance's read methods, which must not deadlock. Preload
 	// conditions parse through the same DSL, so they are filtered as well.
 	if pm != nil {
-		if finalExpr != nil {
+		// The resource-guard pill must skip the filter pass: pruning rebuilds
+		// logical nodes and drops an empty OrExpr entirely (pruneExprFields),
+		// which would launder the refusal into a filter-less match-everything
+		// query the moment a FieldsPlugin is registered.
+		if finalExpr != nil && !guardTripped {
 			finalExpr = pm.ExecuteExprFilters(f, finalExpr)
 		}
 		for table, exprs := range preloads {
