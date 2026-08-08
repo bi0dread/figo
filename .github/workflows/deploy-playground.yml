@@ -14,14 +14,11 @@ on:
 # the branch back does not re-enable it), and a branch nothing reads cannot do
 # that again.
 #
-# deploy-pages needs pages:write to publish and id-token:write to mint the OIDC
-# token the Pages API decodes to verify which repo, ref and workflow the
-# deployment came from. Nothing pushes to the repo now that the branch-publish
-# step is gone, so contents drops back to read.
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+# Permissions are per JOB, not workflow-wide, so the job that runs `npm ci` (i.e.
+# third-party install scripts) never holds a token that can publish: build gets
+# contents:read, and only deploy gets pages:write to publish plus id-token:write
+# to mint the OIDC token the Pages API decodes to verify which repo, ref and
+# workflow the deployment came from.
 
 # One deployment at a time, and never cancel one in flight: deploy-pages traps
 # SIGTERM and cancels the LIVE Pages deployment, so cancel-in-progress: true
@@ -33,6 +30,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-node@v5
@@ -55,6 +54,9 @@ jobs:
   deploy:
     needs: build
     runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
