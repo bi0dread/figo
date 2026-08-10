@@ -463,8 +463,8 @@ func ApplyGorm(f figo.Figo, trx *gorm.DB) *gorm.DB {
 				// list's own order and ahead of GetSort's columns — the same
 				// contract the raw adapter's buildOrderBy implements. Ignoring
 				// it made ONE figo instance return a different row ORDER on the
-				// GORM adapter than on the raw adapter, and with figo's default
-				// take:20 in force that is a different PAGE OF ROWS.
+				// GORM adapter than on the raw adapter, and under any take: at
+				// all that is a different PAGE OF ROWS.
 				//
 				// This is not the expression position: an OrderBy nested inside
 				// And/Or/Not still renders as nothing (see the figo.OrderBy case

@@ -242,7 +242,7 @@ func main() {
     f.Build(adapters.RawAdapter{})
 
     fmt.Println(f.GetSqlString(adapters.RawContext{Table: "users"}))
-    // SELECT * FROM `users` WHERE `idd` = 1 LIMIT 20
+    // SELECT * FROM `users` WHERE `idd` = 1
 }
 ```
 

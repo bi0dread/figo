@@ -214,7 +214,7 @@ func TestG1_ProjectionKeepsCallerDistinctAndJoins(t *testing.T) {
 
 		sql, ok := GormAdapter{}.GetSqlString(f, db.Model(&gormH8User{}))
 		require.True(t, ok)
-		assert.Equal(t, "SELECT `age`,`id` FROM `gorm_h8_users` LIMIT 20", sql)
+		assert.Equal(t, "SELECT `age`,`id` FROM `gorm_h8_users`", sql)
 
 		var out []gormH8User
 		require.NoError(t, ApplyGorm(f, db.Model(&gormH8User{})).Find(&out).Error)
@@ -229,8 +229,8 @@ func TestG1_ProjectionKeepsCallerDistinctAndJoins(t *testing.T) {
 // The divergence A1/A3-3 was filed to close was inverted rather than closed:
 // raw started rendering the clause-list form in the same commit in which GORM
 // stopped, so one figo instance still returned rows in a different ORDER
-// depending on the adapter — and with figo's default take:20 in force, that is a
-// different PAGE of rows. The contract pinned here: honour it at the top level
+// depending on the adapter — and under any take: at all, that is a different
+// PAGE of rows. The contract pinned here: honour it at the top level
 // on both adapters, clause-list columns first and GetSort's after, and continue
 // to ignore it in a boolean/expression position.
 func TestG2_ClauseListOrderByRendersOnGormAndRaw(t *testing.T) {

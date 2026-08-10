@@ -259,8 +259,8 @@ func TestPageOriginTracking(t *testing.T) {
 	}
 	_ = f.AddFiltersFromString(`name="x"`)
 	f.Build(nil)
-	if p := f.GetPage(); p.Skip != 0 || p.Take != 20 {
-		t.Errorf("page = %+v after DSL replacement, want the default {0 20}", p)
+	if p := f.GetPage(); p.Skip != 0 || p.Take != 0 {
+		t.Errorf("page = %+v after DSL replacement, want the default {0 0}", p)
 	}
 
 	f2 := figo.New()

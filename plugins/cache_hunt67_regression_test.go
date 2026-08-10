@@ -94,7 +94,7 @@ func TestP3_CacheKeyKeepsCtxTypeAndConditionTypeBoundaries(t *testing.T) {
 
 	byString := cp.GetCachedSqlString(f, "{users}")
 	byStruct := cp.GetCachedSqlString(f, adapters.RawContext{Table: "users"})
-	assert.Equal(t, "SELECT * FROM `{users}` WHERE `id` = 1 LIMIT 20", byString)
+	assert.Equal(t, "SELECT * FROM `{users}` WHERE `id` = 1", byString)
 	assert.Equal(t, f.GetSqlString(adapters.RawContext{Table: "users"}), byStruct,
 		"a string ctx and a RawContext that print alike must not share a key")
 

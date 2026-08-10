@@ -91,7 +91,7 @@ func TestH8A103DeepCopyOfSharedSubtreeIsNotExponential(t *testing.T) {
 	renderTook := time.Since(start)
 	require.NoError(t, err)
 	assert.Len(t, args, 1, "the value is a bind parameter, it never reaches the SQL text")
-	assert.Equal(t, "SELECT * FROM `users` WHERE `meta` = ? LIMIT 20", sql)
+	assert.Equal(t, "SELECT * FROM `users` WHERE `meta` = ?", sql)
 	assert.Less(t, renderTook, 50*time.Millisecond, "raw render with a DAG value took %v", renderTook)
 }
 

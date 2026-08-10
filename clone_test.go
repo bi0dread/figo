@@ -41,7 +41,7 @@ func TestCloneIsIndependent(t *testing.T) {
 
 	// Original is untouched.
 	assert.Len(t, f.GetClauses(), 1, "clone AddFilter must not grow the original")
-	assert.Equal(t, Page{Skip: 0, Take: 20}, f.GetPage(), "clone SetPage must not affect the original")
+	assert.Equal(t, Page{Skip: 0, Take: 0}, f.GetPage(), "clone SetPage must not affect the original")
 	assert.NotContains(t, f.GetSelectFields(), "clone_only", "clone select-field must not leak to original")
 
 	// Clone has its own changes.

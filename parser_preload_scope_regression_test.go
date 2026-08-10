@@ -37,7 +37,7 @@ func TestPreloadPageDoesNotLeakToMainQuery(t *testing.T) {
 	require.NoError(t, f.AddFiltersFromString(`name=x load=[Phone:page=skip:90,take:5 and id=1]`))
 	err := f.BuildE(RawAdapter{})
 
-	assert.Equal(t, Page{Skip: 0, Take: 20}, f.GetPage(), "preload page= must not change the main query's paging")
+	assert.Equal(t, Page{Skip: 0, Take: 0}, f.GetPage(), "preload page= must not change the main query's paging")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "page= inside load=")
 }

@@ -212,7 +212,7 @@ func TestM2_PartialPageDirectiveKeepsSetPage(t *testing.T) {
 		assert.Equal(t, Page{Skip: 2, Take: 7}, f.GetPage())
 		require.NoError(t, f.AddFiltersFromString(`a=1`))
 		f.Build(RawAdapter{})
-		assert.Equal(t, Page{Skip: 0, Take: 20}, f.GetPage(), "a DSL-owned page resets when the DSL drops it")
+		assert.Equal(t, Page{Skip: 0, Take: 0}, f.GetPage(), "a DSL-owned page resets when the DSL drops it")
 	})
 }
 
@@ -482,11 +482,11 @@ func TestSetPageStringE_ReportsDiscardedInput(t *testing.T) {
 		wantErr string
 	}{
 		{"skip:1,take:5", Page{Skip: 1, Take: 5}, ""},
-		{"skip:abc", Page{Skip: 0, Take: 20}, "invalid page value"},
-		{"garbage", Page{Skip: 0, Take: 20}, "malformed page segment"},
+		{"skip:abc", Page{Skip: 0, Take: 0}, "invalid page value"},
+		{"garbage", Page{Skip: 0, Take: 0}, "malformed page segment"},
 		{"skip:5,take:7,extra:1", Page{Skip: 5, Take: 7}, "unknown page key"},
 		{"skip:-4,take:-9", Page{Skip: 0, Take: 0}, "negative page value"},
-		{"", Page{Skip: 0, Take: 20}, ""},
+		{"", Page{Skip: 0, Take: 0}, ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.in, func(t *testing.T) {

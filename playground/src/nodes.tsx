@@ -180,7 +180,7 @@ export function PageNode({ id, data }: NodeProps) {
             className="nodrag"
             type="number"
             min={0}
-            value={Number(data.take ?? 20)}
+            value={Number(data.take ?? 0)}
             onChange={(e) => updateNodeData(id, { take: nonNegative(e.target.value) })}
           />
         </label>

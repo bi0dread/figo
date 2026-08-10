@@ -226,7 +226,7 @@ function defaultData(item: PaletteItem): Record<string, any> {
     case 'sort':
       return { field: '', dir: 'asc' }
     case 'page':
-      return { skip: 0, take: 20 }
+      return { skip: 0, take: 0 }
     case 'load':
       return { relation: '' }
   }

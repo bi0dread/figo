@@ -143,6 +143,9 @@ func TestH8_R1_UnrelatedSegmentsUnchanged(t *testing.T) {
 		t.Fatal(err)
 	}
 	f.SetSelectFields("name", "age")
+	// The default page is {0,0} (no LIMIT), and `page=2` above is malformed, so
+	// the LIMIT segment needs an explicit page to have anything to render.
+	f.SetPage(0, 20)
 	f.Build(RawAdapter{Dialect: MySQLDialect})
 	a := RawAdapter{Dialect: MySQLDialect}
 

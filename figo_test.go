@@ -20,7 +20,7 @@ func TestNew(t *testing.T) {
 	f := New()
 	assert.NotNil(t, f)
 	assert.Equal(t, 0, f.GetPage().Skip)
-	assert.Equal(t, 20, f.GetPage().Take)
+	assert.Equal(t, 0, f.GetPage().Take)
 }
 
 func TestAddSelectFields(t *testing.T) {
@@ -1989,21 +1989,21 @@ func TestSortPageComprehensive(t *testing.T) {
 				name:        "EmptyPage",
 				dsl:         "page=",
 				expectSkip:  0,
-				expectTake:  20, // Default value
+				expectTake:  0, // Default value: no limit
 				description: "Empty page should use defaults",
 			},
 			{
 				name:        "InvalidPageFormat",
 				dsl:         "page=invalid",
 				expectSkip:  0,
-				expectTake:  20, // Default value
+				expectTake:  0, // Default value: no limit
 				description: "Invalid page format should use defaults",
 			},
 			{
 				name:        "PartialPage",
 				dsl:         "page=skip:10",
 				expectSkip:  10,
-				expectTake:  20, // Default value
+				expectTake:  0, // Default value: no limit
 				description: "Partial page should use defaults for missing values",
 			},
 			{

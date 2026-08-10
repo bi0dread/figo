@@ -83,7 +83,7 @@ func TestA3_1_CustomExprCompoundFragmentIsParenthesized(t *testing.T) {
 	}})
 	f.Build(RawAdapter{Dialect: SQLiteDialect})
 	q := sqliteQuery(t, f)
-	assert.Equal(t, `SELECT * FROM "items" WHERE ("tenant" = ? AND (id = ? OR id = ?)) LIMIT 20`, q.SQL)
+	assert.Equal(t, `SELECT * FROM "items" WHERE ("tenant" = ? AND (id = ? OR id = ?))`, q.SQL)
 	assert.Empty(t, queryIDs(t, d, q), "rows outside the tenant scope came back: %s", q.SQL)
 
 	// Two compound fragments joined at the top level: also empty.
@@ -95,7 +95,7 @@ func TestA3_1_CustomExprCompoundFragmentIsParenthesized(t *testing.T) {
 	f2.AddFilter(anyOf())
 	f2.Build(RawAdapter{Dialect: SQLiteDialect})
 	q2 := sqliteQuery(t, f2)
-	assert.Equal(t, `SELECT * FROM "items" WHERE (id = ? OR id = ?) AND (id = ? OR id = ?) LIMIT 20`, q2.SQL)
+	assert.Equal(t, `SELECT * FROM "items" WHERE (id = ? OR id = ?) AND (id = ? OR id = ?)`, q2.SQL)
 	assert.Empty(t, queryIDs(t, d, q2))
 
 	// An empty fragment is still dropped entirely (no stray "()").
@@ -104,7 +104,7 @@ func TestA3_1_CustomExprCompoundFragmentIsParenthesized(t *testing.T) {
 	f3.AddFilter(figo.CustomExpr{Field: "id", Operator: "noop",
 		Handler: func(field, op string, v any) (string, []any, error) { return "", nil, nil }})
 	f3.Build(RawAdapter{Dialect: SQLiteDialect})
-	assert.Equal(t, `SELECT * FROM "items" WHERE "tenant" = ? LIMIT 20`, sqliteQuery(t, f3).SQL)
+	assert.Equal(t, `SELECT * FROM "items" WHERE "tenant" = ?`, sqliteQuery(t, f3).SQL)
 }
 
 // H9: with a JOIN emitted next to an unqualified main WHERE, any column both
@@ -159,7 +159,7 @@ func TestH9_H10_PreloadDoesNotAlterTheMainResultSet(t *testing.T) {
 // hides the $n half of the mismatch.
 func TestH11_DialectComesFromTheReceiver(t *testing.T) {
 	recv := RawAdapter{Dialect: PostgresDialect}
-	const want = `SELECT * FROM "t" WHERE ("id" = $1 AND "name" = $2) LIMIT 20`
+	const want = `SELECT * FROM "t" WHERE ("id" = $1 AND "name" = $2)`
 
 	build := func(a figo.Adapter) figo.Figo {
 		f := figo.New()
@@ -276,7 +276,7 @@ func TestL3_ProjectionIsDedupedAfterNormalization(t *testing.T) {
 
 	s, ok := RawAdapter{}.GetSqlString(f, RawContext{Table: "t"})
 	require.True(t, ok)
-	assert.Equal(t, "SELECT `user_name`, `id` FROM `t` LIMIT 20", s)
+	assert.Equal(t, "SELECT `user_name`, `id` FROM `t`", s)
 	assert.Equal(t, 1, strings.Count(s, "`user_name`"))
 }
 
@@ -342,7 +342,7 @@ func TestA3_4_CustomExprSliceArgExpands(t *testing.T) {
 		}})
 	f.Build(RawAdapter{Dialect: SQLiteDialect})
 	q := sqliteQuery(t, f)
-	assert.Equal(t, `SELECT * FROM "items" WHERE (id IN (?,?)) LIMIT 20`, q.SQL)
+	assert.Equal(t, `SELECT * FROM "items" WHERE (id IN (?,?))`, q.SQL)
 	assert.Equal(t, []any{int64(1), int64(3)}, q.Args)
 	assert.Equal(t, []int64{1, 3}, queryIDs(t, d, q))
 
@@ -354,7 +354,7 @@ func TestA3_4_CustomExprSliceArgExpands(t *testing.T) {
 		}})
 	fe.Build(RawAdapter{Dialect: SQLiteDialect})
 	qe := sqliteQuery(t, fe)
-	assert.Equal(t, `SELECT * FROM "items" WHERE (id IN (NULL)) LIMIT 20`, qe.SQL)
+	assert.Equal(t, `SELECT * FROM "items" WHERE (id IN (NULL))`, qe.SQL)
 	assert.Empty(t, queryIDs(t, d, qe))
 
 	// Values a driver CAN bind are never expanded: []byte, and a '?' that does
@@ -366,7 +366,7 @@ func TestA3_4_CustomExprSliceArgExpands(t *testing.T) {
 		}})
 	fb.Build(RawAdapter{Dialect: SQLiteDialect})
 	qb := sqliteQuery(t, fb)
-	assert.Equal(t, `SELECT * FROM "items" WHERE (name = ? AND id IN (?)) LIMIT 20`, qb.SQL)
+	assert.Equal(t, `SELECT * FROM "items" WHERE (name = ? AND id IN (?))`, qb.SQL)
 	assert.Equal(t, []byte("alice"), qb.Args[0])
 
 	// A scalar handler is untouched.

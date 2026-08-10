@@ -726,10 +726,15 @@ type figo struct {
 
 // New constructs a new instance. Supply the adapter when you build:
 // Build(GormAdapter{}) (or via SetAdapterObject). New itself takes no adapter.
+//
+// Pagination defaults to {Skip: 0, Take: 0} — no OFFSET and no LIMIT. A query
+// that never mentions page= is unbounded, so a caller that wants a page has to
+// say so, via page= in the DSL or SetPage. Nothing in the library caps a result
+// set on the caller's behalf.
 func New() Figo {
 	return &figo{page: Page{
 		Skip: 0,
-		Take: 20,
+		Take: 0,
 	}, preloads: make(map[string][]Expr), selectFields: make(map[string]bool), selectFieldsAsked: make(map[string]bool), clauses: make([]Expr, 0), namingFunc: SnakeCaseNaming}
 }
 
@@ -737,7 +742,7 @@ func New() Figo {
 // supplied. It used to be a single bool set on the mere PRESENCE of the token,
 // before any segment was validated, so a partial or malformed directive claimed
 // the caller's whole SetPage value: "page=skip:5" + SetPage(0,100) built
-// {5,100} the first time and {5,20} the second, because the rebuild reset the
+// {5,100} the first time and {5,0} the second, because the rebuild reset the
 // Take the DSL never mentioned. Resetting per component keeps Build idempotent
 // and leaves SetPage owning everything the DSL did not set. (sort= has always
 // gated its ownership flag on a segment actually parsing — see :1032.)
@@ -754,7 +759,7 @@ func (f *figo) resetDSLPage() {
 	if f.pageFromDSL == 0 {
 		return
 	}
-	def := Page{Skip: 0, Take: 20} // New()'s default
+	def := Page{Skip: 0, Take: 0} // New()'s default
 	if f.pageFromDSL&pageSkipFromDSL != 0 {
 		f.page.Skip = def.Skip
 	}
@@ -2751,7 +2756,7 @@ func (f *figo) SetPageString(v string) {
 //
 // It exists because SetPageString normalized garbage into a plausible-looking
 // page and had no diagnostic channel at all: "garbage" and "skip:abc" both
-// silently left the {0,20} default, an unknown key was ignored, and
+// silently left whatever page was already set, an unknown key was ignored, and
 // "skip:-4,take:-9" clamped to {0,0} — a Take of 0 meaning "no LIMIT", i.e.
 // the opposite of the tiny page the caller asked for.
 func (f *figo) SetPageStringE(v string) error {

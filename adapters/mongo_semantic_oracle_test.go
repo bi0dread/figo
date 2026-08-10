@@ -762,8 +762,10 @@ func TestMongoSemanticOracle_SortAndPage(t *testing.T) {
 		dsl string
 		sql string
 	}{
-		{`sort=a:asc`, `SELECT id FROM items ORDER BY a ASC LIMIT 20`},
-		{`sort=a:desc`, `SELECT id FROM items ORDER BY a DESC LIMIT 20`},
+		// No page= at all: figo's default is take:0, i.e. no LIMIT, so the
+		// oracle statement must not carry one either.
+		{`sort=a:asc`, `SELECT id FROM items ORDER BY a ASC`},
+		{`sort=a:desc`, `SELECT id FROM items ORDER BY a DESC`},
 		{`sort=a:asc page=take:2`, `SELECT id FROM items ORDER BY a ASC LIMIT 2`},
 		{`sort=a:asc page=take:2,skip:2`, `SELECT id FROM items ORDER BY a ASC LIMIT 2 OFFSET 2`},
 		{`sort=b:desc page=take:3,skip:1`, `SELECT id FROM items ORDER BY b DESC LIMIT 3 OFFSET 1`},

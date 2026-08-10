@@ -110,7 +110,7 @@ where, args, err := adapters.BuildRawWhere(f)
 
 > **Note:** `New()` takes no adapter. Supply it at `Build(adapter)` or via `SetAdapterObject(adapter)`. `Build` takes exactly one adapter; pass `Build(nil)` to rebuild against whatever adapter was set previously (by an earlier `Build` or `SetAdapterObject`).
 
-**Defaults set by `New()`:** pagination starts at `skip:0, take:20` — a query with no `page=` directive is limited to 20 rows. Use `page=` in the DSL or `SetPage(skip, take)` to change it (`take:0` = no limit). Naming defaults to snake_case (`figo.SnakeCaseNaming`).
+**Defaults set by `New()`:** pagination starts at `skip:0, take:0` — `take:0` means *no limit*, so a query with no `page=` directive returns every matching row. Nothing caps a result set on your behalf; use `page=` in the DSL or `SetPage(skip, take)` when you want a page. Naming defaults to snake_case (`figo.SnakeCaseNaming`).
 
 ## Quick start
 
@@ -457,8 +457,8 @@ f.AddFiltersFromString(`id>0 load=[Orders:total>100]`)
 f.Build(adapters.RawAdapter{})
 
 sql, args, err := adapters.BuildRawSelect(f, "users")
-// sql:  "SELECT * FROM `users` WHERE `id` > ? LIMIT 20"   <- no JOIN, no `total` predicate
-// args: []any{int64(0)}                                    <- no preload args
+// sql:  "SELECT * FROM `users` WHERE `id` > ?"   <- no JOIN, no `total` predicate
+// args: []any{int64(0)}                          <- no preload args
 
 preloads, err := adapters.BuildRawPreloads(f)     // map[string]RawPreload
 // preloads["Orders"] == RawPreload{Where: "`total` > ?", Args: []any{int64(100)}}
@@ -576,7 +576,8 @@ One more backend limit: Elasticsearch cannot express figo's `take:0`
 validates **`from + size`** against `index.max_result_window` (default 10000),
 not `size` alone. So for `take:0` the ES adapter renders the largest size that
 still fits the window at the requested offset — `max_result_window - from`, not
-a flat 10000:
+a flat 10000. Since `take:0` is also `New()`'s default, this is what a query
+that never mentions `page=` renders on ES:
 
 | `page=`                  | rendered                  |
 | ------------------------ | ------------------------- |
