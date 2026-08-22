@@ -102,26 +102,39 @@ func (afterParseRejector) AfterParse(_ Figo, dsl string) error {
 	return nil
 }
 
-func TestAfterParseErrorRollsBackDSL(t *testing.T) {
+// A rejected DSL must NARROW. It used to be rolled back to the previously
+// accepted one, which is the opposite of a refusal: a caller that ignored the
+// error silently ran an OLDER, BROADER query than the one it had just been
+// told it could not have.
+func TestAfterParseErrorRefusesRatherThanRevertingToTheOlderQuery(t *testing.T) {
 	f := New()
 	require.NoError(t, f.RegisterPlugin(afterParseRejector{}))
 
 	require.NoError(t, f.AddFiltersFromString(`id=1`))
 	require.Error(t, f.AddFiltersFromString(`reject_me=1`))
 
-	// The rejected DSL must not have replaced the accepted one.
-	assert.Equal(t, `id=1`, f.GetDSL())
+	// Neither DSL stays armed.
+	assert.Equal(t, "", f.GetDSL())
 
-	// A caller that ignores the error and Builds anyway gets the LAST
-	// ACCEPTED query, not the rejected one.
+	// A caller that ignores the error and Builds anyway gets a query matching
+	// nothing — not the rejected one, and not the earlier accepted one.
 	f.Build(RawAdapter{})
 	where, _, err := BuildRawWhere(f)
 	require.NoError(t, err)
-	assert.Contains(t, where, "`id` = ?")
+	assert.Equal(t, "1=0", where)
 	assert.NotContains(t, where, "reject_me")
+
+	// Giving it a DSL that parses acceptably reopens it.
+	require.NoError(t, f.AddFiltersFromString(`id=2`))
+	f.Build(RawAdapter{})
+	where, _, err = BuildRawWhere(f)
+	require.NoError(t, err)
+	assert.Equal(t, "`id` = ?", where)
 }
 
-func TestAfterParseErrorOnFirstCallLeavesDSLEmpty(t *testing.T) {
+// On a FRESH instance the previous DSL is none at all, so the old rollback left
+// an UNFILTERED query: refusing a filter widened the result set to everything.
+func TestAfterParseErrorOnFirstCallLeavesTheQueryClosed(t *testing.T) {
 	f := New()
 	require.NoError(t, f.RegisterPlugin(afterParseRejector{}))
 
@@ -129,5 +142,23 @@ func TestAfterParseErrorOnFirstCallLeavesDSLEmpty(t *testing.T) {
 	assert.Equal(t, "", f.GetDSL())
 
 	f.Build(RawAdapter{})
-	assert.Empty(t, f.GetClauses())
+	assert.Equal(t, []Expr{OrExpr{}}, f.GetClauses())
+	where, _, err := BuildRawWhere(f)
+	require.NoError(t, err)
+	assert.Equal(t, "1=0", where)
+
+	// The refusal is deep-copied by Clone, so a clone of a refused instance
+	// cannot be used to escape it.
+	c := f.Clone()
+	c.Build(RawAdapter{})
+	where, _, err = BuildRawWhere(c)
+	require.NoError(t, err)
+	assert.Equal(t, "1=0", where)
+
+	// Clearing the filters does not reopen it either — only a DSL that parses.
+	require.NoError(t, f.AddFiltersFromString(""))
+	f.Build(RawAdapter{})
+	where, _, err = BuildRawWhere(f)
+	require.NoError(t, err)
+	assert.Equal(t, "1=0", where)
 }

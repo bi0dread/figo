@@ -150,7 +150,7 @@ func (p h7RejectPlugin) BeforeParse(_ Figo, dsl string) (string, error) {
 }
 func (p h7RejectPlugin) AfterParse(Figo, string) error { return errors.New("rejected") }
 
-func TestH15_PanickingAfterParseHookRollsBackTheRejectedDSL(t *testing.T) {
+func TestH15_PanickingAfterParseHookRefusesTheRejectedDSL(t *testing.T) {
 	f := New()
 	require.NoError(t, f.RegisterPlugin(h7RejectPlugin{name: "rejector"}))
 	require.NoError(t, f.RegisterPlugin(h7PanicPlugin{name: "panicker"}))
@@ -167,7 +167,8 @@ func TestH15_PanickingAfterParseHookRollsBackTheRejectedDSL(t *testing.T) {
 	f.Build(RawAdapter{})
 	w, _, err := BuildRawWhere(f)
 	require.NoError(t, err)
-	assert.Equal(t, "", w, "the rejected DSL must not be buildable afterwards")
+	assert.Equal(t, "1=0", w,
+		"the rejected DSL must not be buildable afterwards, and refusing it must NARROW: an empty WHERE here is an unfiltered scan")
 }
 
 // M1. An unterminated quote swallows the rest of the DSL into one value and can

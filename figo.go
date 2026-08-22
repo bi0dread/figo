@@ -2482,35 +2482,33 @@ func (f *figo) AddFiltersFromString(input string) error {
 		var err error
 		input, err = pm.ExecuteBeforeParse(f, input)
 		if err != nil {
+			f.refuseDSL()
 			return err
 		}
 	}
 
-	// Update DSL string (replace existing) - protected by mutex. The previous
-	// DSL is kept for rollback: AfterParse hooks (LimitsPlugin, Validation-
-	// Plugin) inspect the committed DSL via Clone+Build, so the new value must
-	// be visible while they run — but a rejected DSL must not stay armed for a
-	// later Build when the caller ignores the returned error.
+	// Update DSL string (replace existing) - protected by mutex. AfterParse
+	// hooks (LimitsPlugin, ValidationPlugin) inspect the committed DSL via
+	// Clone+Build, so the new value must be visible while they run — but a
+	// rejected DSL must not stay armed for a later Build when the caller
+	// ignores the returned error.
 	f.mu.Lock()
-	prevDSL := f.dsl
 	f.dsl = input
 	f.mu.Unlock()
 
 	// Execute AfterParse plugin hooks (error returned unwrapped, as above).
 	if pm != nil {
-		// The rollback must also run when a hook PANICS. ExecuteAfterParse
+		// The refusal must also happen when a hook PANICS. ExecuteAfterParse
 		// deliberately runs every hook and joins their errors, so a panic in a
 		// later hook (a ValidationRule handler with an unchecked type
 		// assertion, say) unwound past the error path, threw away an earlier
 		// plugin's rejection and left the rejected DSL armed for the next
 		// Build — breaking the guide's invariant that "a rejected DSL can never
-		// be built later". Roll back first, then let the panic continue.
+		// be built later". Refuse first, then let the panic continue.
 		committed := false
 		defer func() {
 			if !committed {
-				f.mu.Lock()
-				f.dsl = prevDSL
-				f.mu.Unlock()
+				f.refuseDSL()
 			}
 		}()
 		if err := pm.ExecuteAfterParse(f, input); err != nil {
@@ -2520,6 +2518,40 @@ func (f *figo) AddFiltersFromString(input string) error {
 	}
 
 	return nil
+}
+
+// refuseDSL puts the instance into the refused state: the DSL is dropped and
+// the clause list becomes the canonical never-true clause, so every later
+// Build renders 1=0 (raw/GORM), {"$nor":[{}]} (Mongo) or match_none (ES).
+//
+// A rejection has to NARROW. This used to restore the PREVIOUS DSL instead,
+// which is the opposite: on a fresh per-request instance the previous DSL is
+// none at all, so refusing a filter left an UNFILTERED query — a caller that
+// ignored the returned error ran a full table scan, strictly worse than the
+// malformed query it was refused. Restoring a previous non-empty DSL was no
+// better: the caller then silently ran an OLDER, broader query than the one it
+// had just been told it could not have.
+//
+// The pill is written to clausesAsked as well as clauses, because clauses is
+// re-derived from it on every Build, and it is written HERE rather than left to
+// a plugin because nothing a plugin can reach is safe: an expression added
+// through AddFilter is subject to registered ExprFilters, and pruneExprFields
+// deletes a logical node with no operands — so merely registering a
+// FieldsPlugin laundered the refusal back into a match-everything query. The
+// empty-DSL path in BuildE runs no ExprFilters, so the pill written here
+// reaches the render intact, and Clone deep-copies it, so a clone of a refused
+// instance is refused too.
+//
+// The instance stays refused until it is given a DSL that parses acceptably;
+// AddFiltersFromString("") does not reopen it.
+func (f *figo) refuseDSL() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.dsl = ""
+	f.clauses = []Expr{OrExpr{}}
+	f.clausesAsked = []Expr{OrExpr{}}
+	f.preloads = make(map[string][]Expr)
+	f.builtFromDSL = false
 }
 
 // AddFilter appends a programmatic expression. Plugin expression filters

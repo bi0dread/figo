@@ -34,7 +34,7 @@ type Plugin interface {
 ### 3. AfterParse Hook
 - **When**: Called after DSL string is parsed
 - **Purpose**: Post-process the parsed expressions
-- **Return**: Error if processing fails. An error also rolls the instance's DSL back to its previous value, so a rejected DSL can never be built later by a caller that ignored the error.
+- **Return**: Error if processing fails. An error also **refuses the instance**: the DSL is dropped and the clause list becomes the never-true clause, so a rejected DSL can never be built later by a caller that ignored the error — and refusing it narrows the query instead of reverting to a broader one.
 - **Example**: Validate parsed expressions, add metadata
 
 ### 4. BeforeQuery Hook
@@ -252,7 +252,40 @@ in the `adapters` import.
 
 ## Built-in Plugins
 
-Figo ships eight plugins out of the box: `ValidationPlugin`, `CachePlugin`, `MetricsPlugin`, `FieldsPlugin`, `LimitsPlugin`, `SyntaxPlugin`, `ScopePlugin`, and `AuditPlugin`.
+Figo ships nine plugins out of the box: `ValidationPlugin`, `CachePlugin`, `MetricsPlugin`, `FieldsPlugin`, `LimitsPlugin`, `SyntaxPlugin`, `ScopePlugin`, `InjectionGuardPlugin`, and `AuditPlugin`.
+
+### Identifier screening (injection guard)
+
+`InjectionGuardPlugin` refuses a query whose **column identifiers** are not names a column can have, and is the worked example of a plugin that has to reject *and* fail closed at the same time.
+
+```go
+g := plugins.NewInjectionGuardPlugin().AllowFields("median_price", "city")
+f.RegisterPlugin(g)
+
+err := f.AddFiltersFromString(`page=skip:0,take:50 and sort=median_price:desc or 1=1`)
+// figo-injection-guard: rejected 1 identifier(s): filter field "1": segment "1"
+// is only digits, which names no column
+```
+
+That DSL used to build ``WHERE `1` = ?`` with `AddFiltersFromString`, `BuildE` and `Explain` all reporting success — a `sort=` directive is consumed as a statement and its connector discarded, so `or 1=1` became the entire filter. It is not injection (values are bound, identifiers are quote-doubled); it is an invented identifier reaching the engine, whose refusal came back as a driver error quoting the whole statement.
+
+The plugin uses three hooks, and which one does what is the interesting part:
+
+- **`AfterParse`** produces the error. It parses the DSL on a bare `figo.New()` probe rather than through `cloneForInspection`, because a guard must see what the caller *sent*: a `FieldsPlugin` whitelist prunes a disallowed field inside the inspection clone's own Build, so a check reading that clone finds nothing to refuse. A bare instance also runs no hooks, so there is no recursion.
+- **`FinalizeClauses`** screens the clause list, sort and projection each Build is about to render, and returns `[]figo.Expr{figo.OrExpr{}}` when any of them is hostile. That covers the routes with no parse hook to reject from — `AddFilter`, `SetSort`, `SetSelectFields`. It has to be this hook: `pruneExprFields` deletes a logical node with no operands, so a never-true clause returned from `FilterExpr` or handed to `AddFilter` is laundered back into a match-everything query the moment a `FieldsPlugin` is registered. `FinalizeClauses` runs after every `ExprFilter`, on every Build, including one with an empty clause list.
+- **`FinalizePreloads`** returns the same clause per relation, rather than an empty list — an empty list drops a *conditioned* relation but is a no-op for one preloaded unconditioned, which would still be fetched in full.
+
+The DSL path needs none of that, and the reason is worth reading if you are writing a rejecting plugin of your own: **core keeps a rejected query closed for you**. A `BeforeParse`/`AfterParse` error drops the DSL and installs the never-true clause (`refuseDSL` in figo.go), in state `Clone` deep-copies and no `ExprFilter` runs over.
+
+That is in core because three plugin-level attempts at it all leaked, each one a widening rather than a narrowing:
+
+1. **Latch the verdict per instance.** `Clone()` produces a different key, and the clone carries no DSL to re-screen because the rollback emptied it — so a clone of a refused instance rendered a completely unfiltered query.
+2. **Append the never-true clause through `AddFilter`**, putting it in state `Clone` deep-copies. `AddFilter` runs registered `ExprFilter`s, so merely *having* a `FieldsPlugin` ignore list configured — on a field the query never mentions — put the clone straight back to unfiltered.
+3. **Key the latch by the plugin manager**, which `Clone` shares. Now a sibling clone parsing a *clean* DSL cleared the verdict for every refused sibling; under a clone-per-request template roughly a third of refused requests escaped.
+
+Each fix moved the hole rather than closing it, which is the signal that the invariant belonged one layer down.
+
+One more trap worth copying: the guard screens the expression tree with `figo.Walk`, and an early version added a `*AndExpr` arm to the visitor to reach pointer logical nodes. `Walk`'s value arm recurses into the operands and *then* hands the visitor `&v` — so that arm fired for every ordinary value node too and re-walked the subtree it had just screened. 3·2^d−2 screen calls for depth d: 321 bytes of plain nested parentheses took 79 seconds. Normalise pointer nodes into value form *before* the walk instead.
 
 ### Scoping (mandatory filters)
 
@@ -580,7 +613,7 @@ own. Within every hook, plugins run in registration order.
 ```
 AddFiltersFromString:
 ┌────────────┐   ┌─────────────┐   ┌────────────┐   ┌────────────┐
-│ DSL String │──▶│ BeforeParse │──▶│ commit DSL │──▶│ AfterParse │  (error ⇒ DSL rolled back)
+│ DSL String │──▶│ BeforeParse │──▶│ commit DSL │──▶│ AfterParse │  (error ⇒ instance refused)
 └────────────┘   └─────────────┘   └────────────┘   └────────────┘
 
 Build / BuildE:

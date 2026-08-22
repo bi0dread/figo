@@ -42,7 +42,7 @@ import (
   f.Build(adapters.GormAdapter{})
   ```
 
-- **Policy is opt-in, per instance.** Nothing polices your queries until you register the plugin for it — `f.RegisterPlugin(plugins.NewFieldsPlugin())` and friends. Field ignore-lists/whitelists (`FieldsPlugin`), complexity limits (`LimitsPlugin`), value validation (`ValidationPlugin`), strict syntax checking or repair (`SyntaxPlugin`), mandatory multi-tenant scopes (`ScopePlugin`), caching (`CachePlugin`), metrics (`MetricsPlugin`), and audit logging (`AuditPlugin`) are all plugins; without registration, no pruning or enforcement happens. Each has a dedicated section below.
+- **Policy is opt-in, per instance.** Nothing polices your queries until you register the plugin for it — `f.RegisterPlugin(plugins.NewFieldsPlugin())` and friends. Field ignore-lists/whitelists (`FieldsPlugin`), complexity limits (`LimitsPlugin`), value validation (`ValidationPlugin`), strict syntax checking or repair (`SyntaxPlugin`), mandatory multi-tenant scopes (`ScopePlugin`), identifier screening (`InjectionGuardPlugin`), caching (`CachePlugin`), metrics (`MetricsPlugin`), and audit logging (`AuditPlugin`) are all plugins; without registration, no pruning or enforcement happens. Each has a dedicated section below.
 
 - **Plugin hooks fire automatically, in registration order.** `BeforeQuery`/`AfterQuery` wrap every `GetSqlString`/`GetQuery` render (a hook error vetoes the render), `ExprFilter` prunes DSL and programmatic filters alike, and `FinalizeClauses` runs on every `Build` — the mechanism behind mandatory scopes. Within each hook, plugins run in the order they were registered.
 
@@ -690,6 +690,69 @@ GetPluginManager() *PluginManager   // never nil; empty when no plugin was regis
 
 > `GetPage()` returns a **copy** of the page. Mutating it has no effect — call `SetPage(skip, take)` to change pagination.
 
+## Rejecting nonsense identifiers (injection guard)
+
+`InjectionGuardPlugin` screens every **column identifier** a query is about to address and rejects the request — failing closed — when one of them is not a name a column can have.
+
+It exists because of a real report. The DSL
+
+```
+page=skip:0,take:50 and sort=median_price:desc or 1=1
+```
+
+built `WHERE `1` = ?` — a filter whose field is the literal `1`. A `page=`/`sort=`/`load=` directive is consumed as a statement and its connector is discarded, so the `or` vanished and `1=1` became the whole top-level filter. `AddFiltersFromString` returned `nil`, `BuildE` returned `nil` and `Explain()` printed `1 = 1`, so the service had no signal at all: it ran the query, the engine refused it, and the driver error — which quotes the entire statement — came back to the caller as schema disclosure.
+
+**This is not SQL injection.** Values are bound (`?`/`$n`) and identifiers are quote-doubled by every adapter, so `1=1` reaches the engine as one quoted identifier and cannot break out of it. The defect is that an invented identifier reached the database at all, with no way to reject the request.
+
+```go
+g := plugins.NewInjectionGuardPlugin()
+g.AllowFields("median_price", "city", "title") // optional, and the part that stops probing
+f.RegisterPlugin(g)
+
+if err := f.AddFiltersFromString(userDSL); err != nil {
+    return c.Status(400).JSON(fiber.Map{"error": "invalid filters"})
+}
+// figo-injection-guard: rejected 1 identifier(s): filter field "1": segment "1"
+// is only digits, which names no column
+```
+
+Check *that* error — it is the only signal. figo keeps a plugin's parse-hook error on the `AddFiltersFromString` call that produced it, so a later `BuildE` returns `nil` for a query this plugin has refused; a caller validating only through `BuildE` sees nothing and simply gets a query that matches nothing. `Rejected(f)` answers after the fact if that suits your call shape better.
+
+**What it screens** — every identifier position untrusted DSL can reach: filter fields, sort keys, preload relation names, preload conditions and the select-field set. A column must be one to four dot-separated segments of at most 64 characters, made of letters, digits, `_` and `$`, with **no segment composed solely of digits** — the reported bug's exact shape. That last clause is the load-bearing one; a leading digit on its own is fine, because MySQL allows `2fa_enabled`. The rule is deliberately narrower than "what an adapter can quote": every adapter can quote `1`, `x--`, `x;drop` and a backtick and render them inert, and every one of them is still a name no column has.
+
+Names are screened in the spelling that will be **rendered**, i.e. after the naming func. That matters for select fields, the one position figo converts at render time rather than on the way in — screening the stored spelling both missed a name that only becomes hostile after conversion and refused `first-name`, which figo's own default naming func is documented to accept and which renders as `first_name`.
+
+Beyond the reported case this also catches `price<>500` — `<>` is not a figo operator, so the field silently absorbs `<` and the operator becomes `>` — along with `x--=1`, `` `x`=1 ``, `sort=1:desc`, `` load=[Rel`x:id=1] `` and identifiers carrying zero-width or bidi characters.
+
+Field names on Mongo and Elasticsearch are not SQL columns and legitimately break this rule. One line relaxes it for them, and the escape hatch cannot switch the screen off — a quote rune, `;` or a control byte stays refused however it is configured:
+
+```go
+g.AllowExtraRunes("-@").AllowNumericSegments(true).SetMaxSegments(8) // @timestamp, user-agent, meta.tags.0
+```
+
+**It fails closed, and that is load bearing.** A caller that ignores the error gets `1=0` (raw/GORM), `{"$nor":[{}]}` (Mongo) or `match_none` (Elasticsearch) — never a wider query. Hostile `ORDER BY` and `SELECT` entries are stripped from the same render, since reaching the engine at all is what leaked the schema, and a SELECT list is resolved before any row is filtered.
+
+That half is not the plugin's doing: **figo keeps a rejected query closed itself** (see [rejection narrows](#a-rejection-narrows)), which is the only place it can be done safely. Every route a plugin can reach turned out to be prunable or escapable, and each hole turned a refusal into a full unfiltered scan — strictly worse than the malformed query being refused. On top of that, every `Build` **re-screens** the clause list, sort and projection it is about to render, which catches a hostile name that never went through the DSL at all (`AddFilter`, `SetSort`, `SetSelectFields`); state set after the last `Build` is screened by the next one. A panic while screening — the application's naming func runs over attacker-chosen names — becomes an ordinary refusal rather than escaping.
+
+One limit worth knowing: a refusal caused *only* by a hostile `sort=`/projection entry is self-healing, because the guard strips the offending entry, so a second `Build` on the same instance runs the remainder of the query rather than `1=0`. One request means one `Build`, so this matters only if you build twice.
+
+**Options** (all chainable):
+
+| Method | Default | Effect |
+| --- | --- | --- |
+| `AllowFields(names...)` | none | Restrict every position — filter fields, sort keys, select fields **and preload relation names** — to these names. Matches in both spellings (`AllowFields("City")` accepts `city=` under snake_case, and `AllowFields("median_price")` accepts `medianPrice=`), and a qualified name by its bare column. Applies to DSL input only, so a `ScopePlugin`'s injected column does not have to be listed. |
+| `AllowUnicodeIdentifiers(bool)` | `false` | Accept any Unicode letter. Still refuses combining marks, format characters and bidi overrides — but not homoglyphs, so pair it with `AllowFields`. |
+| `RejectParseDiagnostics(bool)` | `true` | Treat a parser diagnostic as a rejection. A dropped conjunct *widens*: `a b=1` renders `` WHERE `b` = ? `` with the `a` silently gone. Behaviour-neutral diagnostics are never a rejection either way — a blank list part (`<in>[1,2,]`, which the README documents as skipped) and an unconditioned `load=[Orders:]`. |
+| `AllowExtraRunes(runes)` | none | Extra characters allowed inside a segment, e.g. `"-@"` for Mongo/ES field names. A hard floor still applies: the three quote runes, `;` and every control byte are refused whatever is listed. It is a floor, not a list of everything dangerous — admitting `-` also admits `x--`, which the adapters render backtick-quoted and inert. |
+| `AllowNumericSegments(bool)` | `false` | Permit an all-digit segment (`meta.tags.0`). Keep it off on SQL — that is the reported bug's shape. |
+| `ScreenCustomExpr(bool)` | `false` | Screen `CustomExpr.Field`. Exempt by default because its handler receives the field verbatim and owns its own quoting, exactly as the SQL adapters treat it — and no DSL can produce one. |
+| `SetMaxSegments(n)` / `SetMaxSegmentLength(n)` | 4 / 64 | Segments per identifier, characters per segment. |
+| `SetMaxLatched(n)` | 4096 | Bound on the table of recorded reasons (reporting only — the refusal itself is core's). |
+
+`CheckDSL(dsl, naming)` runs the same screen without a figo instance, for validating before you build. `Rejected(f)` reports what an instance was refused for — including the programmatic path, which has no error channel of its own since `AddFilter` returns nothing and a clause finalizer cannot fail a `Build`. `Release(f)` clears a refusal.
+
+> **Do not combine it with a `FieldsPlugin` whitelist.** The whitelist *prunes* a disallowed field and answers 200 over a wider set; this plugin *rejects*. Because `FieldsPlugin`'s `ExprFilter` runs before the guard sees the final clause list, a field the whitelist prunes is one the guard can no longer refuse. `AllowFields` covers every position the whitelist does, so use one or the other per instance.
+
 ## Field safety: ignore lists & whitelist
 
 Because DSL usually comes from untrusted input, figo gives you two ways to constrain which fields a caller may filter on — both live on the `FieldsPlugin`. Register it **before** adding filters. Both prune the built AST — dropping a condition never leaves a dangling `and`/`or`/`not` behind, and both apply to DSL filters and to programmatic `AddFilter` clauses alike (the plugin implements the `ExprFilter` hook, which `Build` and `AddFilter` run on every expression entering the clause tree).
@@ -918,14 +981,22 @@ f.UnregisterPlugin("my-plugin")
 
 All hooks fire automatically:
 
-- `BeforeParse` / `AfterParse` inside `AddFiltersFromString` (`BeforeParse` can rewrite the DSL; an `AfterParse` error fails the call **and rolls the instance's DSL back to the previous value** — a rejected DSL is never left armed for a later `Build`, even if the caller ignores the error).
+- `BeforeParse` / `AfterParse` inside `AddFiltersFromString` (`BeforeParse` can rewrite the DSL; an error from either **refuses the instance** — see [rejection narrows](#a-rejection-narrows) — so a rejected DSL is never left armed for a later `Build`, even if the caller ignores the error).
+
+### A rejection narrows
+
+When a plugin's `BeforeParse` or `AfterParse` rejects a DSL, figo drops the DSL **and replaces the clause list with the never-true clause**. Every later `Build` on that instance renders `1=0` / `{"$nor":[{}]}` / `match_none` until it is given a DSL that parses acceptably; `AddFiltersFromString("")` does not reopen it, and `Clone` deep-copies the refusal.
+
+This is a change of behaviour, and the reason for it is that the alternative was backwards. A rejection used to restore the *previous* DSL, so a caller that ignored the error ran an older, broader query than the one it had just been refused — and on a fresh per-request instance, where the previous DSL is none at all, refusing a filter produced a completely **unfiltered** query. Refusing a malformed request must never return more rows than granting it would have.
+
+It applies to every rejecting plugin — `ValidationPlugin`, `LimitsPlugin`, `SyntaxPlugin` and `InjectionGuardPlugin` alike — and it is done in core because nothing a plugin can reach is safe: an expression added through `AddFilter` is deleted by a registered `FieldsPlugin` policy, and a verdict remembered per instance is lost by `Clone`.
 - `FilterExpr` (optional) on every expression entering the clause tree — `Build` and `AddFilter` alike.
 - `FinalizeClauses` (optional) once at the end of every `Build`, even one with no filters.
 - `BeforeQuery` / `AfterQuery` around every `GetSqlString` / `GetQuery` render. A `BeforeQuery` error vetoes the render (`""` / `nil` is returned); an `AfterQuery` error vetoes the rendered result the same way — useful for authorization, auditing, and logging. On the cached paths (`CachePlugin.GetCached*`) they fire on misses, when a render actually happens, not on hits.
 
 Hooks run on a snapshot outside the manager's lock, so a hook may call back into the manager without deadlocking. Query hooks must not render through the same instance (that would recurse).
 
-**Eight built-in plugins** cover the common policies — each documented in its own section above: [`SyntaxPlugin`](#input-validation--repair), [`FieldsPlugin`](#field-safety-ignore-lists--whitelist), [`LimitsPlugin`](#query-complexity-limits), [`ValidationPlugin`](#validation), [`ScopePlugin`](#mandatory-scopes-multi-tenant), [`CachePlugin`](#caching), [`MetricsPlugin`](#performance-monitoring), [`AuditPlugin`](#auditing).
+**Nine built-in plugins** cover the common policies — each documented in its own section above: [`SyntaxPlugin`](#input-validation--repair), [`FieldsPlugin`](#field-safety-ignore-lists--whitelist), [`LimitsPlugin`](#query-complexity-limits), [`ValidationPlugin`](#validation), [`ScopePlugin`](#mandatory-scopes-multi-tenant), [`InjectionGuardPlugin`](#rejecting-nonsense-identifiers-injection-guard), [`CachePlugin`](#caching), [`MetricsPlugin`](#performance-monitoring), [`AuditPlugin`](#auditing).
 
 See [PLUGIN_SYSTEM_GUIDE.md](PLUGIN_SYSTEM_GUIDE.md) for a full walkthrough with example plugins.
 
@@ -1010,7 +1081,7 @@ Runnable usage examples live in [examples/example_usage.go](examples/example_usa
 
 ## Status of features
 
-Fully wired end-to-end: the DSL and all operators above, the four adapters (raw SQL with MySQL/PostgreSQL/SQLite dialects), select-field control, naming funcs, pagination/sort/preloads, the `Explain`/`Clone`/`Walk` AST tools, the full plugin hook surface (parse, expression-filter, clause-finalizer, and query hooks), and the eight built-in plugins: `SyntaxPlugin` (validation & repair), `FieldsPlugin` (ignore/whitelist), `LimitsPlugin` (complexity limits), `ValidationPlugin` (value rules), `ScopePlugin` (mandatory filters), `CachePlugin`, `MetricsPlugin`, and `AuditPlugin`.
+Fully wired end-to-end: the DSL and all operators above, the four adapters (raw SQL with MySQL/PostgreSQL/SQLite dialects), select-field control, naming funcs, pagination/sort/preloads, the `Explain`/`Clone`/`Walk` AST tools, the full plugin hook surface (parse, expression-filter, clause-finalizer, and query hooks), and the nine built-in plugins: `SyntaxPlugin` (validation & repair), `FieldsPlugin` (ignore/whitelist), `LimitsPlugin` (complexity limits), `ValidationPlugin` (value rules), `ScopePlugin` (mandatory filters), `InjectionGuardPlugin` (identifier screening), `CachePlugin`, `MetricsPlugin`, and `AuditPlugin`.
 
 Advanced expression types (programmatic `AddFilter` only — no DSL syntax) render on the document-store adapters:
 
