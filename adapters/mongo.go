@@ -352,12 +352,47 @@ func mongoAggregatePipeline(f figo.Figo, joins map[string]MongoJoin, a MongoAdap
 	// requires a $match carrying $text to be the FIRST pipeline stage, so the
 	// two demands are mutually exclusive and the build fails loudly instead of
 	// emitting a pipeline the server rejects.
-	rootAfterLookups := len(rootMatch) > 0 && len(relations) > 0 && exprsReferenceAlias(f.GetClauses(), aliases)
+	// Partition the top-level conjuncts rather than deciding for the whole
+	// list. A clause addressing a lookup alias ("Orders.total>5") can only be
+	// evaluated once the $lookup has created that field, so it has to go after;
+	// but a clause that references no alias has no such dependence, and moving
+	// it after the joins meant the pipeline no longer opened with the
+	// selective, index-usable $match it could have. One alias-shaped conjunct
+	// dragged every unrelated conjunct with it — including a mandatory tenant
+	// predicate a ScopePlugin injected, which is exactly the clause that most
+	// wants to run first.
+	//
+	// The row set is identical either way ($and is commutative and both halves
+	// are still applied); this is a plan-shape fix.
+	preLookup, postLookup := partitionByAliasReference(f.GetClauses(), aliases)
+	rootAfterLookups := len(rootMatch) > 0 && len(relations) > 0 && len(postLookup) > 0
 	if rootAfterLookups && anyContainsFullText(f.GetClauses()) {
 		return nil, fmt.Errorf("figo: a root clause referencing a preloaded relation cannot be combined with full-text search ($text) on the MongoDB adapter — $text must be the first pipeline stage")
 	}
-	if len(rootMatch) > 0 && !rootAfterLookups {
-		pipeline = append(pipeline, bson.D{{Key: "$match", Value: rootMatch}})
+	var postMatch bson.M
+	if !rootAfterLookups {
+		if len(rootMatch) > 0 {
+			pipeline = append(pipeline, bson.D{{Key: "$match", Value: rootMatch}})
+		}
+	} else {
+		// Render each half on its own so the two $match documents together say
+		// exactly what the single one did.
+		preMatch, err := buildMongoFilterFromExprs(preLookup, a.render())
+		if err != nil {
+			return nil, err
+		}
+		postMatch, err = buildMongoFilterFromExprs(postLookup, a.render())
+		if err != nil {
+			return nil, err
+		}
+		if len(preMatch) > 0 {
+			pipeline = append(pipeline, bson.D{{Key: "$match", Value: preMatch}})
+		}
+		// A partition that produced nothing renderable on the post side would
+		// drop the predicate, which widens: fall back to the whole filter.
+		if len(postMatch) == 0 {
+			postMatch = rootMatch
+		}
 	}
 
 	for i, relation := range relations {
@@ -424,7 +459,7 @@ func mongoAggregatePipeline(f figo.Figo, joins map[string]MongoJoin, a MongoAdap
 	}
 
 	if rootAfterLookups {
-		pipeline = append(pipeline, bson.D{{Key: "$match", Value: rootMatch}})
+		pipeline = append(pipeline, bson.D{{Key: "$match", Value: postMatch}})
 	}
 
 	// sort= and page= must survive the aggregation path with the same
@@ -475,6 +510,29 @@ func mongoAggregatePipeline(f figo.Figo, joins map[string]MongoJoin, a MongoAdap
 	}
 
 	return pipeline, nil
+}
+
+// partitionByAliasReference splits the TOP-LEVEL conjuncts into those that can
+// be matched before the $lookup stages and those that cannot.
+//
+// Only the top level is split, and only into two lists: the clause list is
+// ANDed by the adapter, so moving a whole conjunct across the joins preserves
+// the filter exactly. A compound conjunct that mixes an alias reference with a
+// plain field is NOT taken apart — that would mean rewriting an OR, which is
+// not distributive across the split — so it goes after, which is always
+// correct if sometimes conservative.
+func partitionByAliasReference(exprs []figo.Expr, aliases map[string]bool) (pre, post []figo.Expr) {
+	for _, e := range exprs {
+		if e == nil {
+			continue
+		}
+		if exprsReferenceAlias([]figo.Expr{e}, aliases) {
+			post = append(post, e)
+		} else {
+			pre = append(pre, e)
+		}
+	}
+	return pre, post
 }
 
 // exprsReferenceAlias reports whether any leaf in exprs filters on a field
@@ -1103,18 +1161,52 @@ func likeToRegexPattern(v any) string {
 		s = fmt.Sprint(x)
 	}
 	var b strings.Builder
-	b.WriteByte('^')
-	for _, r := range s {
-		switch r {
+	// \A and \z, not ^ and $.
+	//
+	// Mongo evaluates $regex with PCRE2, where the default '$' matches at the
+	// end of the subject OR immediately before a final newline — so LIKE
+	// 'admin' also matched the stored value "admin\n", returning a row SQL
+	// excludes. (Go's regexp is RE2, where '$' without 'm' is strictly
+	// end-of-text, which is why the in-repo semantics oracle cannot observe
+	// this and why a fixture row alone would not pin it.) \A and \z are
+	// unconditional start/end-of-subject in PCRE2 and mean exactly what LIKE's
+	// implicit anchoring means.
+	b.WriteString(`\A`)
+	runes := []rune(s)
+	for i := 0; i < len(runes); i++ {
+		switch runes[i] {
 		case '%':
-			b.WriteString(".*")
+			// Collapse a RUN of '%' (and any '_' mixed into it) into one
+			// quantifier. Emitting a separate ".*" per '%' handed PCRE2 a
+			// pattern with N adjacent unbounded quantifiers, which is a
+			// backtracking bomb: 20 of them, from 20 bytes of input, made the
+			// engine explore an exponential number of splits of the same
+			// subject. SQL LIKE skips a '%' run in O(1) and never backtracks,
+			// so collapsing is also the semantically faithful rendering.
+			//
+			// A '_' inside the run still requires one character each, so the
+			// run becomes ".{n,}" when it contains n underscores and ".*" when
+			// it contains none — same language, one quantifier.
+			underscores := 0
+			for i < len(runes) && (runes[i] == '%' || runes[i] == '_') {
+				if runes[i] == '_' {
+					underscores++
+				}
+				i++
+			}
+			i-- // the loop's own i++ consumes the lookahead
+			if underscores == 0 {
+				b.WriteString(".*")
+			} else {
+				fmt.Fprintf(&b, ".{%d,}", underscores)
+			}
 		case '_':
 			b.WriteByte('.')
 		default:
-			b.WriteString(regexp.QuoteMeta(string(r)))
+			b.WriteString(regexp.QuoteMeta(string(runes[i])))
 		}
 	}
-	b.WriteByte('$')
+	b.WriteString(`\z`)
 	return b.String()
 }
 
@@ -1125,15 +1217,297 @@ func likeToRegexPattern(v any) string {
 func mongoRawRegex(v any) (primitive.Regex, bool) {
 	switch t := v.(type) {
 	case *regexp.Regexp:
+		// A compiled pattern came from the APPLICATION, not from the DSL —
+		// figo has no way to produce one from parsed text — so it is trusted
+		// the way a CustomExpr handler is.
 		return primitive.Regex{Pattern: t.String()}, true
 	case string:
 		if _, err := regexp.Compile(t); err != nil {
+			return primitive.Regex{}, false
+		}
+		if !regexPatternIsSafe(t) {
 			return primitive.Regex{}, false
 		}
 		return primitive.Regex{Pattern: t}, true
 	default:
 		return primitive.Regex{}, false
 	}
+}
+
+// maxRawRegexPattern bounds the length of a DSL-supplied regex. A pattern
+// longer than this is not a filter anyone typed.
+const maxRawRegexPattern = 512
+
+// maxAdjacentUnbounded is how many unbounded quantifiers may sit next to each
+// other with nothing but wildcards between them. Each adjacent pair multiplies
+// the ways a subject can be split between them, and no filter needs two.
+const maxAdjacentUnbounded = 3
+
+// regexPatternIsSafe screens a DSL-supplied regex for the shape that makes a
+// BACKTRACKING engine blow up, which the regexp.Compile above cannot do.
+//
+// The compile is not a safety check and never claimed to be: it exists because
+// the BSON encoder serializes a *regexp.Regexp as an empty document, so the
+// pattern has to cross as a string. Go's regexp is RE2 — no backtracking — so
+// it accepts "^(a+)+$", "(a|a)*" and "(.*)*" without complaint. MongoDB
+// evaluates the very same pattern with PCRE2, which does backtrack: the
+// accepted "^(a+)+$" costs over a second against 28 characters, from 15 bytes
+// of untrusted input, and figo applied no length or shape bound on this arm at
+// all.
+//
+// The rule refused here is an UNBOUNDED quantifier applied to a group that is
+// itself ambiguous — one containing another unbounded quantifier ("(a+)+") or
+// an alternation ("(a|a)*"). Those are the two classic catastrophic-backtracking
+// families, and neither is something a filter pattern needs: "^(a+)+$" and
+// "^a+$" match the same language. Ordinary patterns are untouched — character
+// classes, anchors, a quantifier per atom, an unquantified alternation
+// ("(foo|bar)") and a boundedly quantified one ("(foo|bar){2}") all pass.
+//
+// This is a shape screen, not a proof: it bounds the known-bad construction
+// rather than deciding worst-case match cost, which is undecidable in general.
+// An application exposing =~ to untrusted input should still prefer an explicit
+// allowlist.
+func regexPatternIsSafe(pat string) bool {
+	if len(pat) > maxRawRegexPattern {
+		return false
+	}
+	// Depth-indexed record of what has been seen inside the group currently
+	// open at that depth: an unbounded quantifier, and a top-level alternation.
+	// Both make a quantified group ambiguous, which is what backtracking
+	// engines pay for.
+	var unboundedInGroup []bool
+	var altInGroup []bool
+	var optionalInGroup []bool
+	var groupStart []int
+	depth := 0
+	// Consecutive unbounded quantifiers with no group between them (".*.*.*")
+	// are ambiguous in exactly the way a quantified group is, and the group
+	// rules below never look at them because they key on depth > 0.
+	adjacentUnbounded := 0
+	for i := 0; i < len(pat); i++ {
+		switch c := pat[i]; c {
+		case '\\':
+			i++ // an escaped byte is a literal, never structure
+			adjacentUnbounded = 0
+		case '[':
+			// Skip a character class whole: its ']', '(' and '*' are literals.
+			j := i + 1
+			if j < len(pat) && pat[j] == '^' {
+				j++
+			}
+			if j < len(pat) && pat[j] == ']' {
+				j++ // a leading ']' is a literal member
+			}
+			for j < len(pat) && pat[j] != ']' {
+				if pat[j] == '\\' {
+					j++
+				}
+				j++
+			}
+			i = j
+		case '|':
+			if depth > 0 {
+				altInGroup[depth-1] = true
+			}
+		case '(':
+			depth++
+			for len(unboundedInGroup) < depth {
+				unboundedInGroup = append(unboundedInGroup, false)
+				altInGroup = append(altInGroup, false)
+				optionalInGroup = append(optionalInGroup, false)
+				groupStart = append(groupStart, 0)
+			}
+			groupStart[depth-1] = i
+			unboundedInGroup[depth-1] = false
+			altInGroup[depth-1] = false
+			optionalInGroup[depth-1] = false
+			adjacentUnbounded = 0
+		case ')':
+			if depth == 0 {
+				break
+			}
+			inner := unboundedInGroup[depth-1]
+			innerAlt := altInGroup[depth-1]
+			innerOpt := optionalInGroup[depth-1]
+			body := pat[groupStart[depth-1]+1 : i]
+			depth--
+			adjacentUnbounded = 0
+			// A quantifier applied to the group we just closed.
+			if q, ok := quantifierAt(pat, i+1); ok {
+				// Two ways a quantified group becomes ambiguous, and both are
+				// what a backtracking engine pays for:
+				//   (a+)+   an unbounded quantifier inside an unbounded one —
+				//           the same string splits many ways between the two.
+				//   (a|a)*  an alternation whose branches can match the same
+				//           text, repeated without bound.
+				// An unquantified group, or one with a bounded quantifier
+				// ("(foo|bar){2}"), is not ambiguous in this sense and passes.
+				// An alternation is only dangerous when its branches are
+				// AMBIGUOUS — two of them able to match the same text, so the
+				// engine has more than one way to consume a subject and must
+				// try them all. "(a|a)*" and "(a|ab)*" are; "(foo|bar)+" and
+				// "(cat|dog)*" are not, and refusing those would have made the
+				// screen reject ordinary filters for nothing.
+				if q.unbounded && (inner || innerOpt || (innerAlt && !alternationIsUnambiguous(body))) {
+					return false
+				}
+				if q.unbounded && depth > 0 {
+					unboundedInGroup[depth-1] = true
+				}
+			} else if inner && depth > 0 {
+				// Carry the inner finding outward: "((a+))+" must still refuse.
+				unboundedInGroup[depth-1] = true
+			}
+		case '*', '+':
+			if depth > 0 {
+				unboundedInGroup[depth-1] = true
+			}
+			adjacentUnbounded++
+			if adjacentUnbounded >= maxAdjacentUnbounded {
+				return false
+			}
+		case '{':
+			if q, ok := quantifierAt(pat, i); ok {
+				if depth > 0 {
+					if q.unbounded {
+						unboundedInGroup[depth-1] = true
+					}
+					if q.variable {
+						// A variable-length repetition inside a group that is
+						// itself repeated is the same ambiguity '?' introduces:
+						// "(a{1,2})*b" backtracks catastrophically with no
+						// nested UNBOUNDED quantifier anywhere.
+						optionalInGroup[depth-1] = true
+					}
+				}
+				i = q.end - 1
+			}
+			// Not a quantifier: it is a literal brace, and the scan must NOT
+			// jump over the bytes after it.
+		case '?':
+			// An optional atom inside a quantified group is the bounded-
+			// ambiguity family: "(a?a?)*b" backtracks catastrophically without
+			// any nested UNBOUNDED quantifier for the rule above to catch.
+			if depth > 0 {
+				optionalInGroup[depth-1] = true
+			}
+		}
+	}
+	return true
+}
+
+// alternationIsUnambiguous reports whether every top-level branch of a group
+// body starts with a DIFFERENT plain literal byte, which is enough to make the
+// alternation deterministic: at most one branch can match at any position, so
+// repeating the group cannot multiply the ways a subject is consumed.
+//
+// Conservative by construction. A branch whose first element is anything other
+// than a plain literal — a character class, an escape, a nested group, an
+// anchor, a wildcard — is "unknown", and unknown means NOT proven unambiguous,
+// so the caller refuses. Empty branches ("(a|)") are ambiguous with everything.
+func alternationIsUnambiguous(body string) bool {
+	seen := make(map[byte]bool)
+	depth := 0
+	branchStart := 0
+	branches := make([]string, 0, 4)
+	for i := 0; i < len(body); i++ {
+		switch body[i] {
+		case '\\':
+			i++
+		case '[':
+			for i < len(body) && body[i] != ']' {
+				if body[i] == '\\' {
+					i++
+				}
+				i++
+			}
+		case '(':
+			depth++
+		case ')':
+			if depth > 0 {
+				depth--
+			}
+		case '|':
+			if depth == 0 {
+				branches = append(branches, body[branchStart:i])
+				branchStart = i + 1
+			}
+		}
+	}
+	branches = append(branches, body[branchStart:])
+	for _, b := range branches {
+		if b == "" {
+			return false
+		}
+		c := b[0]
+		// Only a plain literal byte proves anything. Everything else — a class,
+		// an escape, a nested group, an anchor, a wildcard, a quantifier — could
+		// overlap another branch in ways this scan does not model.
+		if c == '[' || c == '\\' || c == '(' || c == '.' || c == '^' || c == '$' ||
+			c == '*' || c == '+' || c == '?' || c == '{' || c == '|' {
+			return false
+		}
+		if seen[c] {
+			return false
+		}
+		seen[c] = true
+	}
+	return true
+}
+
+type regexQuantifier struct {
+	unbounded bool // '*', '+', or '{n,}' — no upper bound on repetitions
+	variable  bool // matches a RANGE of lengths ('*', '+', '?', '{n,}', '{n,m}')
+	end       int  // index just past the quantifier
+}
+
+// quantifierAt reports whether a quantifier starts at i, and whether it is
+// unbounded. A trailing '?' (lazy) or '+' (possessive) is consumed as part of
+// it; laziness does not remove the backtracking, and a possessive quantifier
+// would be safe but is not worth special-casing.
+func quantifierAt(pat string, i int) (regexQuantifier, bool) {
+	if i >= len(pat) {
+		return regexQuantifier{}, false
+	}
+	switch pat[i] {
+	case '*', '+':
+		end := i + 1
+		if end < len(pat) && (pat[end] == '?' || pat[end] == '+') {
+			end++
+		}
+		return regexQuantifier{unbounded: true, variable: true, end: end}, true
+	case '{':
+		// Only digits and at most one ',' may appear between the braces. The
+		// scan used to accept ANY content and report the span, so the caller's
+		// `case '{'` skipped everything up to the next '}' — and a pattern that
+		// merely CONTAINED a literal brace was never examined at all:
+		// "{?^(a+)+$}?" carried the headline refused pattern straight through
+		// the screen.
+		j := i + 1
+		comma := -1
+		for j < len(pat) && pat[j] != '}' {
+			if pat[j] == ',' {
+				if comma >= 0 {
+					return regexQuantifier{}, false // two commas: a literal
+				}
+				comma = j
+			} else if pat[j] < '0' || pat[j] > '9' {
+				return regexQuantifier{}, false // a literal '{', not a repetition
+			}
+			j++
+		}
+		if j >= len(pat) || j == i+1 {
+			return regexQuantifier{}, false // unterminated, or "{}"
+		}
+		// "{n,}" is unbounded; "{n}" and "{n,m}" are not.
+		unbounded := comma >= 0 && strings.TrimSpace(pat[comma+1:j]) == ""
+		end := j + 1
+		if end < len(pat) && (pat[end] == '?' || pat[end] == '+') {
+			end++
+		}
+		return regexQuantifier{unbounded: unbounded, variable: comma >= 0, end: end}, true
+	}
+	return regexQuantifier{}, false
 }
 
 // AdapterMongoGetFind returns filter and find options for a simple Find operation

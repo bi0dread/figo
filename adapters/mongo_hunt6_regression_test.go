@@ -420,9 +420,9 @@ func TestL9_LikeRegexMatchesNewlinesLikeSQL(t *testing.T) {
 	m, err := BuildMongoFilter(f)
 	require.NoError(t, err)
 	re := m["name"].(primitive.Regex)
-	assert.Equal(t, `^a.*b$`, re.Pattern)
+	assert.Equal(t, `\Aa.*b\z`, re.Pattern)
 	assert.Contains(t, re.Options, "s", "'%' must match a newline, as SQL LIKE does")
-	assert.NotContains(t, re.Options, "m", "'m' would unanchor ^ and $")
+	assert.NotContains(t, re.Options, "m", "'m' would change ^/$ semantics; \\A and \\z are unaffected")
 }
 
 // L10: a non-scalar value became query STRUCTURE instead of data —

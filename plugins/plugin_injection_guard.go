@@ -166,6 +166,9 @@ type InjectionGuardPlugin struct {
 	lmu        sync.Mutex
 	cur, prev  map[figo.Figo][]Violation
 	maxLatched int
+	// Retained Reason bytes per generation, so the latch can rotate on size as
+	// well as on entry count (see latch).
+	curBytes, prevBytes int
 }
 
 // Defaults. 64 RUNES per segment is MySQL's identifier limit (PostgreSQL's is
@@ -446,7 +449,15 @@ func (p *InjectionGuardPlugin) AfterParse(f figo.Figo, dsl string) (err error) {
 	}()
 
 	naming := f.GetNamingFunc()
-	vs := p.checkDSL(dsl, naming)
+	// The probe must mirror the instance's PARSE configuration, or it diagnoses
+	// a query the instance would never have built. Nested preloads are the
+	// case that bites: an instance with SetAllowNestedPreloads(true) parses
+	// load=[Orders.Items:...] happily, while a default probe emits the
+	// destructive "nested preloads are disabled" diagnostic and the guard
+	// refuses — so the opt-in was unreachable for anyone who registered this
+	// plugin, in exactly the deployment its own documentation points at
+	// (untrusted DSL plus AddPreloadScopeAll).
+	vs := p.checkDSLWith(dsl, naming, f.GetAllowNestedPreloads())
 
 	// Programmatic state travels with the instance, not the DSL, so it is
 	// screened here too — for shape only (see AllowFields): a hostile name that
@@ -474,11 +485,24 @@ func (p *InjectionGuardPlugin) CheckDSL(dsl string, naming figo.NamingFunc) []Vi
 	return p.checkDSL(dsl, naming)
 }
 
+// CheckDSLNested is CheckDSL for a caller whose instance admits dotted preload
+// labels (figo's SetAllowNestedPreloads). Screening with the wrong setting does
+// not produce a wrong VERDICT about identifiers, but it does add — or omit — the
+// parse diagnostic about nested paths, so pass what the real instance uses.
+func (p *InjectionGuardPlugin) CheckDSLNested(dsl string, naming figo.NamingFunc, allowNested bool) []Violation {
+	return p.checkDSLWith(dsl, naming, allowNested)
+}
+
 func (p *InjectionGuardPlugin) checkDSL(dsl string, naming figo.NamingFunc) []Violation {
+	return p.checkDSLWith(dsl, naming, false)
+}
+
+func (p *InjectionGuardPlugin) checkDSLWith(dsl string, naming figo.NamingFunc, allowNested bool) []Violation {
 	probe := figo.New()
 	if naming != nil {
 		probe.SetNamingFunc(naming)
 	}
+	probe.SetAllowNestedPreloads(allowNested)
 	// A bare instance has no plugin manager, so this stores the string without
 	// running any hook.
 	_ = probe.AddFiltersFromString(dsl)
@@ -501,18 +525,61 @@ func (p *InjectionGuardPlugin) checkDSL(dsl string, naming figo.NamingFunc) []Vi
 	}
 
 	if diag != nil && p.rejectDiagnosticsEnabled() {
-		// One violation per diagnostic line: errors.Join renders its parts
-		// newline-separated, and a caller reading the message wants them
-		// itemised the same way the identifier violations are.
-		for _, line := range strings.Split(diag.Error(), "\n") {
-			line = strings.TrimSpace(line)
-			if line == "" || informationalDiagnostic(line) {
+		// One violation per DIAGNOSTIC, taken from the joined error's parts
+		// rather than by splitting its rendered text on newlines.
+		//
+		// Splitting the text meant classifying it, and every diagnostic
+		// interpolates the caller's own input — so the classifier was reading
+		// attacker-controlled bytes. `load=[X:empty element in list` embedded
+		// the phrase the informational test looked for, the destructive
+		// diagnostic was reclassified as informational, and a query this plugin
+		// exists to refuse came back with no error, no latched verdict and no
+		// never-true pill: an unfiltered scan. figo now carries the
+		// classification as a Go type, which the caller's text cannot forge.
+		//
+		// A diagnostic whose message spans lines is also now one violation
+		// instead of several fragments, which is what it always should have been.
+		for _, part := range figo.DiagParts(diag) {
+			if part == nil || figo.IsInformationalDiag(part) {
 				continue
 			}
-			vs = append(vs, Violation{Position: PositionParse, Reason: line})
+			reason := strings.TrimSpace(part.Error())
+			if reason == "" {
+				continue
+			}
+			vs = append(vs, Violation{Position: PositionParse, Reason: truncateReason(reason)})
 		}
 	}
 	return dedupeViolations(vs)
+}
+
+// maxViolationReasonBytes caps how much of a diagnostic a Violation carries.
+//
+// A Reason quotes the caller's own token, so the violation list scales with the
+// hostile input that produced it — a 30 KB junk DSL measured 5185 violations
+// and 263 KB of reasons, ~9x the input, and the latch then RETAINED that per
+// refused request. The cap costs nothing a reader needs: the position and the
+// leading text identify the offending identifier, and the tail is the rest of a
+// token nobody can act on.
+const maxViolationReasonBytes = 256
+
+// maxViolationsPerRequest caps how many violations one screen reports.
+//
+// Same reason as the byte cap, on the other axis: the count scales with the
+// number of junk tokens. A caller acting on a rejection needs to know THAT it
+// was rejected and roughly why, not an itemisation of ten thousand tokens.
+const maxViolationsPerRequest = 64
+
+func truncateReason(s string) string {
+	if len(s) <= maxViolationReasonBytes {
+		return s
+	}
+	// Trim back to a rune boundary so the message stays valid UTF-8.
+	cut := maxViolationReasonBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + "… (truncated)"
 }
 
 // informationalDiagnostic reports whether a parser diagnostic describes
@@ -531,11 +598,7 @@ func (p *InjectionGuardPlugin) checkDSL(dsl string, naming figo.NamingFunc) []Vi
 //   - A preload with no conditions. `load=[Orders:]` is a first-class case in
 //     the core, and it is named as such in this file's own FinalizePreloads
 //     comment — yet it made the PARENT query match nothing.
-func informationalDiagnostic(line string) bool {
-	return strings.Contains(line, "empty element in list") ||
-		strings.Contains(line, "produced no conditions; relation preloaded unfiltered")
-}
-
+//
 // FinalizeClauses implements figo.ClauseFinalizer: it is where the refusal
 // becomes a query that matches nothing.
 //
@@ -1109,12 +1172,29 @@ func dedupeViolations(vs []Violation) []Violation {
 	}
 	seen := make(map[Violation]bool, len(vs))
 	out := vs[:0]
+	truncated := false
 	for _, v := range vs {
 		if seen[v] {
 			continue
 		}
 		seen[v] = true
+		// Cap the report. The list length scales with the number of junk tokens
+		// in the input, and the latch retains a copy per refused request — so
+		// without a bound here, refused traffic (the traffic this plugin exists
+		// to absorb) sized the plugin's own memory. One violation past the cap
+		// is enough to say the list was cut; the verdict itself is unchanged,
+		// because a rejection is a rejection at one violation or ten thousand.
+		if len(out) >= maxViolationsPerRequest {
+			truncated = true
+			break
+		}
 		out = append(out, v)
+	}
+	if truncated {
+		out = append(out, Violation{
+			Position: PositionParse,
+			Reason:   fmt.Sprintf("(more violations suppressed; reporting the first %d)", maxViolationsPerRequest),
+		})
 	}
 	return out
 }
@@ -1146,12 +1226,55 @@ func (p *InjectionGuardPlugin) latch(f figo.Figo, vs []Violation) {
 	if p.cur == nil {
 		p.cur = make(map[figo.Figo][]Violation)
 	}
+	stored := append([]Violation(nil), vs...)
+	size := violationsSize(stored)
+	// Rotate on EITHER bound. The entry count was the only one, and an entry
+	// is a copy of a violation list whose Reasons quote the caller's own
+	// tokens — so 8192 entries of arbitrary size was not a bound on anything
+	// that matters: 2000 refused 30 KB requests retained ~1 GB while the count
+	// sat at a quarter of its budget. The per-violation and per-request caps
+	// above bound one entry; this bounds the table.
 	if p.maxLatched > 0 && len(p.cur) >= p.maxLatched {
-		p.prev = p.cur
-		p.cur = make(map[figo.Figo][]Violation)
+		p.rotateLatch()
+	} else if p.curBytes+size > maxLatchBytes {
+		p.rotateLatch()
 	}
-	p.cur[f] = append([]Violation(nil), vs...)
-	delete(p.prev, f)
+	if prevSize, ok := p.cur[f]; ok {
+		p.curBytes -= violationsSize(prevSize)
+	}
+	p.cur[f] = stored
+	p.curBytes += size
+	if old, ok := p.prev[f]; ok {
+		p.prevBytes -= violationsSize(old)
+		delete(p.prev, f)
+	}
+}
+
+// maxLatchBytes bounds the total Reason bytes one generation of the latch
+// holds. Two generations may be live, so the retained ceiling is twice this.
+// 4 MiB is far more than any real rejection needs (a violation is capped at
+// 256 bytes and a request at 64 of them, so ~16 KB per entry worst case) and
+// still small enough that hostile refused traffic cannot make the guard the
+// largest thing in the process.
+const maxLatchBytes = 4 << 20
+
+// rotateLatch retires the current generation. f.lmu must be held.
+func (p *InjectionGuardPlugin) rotateLatch() {
+	p.prev = p.cur
+	p.prevBytes = p.curBytes
+	p.cur = make(map[figo.Figo][]Violation)
+	p.curBytes = 0
+}
+
+// violationsSize estimates the retained footprint of a violation list. Only the
+// Reason strings vary with input; the rest is a fixed per-entry overhead that
+// keeps a list of many empty violations from being counted as free.
+func violationsSize(vs []Violation) int {
+	n := 0
+	for _, v := range vs {
+		n += len(v.Reason) + len(v.Name) + 48
+	}
+	return n
 }
 
 // latched returns a COPY of the violations held against f.
@@ -1178,7 +1301,17 @@ func (p *InjectionGuardPlugin) latched(f figo.Figo) []Violation {
 			p.cur = make(map[figo.Figo][]Violation)
 		}
 		p.cur[f] = vs
+		size := violationsSize(vs)
+		p.curBytes += size
+		p.prevBytes -= size
 		delete(p.prev, f)
+		// Promotion is the only other way curBytes grows, and without a cap
+		// test here a caller that holds refused instances and polls Rejected()
+		// drained prev back into cur before every rotation, so rotating freed
+		// nothing and the documented ceiling was not one.
+		if p.curBytes > maxLatchBytes {
+			p.rotateLatch()
+		}
 		return append([]Violation(nil), vs...)
 	}
 	return nil
@@ -1190,8 +1323,14 @@ func (p *InjectionGuardPlugin) clear(f figo.Figo) {
 	}
 	p.lmu.Lock()
 	defer p.lmu.Unlock()
-	delete(p.cur, f)
-	delete(p.prev, f)
+	if vs, ok := p.cur[f]; ok {
+		p.curBytes -= violationsSize(vs)
+		delete(p.cur, f)
+	}
+	if vs, ok := p.prev[f]; ok {
+		p.prevBytes -= violationsSize(vs)
+		delete(p.prev, f)
+	}
 }
 
 // Compile-time proof that the guard implements the three hooks it documents.

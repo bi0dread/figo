@@ -169,6 +169,24 @@ type ExprFilter interface {
 	FilterExpr(f Figo, e Expr) Expr
 }
 
+// NestedPreloadPathExpander is an optional interface an Adapter may implement
+// to say that it treats a DOTTED preload label as a PATH through the
+// association graph rather than as one opaque relation key.
+//
+// It exists so figo can register every prefix of such a label as a relation in
+// its own right — which is what lets a PreloadFinalizer (a ScopePlugin's
+// mandatory tenant condition, say) attach to an intermediate relation the
+// adapter would otherwise fetch with a query nothing could scope.
+//
+// Only GORM answers true. Mongo resolves a label against its configured joins
+// map, where a synthesized prefix is an unconfigured relation and fails the
+// build; raw hands the map to the caller, who would issue an unfiltered query
+// for a relation the DSL never named. An adapter that does not implement this
+// interface is treated as answering false.
+type NestedPreloadPathExpander interface {
+	ExpandsNestedPreloadPaths() bool
+}
+
 // ClauseFinalizer is an optional interface a Plugin may implement to
 // transform the finished top-level clause list at the end of every Build —
 // including a Build whose DSL produced no filters at all (the list may be
@@ -656,6 +674,8 @@ type Figo interface {
 	UnregisterPlugin(name string) error
 	SetNamingFunc(fn NamingFunc)
 	GetNamingFunc() NamingFunc
+	SetAllowNestedPreloads(allow bool)
+	GetAllowNestedPreloads() bool
 	SetPage(skip, take int)
 	SetPageString(v string)
 	SetPageStringE(v string) error
@@ -720,6 +740,14 @@ type figo struct {
 
 	selectFieldsAsked map[string]bool
 	inFinalize        bool // true while ClauseFinalizers run: SetSelectFields then writes the render only
+
+	// allowNestedPreloads admits a DOTTED relation label from the DSL
+	// (load=[Orders.Items:...]). Off by default, and the default is the
+	// security property: a dotted label is a PATH through the association
+	// graph, so admitting one lets the caller reach relations the application
+	// never named, and a relation nobody named cannot have had a mandatory
+	// condition registered for it. See the parse branch for the full argument.
+	allowNestedPreloads bool
 
 	mu sync.RWMutex // Mutex for concurrent access protection
 }
@@ -830,6 +858,109 @@ func addDiag(diags *[]error, format string, args ...any) {
 	}
 }
 
+// informationalDiag marks a diagnostic that changed NOTHING about which rows
+// the built query matches. It wraps without altering the message, so the text a
+// caller reads is unchanged and only the CLASSIFICATION is carried.
+//
+// The classification has to travel as a type rather than as words, because
+// every diagnostic interpolates the caller's own input (%q of a token, a
+// relation label, a value) and a consumer that classified by matching the
+// MESSAGE was therefore matching attacker-controlled text. The
+// InjectionGuardPlugin did exactly that, and a DSL that embedded the phrase it
+// looked for — `load=[X:empty element in list` — was reclassified from
+// "rejection" to "informational", so the plugin returned no error, latched no
+// verdict, and installed no never-true pill: a query the guard exists to refuse
+// rendered as an unfiltered scan. Nothing a caller can write can forge a Go
+// type.
+type informationalDiag struct{ err error }
+
+func (d informationalDiag) Error() string           { return d.err.Error() }
+func (d informationalDiag) Unwrap() error           { return d.err }
+func (d informationalDiag) InformationalDiag() bool { return true }
+
+// addInfoDiag records a diagnostic that is reportable but not a rejection.
+// Use it ONLY where the built query still expresses everything the input asked
+// for; the default for a new diagnostic is addDiag, which is a rejection, and
+// that default is the safe direction.
+func addInfoDiag(diags *[]error, format string, args ...any) {
+	if diags != nil {
+		*diags = append(*diags, informationalDiag{err: fmt.Errorf(format, args...)})
+	}
+}
+
+// IsInformationalDiag reports whether a diagnostic describes something that
+// changed nothing about which rows the query matches.
+//
+// Safe to call on the JOINED error BuildE returns: a join is informational only
+// when EVERY part is. That is the whole point — errors.As traverses a join tree
+// and reports a match on any branch, so the natural spelling
+//
+//	if err != nil && !figo.IsInformationalDiag(err) { reject }
+//
+// would have been forgeable from untrusted DSL by prepending a harmless
+// informational construct such as `id<in>[1,2,]` to a query whose real
+// diagnostic is that a conjunct was DROPPED. That is the same laundering this
+// classification exists to close, one level up from the substring test it
+// replaced.
+//
+// An error carrying no classification at all is not informational: the default
+// for a diagnostic is "rejection", which is the safe direction.
+func IsInformationalDiag(err error) bool {
+	if err == nil {
+		return false
+	}
+	parts := DiagParts(err)
+	if len(parts) == 0 {
+		return false
+	}
+	for _, p := range parts {
+		var d interface{ InformationalDiag() bool }
+		if !errors.As(p, &d) || !d.InformationalDiag() {
+			return false
+		}
+	}
+	return true
+}
+
+// DiagParts flattens the error BuildE returns into its individual diagnostics,
+// unwrapping nested errors.Join values. An error that is not a join comes back
+// as a single-element slice, and nil as nil — so a caller can always range over
+// the result and classify each part with IsInformationalDiag.
+func DiagParts(err error) []error {
+	return diagParts(err, 0)
+}
+
+// maxDiagUnwrapDepth bounds the flattening. errors.Join cannot build a cycle,
+// but a CALLER may fold BuildE's error into their own multi-error type, and an
+// unbounded recursion over a cyclic Unwrap graph is a fatal stack overflow — not
+// a panic a handler can recover.
+const maxDiagUnwrapDepth = 64
+
+func diagParts(err error, depth int) []error {
+	if err == nil {
+		return nil
+	}
+	if depth >= maxDiagUnwrapDepth {
+		// Past the bound the error is returned whole rather than dropped:
+		// losing a diagnostic would silently narrow what a caller rejects on.
+		return []error{err}
+	}
+	if j, ok := err.(interface{ Unwrap() []error }); ok {
+		var out []error
+		for _, part := range j.Unwrap() {
+			if part == nil {
+				continue
+			}
+			out = append(out, diagParts(part, depth+1)...)
+		}
+		if len(out) == 0 {
+			return []error{err}
+		}
+		return out
+	}
+	return []error{err}
+}
+
 // Two resource caps are checked BEFORE the scanner sees a byte, so refusing a
 // hostile input never depends on surviving it. Every parser DoS to date was a
 // super-linear path reached by untrusted input (nested load= re-parsing burned
@@ -853,26 +984,80 @@ func dslResourceGuard(expr string) string {
 	if len(expr) > maxDSLBytes {
 		return fmt.Sprintf("DSL is %d bytes, over the %d-byte parser cap", len(expr), maxDSLBytes)
 	}
-	depth, inQuote := 0, false
+	// Two depths are tracked, and which one decides is settled at the end.
+	//
+	// quoted is the quote-aware count: a '(' inside a string literal is data,
+	// not nesting, which is what this guard is documented to model. blind
+	// counts every '(' regardless.
+	//
+	// They exist as a pair because the quote-aware model is only trustworthy
+	// when the quotes BALANCE. This scan tracks quote state across the whole
+	// string; the tokenizer tracks it per token and the load= branch rewinds to
+	// just past the directive's ']' and starts a fresh token there. An
+	// UNTERMINATED quote is where those two models part company: to this scan
+	// everything after it is quoted forever, while the tokenizer resumes
+	// structural parsing — so `load=[X:a="` followed by a million '(' was
+	// scanned as one long string literal, reported depth 0, and passed a cap it
+	// nested a million levels past. Any future guard added to this function
+	// would have inherited the same desync.
+	//
+	// When the input ends inside a quote the quote-aware count has therefore
+	// modelled the wrong thing, and the blind count — which cannot be desynced
+	// by quote state because it does not read it — decides instead. A
+	// well-formed DSL closes its quotes and is judged exactly as before.
+	quoted, blind := 0, 0
+	quotedPeak, blindPeak := 0, 0
+	inQuote := false
 	for i := 0; i < len(expr); i++ {
 		switch expr[i] {
 		case '"':
 			inQuote = !inQuote
 		case '(':
+			blind++
+			if blind > blindPeak {
+				blindPeak = blind
+			}
 			if !inQuote {
-				depth++
-				if depth > maxDSLGroupDepth {
-					return fmt.Sprintf("DSL nests groups deeper than the %d-level parser cap", maxDSLGroupDepth)
+				quoted++
+				if quoted > quotedPeak {
+					quotedPeak = quoted
 				}
 			}
 		case ')':
-			if !inQuote && depth > 0 {
-				depth--
+			if blind > 0 {
+				blind--
+			}
+			if !inQuote && quoted > 0 {
+				quoted--
 			}
 		}
 	}
+	peak := quotedPeak
+	if inQuote {
+		peak = blindPeak
+	}
+	if peak > maxDSLGroupDepth {
+		return fmt.Sprintf("DSL nests groups deeper than the %d-level parser cap", maxDSLGroupDepth)
+	}
 	return ""
 }
+
+// inLoadBracket reports whether the token under construction is inside an OPEN
+// load=[...] bracket, which is the only bracket whose content is a nested DSL
+// and can therefore legitimately contain a ')'.
+//
+// Every other bracketed value is a list (<in>/<nin>), where a ')' is an ordinary
+// member character AND — critically — a token that never meets its ']' must
+// still be able to end, or an unclosed '[' swallows the rest of the input.
+func inLoadBracket(tokenSoFar string, bracketDepth int) bool {
+	return bracketDepth > 0 && strings.HasPrefix(tokenSoFar, string(OperationLoad)+"=")
+}
+
+// maxPreloadPathSegments bounds how many relations a dotted load= label may
+// traverse. Association paths are two or three deep in practice; the bound
+// exists because the depth is attacker-chosen and each segment costs a map
+// entry and, on GORM, a query.
+const maxPreloadPathSegments = 8
 
 // parseDSL scans the DSL into the Node tree. Malformed constructs are skipped
 // (never fatal) exactly as they always were; each skip is additionally
@@ -1002,14 +1187,49 @@ func (f *figo) parseDSLDepth(expr string, diags *[]error, loadDepth int) *Node {
 						parenDepth--
 						j++
 						// Same rule as ']' above: once the value's own
-						// parenthesis is closed the token is complete.
-						// "price<bet>(10..20)and b=2" used to keep scanning and
-						// produce the token "price<bet>(10..20)and", whose bounds
-						// typed as the strings "(10" and "20)and" while the OR/AND
-						// connector was swallowed — silently, diag=nil.
-						if parenDepth == 0 {
+						// parenthesis is closed the token is complete —
+						// but ONLY outside a bracket, which owns the token
+						// boundary until its own ']'.
+						//
+						// Breaking here regardless of bracketDepth ended the
+						// token at the ')' of "load=[Orders:(id=1) and ...]"
+						// with the '[' still open, so the load= branch saw an
+						// unbalanced bracket count and fell back to the rescan
+						// meant for a token the tokenizer could NOT close. That
+						// rescan is quote-blind: it stopped at the first raw ']'
+						// — the one inside name="a]b" — and parsing resumed in
+						// the middle of a string literal, absorbing every
+						// following filter into one discarded token. The
+						// statement then rendered with NO WHERE AT ALL. This is
+						// CORE-1 in the spelling its regression test does not
+						// cover (that test's load= filters contain no paren).
+						//
+						// The whitespace, closing-quote and "<null>" rules above
+						// are all already conditioned on bracketDepth for the
+						// same reason: inside a bracket, only ']' ends the token.
+						//
+						// Restricted to a load= bracket, and that restriction is
+						// load bearing. Those other rules are safe to condition
+						// on bracketDepth because a ']' will close the bracket,
+						// but a ')' cannot — so relaxing this one for EVERY
+						// bracket removed the last rule that could terminate a
+						// token inside an UNCLOSED '[', and the token then ran
+						// to end of input: `status<nin>[archived) and
+						// tenant_id=7` bound the whole tail as one list member
+						// and the tenant predicate disappeared with BuildE nil.
+						// That is the same fail-open F5 exists to close, arriving
+						// through the tokenizer. Only the load= spelling needs
+						// the relaxation, because only there does a ')' sit
+						// inside a bracket whose content is a nested DSL.
+						if parenDepth == 0 && !inLoadBracket(expr[i:j], bracketDepth) {
 							break
 						}
+						continue
+					}
+					if inLoadBracket(expr[i:j], bracketDepth) {
+						// A ')' with no matching '(' inside a load= bracket is
+						// data, not the end of the token, for the same reason.
+						j++
 						continue
 					}
 					break
@@ -1181,6 +1401,44 @@ func (f *figo) parseDSLDepth(expr string, diags *[]error, loadDepth int) *Node {
 								addDiag(diags, "load= segment %q has an empty relation name", l)
 								continue
 							}
+							// A DOTTED label is a path through the association
+							// graph, not a longer name, and it is refused unless
+							// the instance opted in (SetAllowNestedPreloads).
+							//
+							// The refusal is the security property. Every
+							// per-relation control this library has is keyed on
+							// the LABEL: ScopePlugin.FinalizePreloads looks up
+							// preloadScopes[relation] by exact match, so a path
+							// that walks past the labels the application scoped
+							// arrives somewhere no mandatory condition was ever
+							// registered. Worse on GORM, where the label is a
+							// path whose conditions bind to the LEAF while the
+							// intermediate relations are fetched by queries the
+							// adapter never issues explicitly: "load=[Orders.Items:]"
+							// returned every Orders row of the parent, unscoped,
+							// nested inside a correctly scoped parent, with no
+							// error anywhere. No configuration reached that query.
+							//
+							// Dropping the segment (rather than preloading the
+							// first segment, or the leaf) is the only choice that
+							// cannot widen: the relation is not preloaded at all
+							// and the diagnostic is destructive, so a caller
+							// validating BuildE — or the InjectionGuardPlugin,
+							// which turns a destructive diagnostic into a
+							// refusal — rejects the request instead of running it.
+							if strings.Contains(table, ".") && !f.allowNestedPreloads {
+								addDiag(diags, "load=[%s:...] names a nested relation path; nested preloads are disabled (see SetAllowNestedPreloads)", table)
+								continue
+							}
+							// Even with nesting on, bound the PATH LENGTH. A real
+							// association path is two or three deep; the depth is
+							// attacker-chosen and every segment becomes a map key
+							// (and, on GORM, a query), so an unbounded path is an
+							// amplifier on input the byte cap alone permits.
+							if strings.Count(table, ".") >= maxPreloadPathSegments {
+								addDiag(diags, "load=[%s:...] nests more than %d relations deep", table, maxPreloadPathSegments)
+								continue
+							}
 							loadContent := strings.TrimSpace(l[colonIndex+1:])
 
 							// Parse the relation filter on a scratch instance: the
@@ -1217,7 +1475,7 @@ func (f *figo) parseDSLDepth(expr string, diags *[]error, loadDepth int) *Node {
 								if _, ok := f.preloads[table]; !ok {
 									f.preloads[table] = []Expr{}
 								}
-								addDiag(diags, "load=[%s:...] filter %q produced no conditions; relation preloaded unfiltered", table, loadContent)
+								addInfoDiag(diags, "load=[%s:...] filter %q produced no conditions; relation preloaded unfiltered", table, loadContent)
 							}
 
 						}
@@ -1892,6 +2150,42 @@ func isStringLiteral(v any) bool {
 	return ok
 }
 
+// betBoundKind classifies a <bet> bound by the KIND of value it is, so the
+// compatibility check can compare kinds instead of asking two separate
+// yes/no questions about them.
+//
+// The pair of predicates could not express the third kind. parseScalarLiteral
+// tries parseDate before falling back to string, so a date-shaped bound comes
+// back as a time.Time — for which isNumericLiteral and isStringLiteral are BOTH
+// false. The old test required one of the bounds to be a string, so
+// `price<bet>(10..2024-01-02)` passed the very guard whose comment says it
+// exists to stop a number paired with something that is not one: it rendered
+// BETWEEN 10 AND '2024-01-02 00:00:00+00', and since SQLite, MySQL and BSON all
+// order every number below every date, the ceiling evaporated and six of seven
+// rows came back where three should have. Reversed, the same pair silently
+// matched nothing.
+func betBoundKind(v any) int {
+	switch v.(type) {
+	case int64, float64:
+		return betKindNumber
+	case time.Time:
+		return betKindTime
+	case bool:
+		return betKindBool
+	case string:
+		return betKindString
+	}
+	return betKindOther
+}
+
+const (
+	betKindOther = iota
+	betKindNumber
+	betKindTime
+	betKindString
+	betKindBool
+)
+
 func isAllDigits(s string) bool {
 	t := strings.TrimPrefix(strings.TrimPrefix(s, "-"), "+")
 	if t == "" {
@@ -1923,6 +2217,7 @@ func parseListLiteral(raw string, diags *[]error) []any {
 	// Split on commas OUTSIDE quotes so quoted elements can contain commas.
 	parts := splitOutsideQuotes(s, ',')
 	vals := make([]any, 0, len(parts))
+	blanks := 0
 	for _, p := range parts {
 		// A blank part (leading/trailing/doubled comma) is a separator
 		// artifact, not a value: it used to be typed as "" and injected into
@@ -1932,10 +2227,27 @@ func parseListLiteral(raw string, diags *[]error) []any {
 		// so skipping blanks loses no expressiveness. (The empty LIST is
 		// already special-cased above, yielding the fail-closed 1=0 sentinel.)
 		if strings.TrimSpace(p) == "" {
-			addDiag(diags, "empty element in list %q ignored (write \"\" for an explicit empty string)", raw)
+			blanks++
 			continue
 		}
 		vals = append(vals, parseScalarLiteral(p))
+	}
+	if blanks > 0 {
+		// Skipping a blank part is informational ONLY while some element
+		// survives — the predicate still says what the input asked, minus a
+		// separator artifact. When EVERY part was blank the list is empty, and
+		// an empty list is not a smaller filter but a different one: `<nin>[,]`
+		// renders 1=1 (and $nin:[] / match_all), i.e. it matches everything.
+		// Classifying that as informational told a validating caller, and the
+		// InjectionGuardPlugin, that nothing had changed about which rows the
+		// query returns — while the query had in fact become unfiltered on that
+		// column. addInfoDiag's contract is exactly "the built query still
+		// expresses everything the input asked for", and here it does not.
+		if len(vals) == 0 {
+			addDiag(diags, "list %q has no members after blank elements were skipped; the predicate matches everything", raw)
+		} else {
+			addInfoDiag(diags, "empty element in list %q ignored (write \"\" for an explicit empty string)", raw)
+		}
 	}
 	if len(vals) == 0 {
 		return nil
@@ -2032,12 +2344,22 @@ func getClausesFromOperation(o Operation, field string, value any, diags *[]erro
 				return nil
 			}
 			lowVal, highVal := parseScalarLiteral(low), parseScalarLiteral(high)
-			// A number paired with a string is the same silent widening one step
+			// Bounds of different KINDS are the same silent widening one step
 			// later (`<bet>(10..abc)` renders BETWEEN 10 AND 'abc'), so fail
-			// closed on mixed kinds rather than emit a comparison whose meaning
-			// depends on the engine's type ordering.
-			if isNumericLiteral(lowVal) != isNumericLiteral(highVal) &&
-				(isStringLiteral(lowVal) || isStringLiteral(highVal)) {
+			// closed rather than emit a comparison whose meaning depends on the
+			// engine's type ordering. Comparing kinds — rather than asking
+			// "is one of them a string?" — is what also closes number..date,
+			// which typed as neither and passed (see betBoundKind).
+			// A bound the classifier does not model — notably the `null`
+			// sentinel, which parses to a nil any — is exempt, exactly as it was
+			// under the previous pair of predicates (nil is neither numeric nor
+			// a string, so the old test never fired for it). `<bet>(null..2)` is
+			// a supported shape with adapter-specific rendering that the ES
+			// truth-table oracle pins; this guard is about two bounds whose
+			// COMPARISON is engine-type-ordering dependent, which a sentinel's
+			// is not.
+			if lowKind, highKind := betBoundKind(lowVal), betBoundKind(highVal); lowKind != betKindOther &&
+				highKind != betKindOther && lowKind != highKind {
 				return nil
 			}
 			return BetweenExpr{Field: field, Low: lowVal, High: highVal}
@@ -2115,6 +2437,49 @@ func nextItemKind(children []*Node, from int) (nextSlotKind, Operation) {
 	return nextIsNothing, ""
 }
 
+// nextItemKinds is nextItemKind precomputed for every position in one reverse
+// pass: kinds[i]/ops[i] equal what nextItemKind(children, i) returns, and
+// kinds[len(children)] is the nextIsNothing terminator so a caller may index
+// idx+1 without a bounds test.
+//
+// The scan is why this exists. nextItemKind walks FORWARD from its argument
+// past every child that contributes nothing, and its caller
+// (absorbAroundNonOperand) is invoked once per non-contributing child — so a
+// run of N such children re-walked the tail N times: N + (N-1) + ... = O(N^2)
+// over input that is, per child, trivially cheap to classify. "()" repeated is
+// the cheapest spelling (an empty group contributes nothing and is not a
+// directive, so it falls through the switch), and "sort= " or "page= " repeated
+// is the same shape. At the 1 MiB parser cap 524288 empty groups spent four and
+// a half MINUTES in this function with BuildE returning nil, which the resource
+// guard cannot see: the byte cap is satisfied and the group depth of "()()()"
+// never exceeds 1.
+//
+// The recurrence is nextItemKind's own loop read backwards: a child that
+// returns decides its own slot, and a child the switch does not match — a
+// directive, or an empty group — defers to the answer for the next slot, which
+// has already been computed.
+func nextItemKinds(children []*Node) ([]nextSlotKind, []Operation) {
+	kinds := make([]nextSlotKind, len(children)+1)
+	ops := make([]Operation, len(children)+1)
+	kinds[len(children)] = nextIsNothing
+	for i := len(children) - 1; i >= 0; i-- {
+		child := children[i]
+		switch {
+		case child.Operator == operationDirective:
+			kinds[i], ops[i] = kinds[i+1], ops[i+1]
+		case child.Operator == OperationAnd || child.Operator == OperationOr:
+			kinds[i], ops[i] = nextIsConnector, child.Operator
+		case child.Operator == OperationNot:
+			kinds[i], ops[i] = nextIsOperand, OperationNot
+		case len(child.Expression) > 0:
+			kinds[i], ops[i] = nextIsOperand, ""
+		default:
+			kinds[i], ops[i] = kinds[i+1], ops[i+1]
+		}
+	}
+	return kinds, ops
+}
+
 // buildExpressionTreeWithPrecedence builds a proper expression tree respecting operator precedence
 func buildExpressionTreeWithPrecedence(children []*Node, diags *[]error) Expr {
 	if len(children) == 0 {
@@ -2123,6 +2488,11 @@ func buildExpressionTreeWithPrecedence(children []*Node, diags *[]error) Expr {
 
 	// Build a list of expressions and operators in order
 	var items []any // Can be Expr or Operation
+
+	// One reverse pass replaces absorbAroundNonOperand's forward rescan, which
+	// was quadratic in the number of consecutive non-operand slots (see
+	// nextItemKinds).
+	nextKinds, nextOps := nextItemKinds(children)
 
 	// Set when a non-operand slot left the connector written AFTER it
 	// ("sort=id:asc and a=1") as the one to absorb.
@@ -2156,7 +2526,7 @@ func buildExpressionTreeWithPrecedence(children []*Node, diags *[]error) Expr {
 				prevOp, hasPrevOp = op, true
 			}
 		}
-		kind, nextOp := nextItemKind(children, idx+1)
+		kind, nextOp := nextKinds[idx+1], nextOps[idx+1]
 		switch {
 		case hasPrevOp && kind == nextIsConnector:
 			if prevOp == OperationOr && nextOp == OperationAnd {
@@ -2881,6 +3251,47 @@ func (f *figo) GetNamingFunc() NamingFunc {
 	return f.namingFunc
 }
 
+// SetAllowNestedPreloads admits DOTTED relation labels from the DSL, i.e.
+// load=[Orders.Items:...], which preload a PATH through the association graph
+// rather than one relation.
+//
+// It is off by default and that default is load bearing. A dotted label is not
+// a longer name, it is a traversal: the caller chooses which relations the
+// query reaches, and the reachable set becomes the schema's association graph
+// instead of the set the application named. Two things follow, and both are
+// why a dotted label from untrusted DSL is refused unless the application says
+// otherwise:
+//
+//   - A relation nobody anticipated cannot have had a mandatory condition
+//     registered for it. ScopePlugin.AddPreloadScope is keyed on the label, so
+//     a path that walks past the labels the application scoped arrives at a
+//     relation with no tenant/soft-delete predicate on it.
+//   - On GORM a dotted label is a path whose supplied conditions apply to the
+//     LEAF only, while the INTERMEDIATE relations are fetched by queries the
+//     adapter never issues explicitly. Turning nesting on therefore also turns
+//     on prefix expansion (see the preload finalizer dispatch in BuildE), which
+//     registers every prefix of a dotted label as a relation in its own right
+//     so the finalizers run for it and its conditions reach its own query.
+//
+// Turn it on when the DSL is authored by something you trust, or when every
+// relation reachable by a path carries the scope (AddPreloadScopeAll). With it
+// off, a dotted label is dropped with a diagnostic and the relation is not
+// preloaded at all — the refusal is what a validating caller sees.
+//
+// Configure this before Build()/AddFiltersFromString.
+func (f *figo) SetAllowNestedPreloads(allow bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.allowNestedPreloads = allow
+}
+
+// GetAllowNestedPreloads reports whether dotted relation labels are admitted.
+func (f *figo) GetAllowNestedPreloads() bool {
+	f.mu.RLock()
+	defer f.mu.RUnlock()
+	return f.allowNestedPreloads
+}
+
 func (f *figo) SetAdapterObject(adapter Adapter) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -3087,6 +3498,13 @@ func (f *figo) BuildE(adapter Adapter) error {
 	preloads := f.preloads
 	f.preloads = make(map[string][]Expr)
 	pm := f.pluginManager
+	// Snapshot both under the SAME lock the parse branch read the flag under.
+	// Re-reading through the getter after this Unlock let a concurrent
+	// SetAllowNestedPreloads(false) admit the dotted label and then skip prefix
+	// registration, leaving exactly the unexpanded state the expansion exists
+	// to prevent.
+	allowNested := f.allowNestedPreloads
+	adapterObj := f.adapterObj
 	f.mu.Unlock()
 
 	// An empty manager dispatches nothing, so it must not take the plugin path
@@ -3104,6 +3522,45 @@ func (f *figo) BuildE(adapter Adapter) error {
 	// pruning) OUTSIDE the lock — a FilterExpr callback may call back into
 	// this instance's read methods, which must not deadlock. Preload
 	// conditions parse through the same DSL, so they are filtered as well.
+	// With nested preloads enabled, register every PREFIX of a dotted label as
+	// a relation in its own right — but only on an adapter that treats the
+	// label as a PATH.
+	//
+	// GORM does: "Orders.Items" binds the conditions supplied for it to the
+	// LEAF and fetches each intermediate relation with a query the adapter
+	// never issues explicitly, so a finalizer keyed on the label never saw
+	// "Orders" and the condition registered for it reached nothing. Naming the
+	// prefix gives the finalizers a relation to attach to, and gives the
+	// adapter an explicit Preload("Orders", conds) whose conditions GORM
+	// applies to that intermediate query.
+	//
+	// Mongo and raw do NOT: to Mongo a dotted label is just a key in the joins
+	// map, so a synthesized "Orders" is an unconfigured relation and the build
+	// fails; to raw it is one more entry in the map BuildRawPreloads hands the
+	// caller, who would then issue an UNFILTERED query for a relation the DSL
+	// never named. Expanding unconditionally traded one leak for another, which
+	// is why the adapter is asked (NestedPreloadPathExpander) instead of assumed.
+	if allowNested {
+		if exp, ok := adapterObj.(NestedPreloadPathExpander); ok && exp.ExpandsNestedPreloadPaths() {
+			for table := range preloads {
+				// Slice the ORIGINAL label at each '.' rather than re-joining
+				// its segments: strings.Join allocates a fresh string of length
+				// O(i) per prefix, so a label of N segments cost O(N^2) in time
+				// AND in retained heap — 128 KB of DSL held 4.3 GB in this map,
+				// under both pre-parse caps and before any plugin could measure
+				// it. A slice of the original shares its backing array.
+				for k := 0; k < len(table); k++ {
+					if table[k] != '.' {
+						continue
+					}
+					if _, ok := preloads[table[:k]]; !ok {
+						preloads[table[:k]] = []Expr{}
+					}
+				}
+			}
+		}
+	}
+
 	if pm != nil {
 		// The resource-guard pill must skip the filter pass: pruning rebuilds
 		// logical nodes and drops an empty OrExpr entirely (pruneExprFields),

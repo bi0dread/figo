@@ -28,9 +28,10 @@ import (
 // "a=1 and (b=2 or c=3)" is depth 2.
 type QueryLimits struct {
 	MaxNestingDepth    int // max logical nesting (a flat query has depth 1)
-	MaxFieldCount      int // max number of distinct fields referenced
+	MaxFieldCount      int // max number of distinct fields referenced in FILTERS (see MaxSortColumns for ORDER BY)
 	MaxParameterCount  int // max total number of filter values (each <in> element counts)
 	MaxExpressionCount int // max total number of expression nodes
+	MaxSortColumns     int // max ORDER BY columns (0 = unlimited)
 }
 
 // DefaultQueryLimits returns the defaults figo's core used to seed
@@ -41,6 +42,7 @@ func DefaultQueryLimits() QueryLimits {
 		MaxFieldCount:      50,
 		MaxParameterCount:  100,
 		MaxExpressionCount: 200,
+		MaxSortColumns:     32,
 	}
 }
 
@@ -118,6 +120,32 @@ func (p *LimitsPlugin) AfterParse(f figo.Figo, _ string) error {
 			}
 		}
 	}
+	// Sort columns are fields the query references, and they were measured
+	// nowhere. A sort= directive lands in f.sort, reachable only through
+	// GetSort, so no ORDER BY column ever entered m.fields: under
+	// MaxFieldCount=2 a DSL naming fifty thousand sort columns was reported
+	// within policy, and rendered a 1.1 MB SELECT the database still had to
+	// plan. measureExpr's figo.OrderBy arm only ever fired for an OrderBy
+	// placed in the clause list via AddFilter, which the DSL cannot do.
+	//
+	// They are counted by MaxSortColumns alone, NOT folded into MaxFieldCount.
+	// Folding them in looked more honest — ORDER BY columns are fields the
+	// query references — but it silently lowered every existing
+	// DefaultQueryLimits user's filter budget (45 filter fields plus 10 sort
+	// columns began failing a 50-field policy), which is a breaking change for
+	// no security gain: the gap was that sort columns were bounded by NOTHING,
+	// and a dedicated bound closes it. MaxExpressionCount excludes them for the
+	// separate reason documented on measureExpr: sorting is not filter
+	// complexity.
+	sortCols := 0
+	if ob := c.GetSort(); ob != nil {
+		for _, col := range ob.Columns {
+			if col.Name == "" {
+				continue
+			}
+			sortCols++
+		}
+	}
 
 	if limits.MaxNestingDepth > 0 && m.maxDepth > limits.MaxNestingDepth {
 		return fmt.Errorf("query exceeds MaxNestingDepth: %d > %d", m.maxDepth, limits.MaxNestingDepth)
@@ -130,6 +158,9 @@ func (p *LimitsPlugin) AfterParse(f figo.Figo, _ string) error {
 	}
 	if limits.MaxExpressionCount > 0 && m.expressions > limits.MaxExpressionCount {
 		return fmt.Errorf("query exceeds MaxExpressionCount: %d > %d", m.expressions, limits.MaxExpressionCount)
+	}
+	if limits.MaxSortColumns > 0 && sortCols > limits.MaxSortColumns {
+		return fmt.Errorf("query exceeds MaxSortColumns: %d > %d", sortCols, limits.MaxSortColumns)
 	}
 	return nil
 }

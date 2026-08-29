@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"sync"
 	"time"
+	"unicode/utf8"
 )
 
 // AuditPlugin records every DSL the instance parses and every statement it
@@ -47,6 +48,9 @@ type AuditPlugin struct {
 	logger  *slog.Logger
 	history []AuditEntry
 	max     int
+	// bytes is the running footprint of history, so the plugin can bound
+	// retention by size as well as by entry count (see record).
+	bytes int
 }
 
 // AuditEntry is one recorded parse or render event
@@ -132,16 +136,72 @@ func (p *AuditPlugin) AfterQuery(f figo.Figo, ctx any, result interface{}) error
 	return nil
 }
 
-// record appends to the bounded history
+// maxAuditEntryBytes caps the recorded DSL and rendered result per entry.
+//
+// The hooks run inside AddFiltersFromString, which applies no length check —
+// the parser's 1 MiB cap lives in BuildE and fires later — so this plugin
+// retained precisely the input the parser was about to refuse, and it retained
+// it once per hook per request. 50 requests of 5 MiB held 250 MB while the
+// entry count sat at 50 of its 100 budget. An audit trail needs enough of the
+// DSL to identify the request, not all of it.
+const maxAuditEntryBytes = 4096
+
+// maxAuditHistoryBytes bounds the whole history, so the entry count is no
+// longer the only bound. With both caps a full history is a few MB at worst.
+const maxAuditHistoryBytes = 8 << 20
+
+// truncateAudit trims s to the per-entry budget on a rune boundary, marking
+// that it was cut so a reader never mistakes a prefix for the whole input.
+func truncateAudit(s string) string {
+	if len(s) <= maxAuditEntryBytes {
+		return s
+	}
+	cut := maxAuditEntryBytes
+	for cut > 0 && !utf8.RuneStart(s[cut]) {
+		cut--
+	}
+	return s[:cut] + fmt.Sprintf("… (truncated, %d bytes total)", len(s))
+}
+
+// auditEntrySize estimates an entry's retained footprint. Only the strings vary
+// with input; the fixed term keeps a run of tiny entries from counting as free.
+func auditEntrySize(e AuditEntry) int {
+	n := len(e.DSL) + len(e.Result) + len(e.Ctx) + len(e.Kind) + 96
+	for _, a := range e.Args {
+		if s, ok := a.(string); ok {
+			n += len(s)
+		}
+		n += 16
+	}
+	return n
+}
+
+// record appends to the bounded history.
+//
+// Bounded on two axes: the entry count the caller configured, and a byte
+// budget. The count alone bounded nothing that mattered, because an entry
+// holds the caller's own DSL — see maxAuditEntryBytes.
 func (p *AuditPlugin) record(e AuditEntry) {
 	if p.max == 0 {
 		return
 	}
+	e.DSL = truncateAudit(e.DSL)
+	e.Result = truncateAudit(e.Result)
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.history = append(p.history, e)
-	if len(p.history) > p.max {
-		p.history = p.history[len(p.history)-p.max:]
+	p.bytes += auditEntrySize(e)
+	// Drop from the front until BOTH bounds hold. Evicted elements are zeroed
+	// before the slice is resliced: reslicing alone leaves them reachable from
+	// the backing array, which held ~60 MB past the documented window.
+	drop := 0
+	for len(p.history)-drop > p.max || (p.bytes > maxAuditHistoryBytes && len(p.history)-drop > 1) {
+		p.bytes -= auditEntrySize(p.history[drop])
+		p.history[drop] = AuditEntry{}
+		drop++
+	}
+	if drop > 0 {
+		p.history = p.history[drop:]
 	}
 }
 

@@ -180,12 +180,14 @@ name="John Doe" and (age>18 or vip=true) and status<nin>["banned","deleted"]
 | `=~` | `email=~"^[a-z]+@x\.com$"` | Regex match |
 | `!=~` | `phone!=~"^\+1"` | Regex not match |
 
+> **`=~` on MongoDB is screened.** Mongo evaluates `$regex` with PCRE2, which backtracks, while the pattern is validated with Go's RE2, which does not — so RE2 accepts `^(a+)+$` happily and Mongo then spends seconds on it. figo therefore refuses a DSL-supplied pattern longer than 512 bytes, or one whose shape is catastrophic: an unbounded quantifier (`*`, `+`, `{n,}`) applied to a group that itself contains an unbounded quantifier (`(a+)+`), a variable-length repetition (`(a?a?)*`, `(a{1,2})*`), or an *ambiguous* alternation — one whose branches can start with the same character (`(a|ab)*`). `(foo|bar)+` is fine. Refusal is a render error on that adapter, so the same DSL still renders on raw, GORM and Elasticsearch. This is a shape bound, not a cost bound: it refuses the known catastrophic constructions, not every expensive pattern.
+
 Per-backend translation of `=^`:
 
 | Backend | Output |
 |---------|--------|
 | Raw SQL / GORM | `col LIKE ?` (arg `%john%`) |
-| MongoDB | anchored, metachar-escaped regex `^.*john.*$` |
+| MongoDB | anchored, metachar-escaped regex `\A.*john.*\z` |
 | Elasticsearch | `wildcard` query `*john*` (literal `*`/`?` in the value are escaped) |
 
 ### Set, range, and null operators
@@ -799,7 +801,7 @@ f.AddSelectFields("id", "name", "email")
 `LimitsPlugin` guards against pathological untrusted DSL: once registered, every `AddFiltersFromString` call is measured and fails when a limit is exceeded. A zero value disables that particular limit.
 
 ```go
-lp := plugins.NewLimitsPlugin(plugins.DefaultQueryLimits()) // nesting 10, fields 50, params 100, expressions 200
+lp := plugins.NewLimitsPlugin(plugins.DefaultQueryLimits()) // nesting 10, filter fields 50, params 100, expressions 200, sort columns 32
 f.RegisterPlugin(lp)
 
 err := f.AddFiltersFromString(hugeUntrustedDSL)
@@ -830,10 +832,16 @@ f.Build(adapters.RawAdapter{})
 Multiple scopes are ANDed in; `sp.AddScope(...)` adds more. Rebuilds never duplicate an already-present scope.
 
 > **Security note — preloads are NOT scoped by default.** The scope guards the top-level query only. A relation pulled in with `load=[Orders:...]` is fetched by a separate query on GORM (and is an unfiltered array on Mongo), so a child row belonging to another tenant comes back inside a correctly scoped parent. Which column scopes a child table is a property of that table and is not inferred from the parent — register it explicitly with `sp.AddPreloadScope("Orders", figo.EqExpr{Field: "tenant_id", Value: tenantID})`, or `sp.AddPreloadScopeAll(...)` to apply conditions to every preloaded relation.
+>
+> **Preload scopes are keyed by the exact relation label.** `AddPreloadScope` does a byte-exact lookup, so a scope registered for `"Items"` does **not** apply when the same relation is reached as `Orders.Items` — register it under every path spelling the DSL can produce, or use `AddPreloadScopeAll`, which covers every segment of every path. Nothing warns when a path segment has no registered scope.
+>
+> **Nested (dotted) preload paths are refused by default.** `load=[Orders.Items:...]` is a *path* through the association graph, not a longer relation name, so it can reach relations the application never named — and a relation nobody named cannot have had a scope registered for it. `BuildE` reports it and the relation is not preloaded at all. Turn it on with `f.SetAllowNestedPreloads(true)` when the DSL is authored by something you trust, or when `AddPreloadScopeAll` covers every reachable relation. With it on, figo registers every prefix of a dotted label as a relation in its own right (on GORM, the only adapter that treats the label as a path), so a scope registered for `"Orders"` reaches the intermediate query GORM would otherwise issue unscoped. Paths deeper than 8 relations are refused regardless.
 
 ## Auditing
 
 `AuditPlugin` records every parsed DSL and every rendered statement — for compliance logs and "what did it actually run?" debugging. Entries go to an optional `log/slog` logger and a bounded in-memory history (on cached paths, only real renders are recorded — not cache hits).
+
+The history is bounded on two axes — the entry count you pass, and a byte budget — because an entry holds the caller's own DSL and the hooks run before the parser's size cap. A recorded DSL or result longer than 4096 bytes is stored as a prefix ending `… (truncated, N bytes total)`.
 
 ```go
 ap := plugins.NewAuditPlugin(slog.Default(), 100) // nil logger = history only; size 0 = log only

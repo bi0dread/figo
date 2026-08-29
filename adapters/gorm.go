@@ -298,6 +298,55 @@ func gormIdentScreen(what, name string) error {
 	return nil
 }
 
+// gormRelationScreen screens a preload RELATION label — the key of the map
+// figo.GetPreloads returns, which is the `load=[Name:...]` label the DSL
+// supplied verbatim.
+//
+// This is the one identifier position the adapter used to hand to GORM with no
+// screening at all, and unlike a column name it is not merely quoted on the way
+// to the engine: GORM RESOLVES it against the schema, and two shapes make that
+// resolution do something the caller never asked for.
+//
+//   - clause.Associations ("~~~as~~~") is GORM's own sentinel for "every
+//     association" (callbacks/preload.go expands it against the whole schema).
+//     A relation figo never named cannot have a per-relation scope attached to
+//     it — ScopePlugin.FinalizePreloads is keyed on the label — so the sentinel
+//     pulled back every association of the model with no mandatory condition on
+//     any of them.
+//   - a name that is not a Go field name at all. Relation labels are struct
+//     field names, so the legal alphabet is exactly Go's: a leading letter or
+//     '_', then letters, digits and '_'. Screening to that alphabet refuses the
+//     sentinel on its own (it is all '~'), and refuses anything else GORM might
+//     later give a meaning to, rather than enumerating sentinels as they appear.
+//
+// A dot separates path segments; each segment is screened on its own. The parse
+// layer decides whether a DOTTED label is admissible at all (see figo's
+// AllowNestedPreloads) — this screen only says that each segment is a name a
+// relation can have.
+func gormRelationScreen(name string) error {
+	if name == clause.Associations {
+		return fmt.Errorf("gorm adapter: preload relation %q is gorm's all-associations sentinel", name)
+	}
+	if name == "" {
+		return fmt.Errorf("gorm adapter: preload relation %q is empty", name)
+	}
+	for _, seg := range strings.Split(name, ".") {
+		if seg == "" {
+			return fmt.Errorf("gorm adapter: preload relation %q has an empty name segment", name)
+		}
+		for i, r := range seg {
+			switch {
+			case r == '_':
+			case unicode.IsLetter(r):
+			case unicode.IsDigit(r) && i > 0:
+			default:
+				return fmt.Errorf("gorm adapter: preload relation %q: segment %q contains %q, which cannot appear in a relation name", name, seg, r)
+			}
+		}
+	}
+	return nil
+}
+
 // gormProjectionName screens one projection name for the SELECT list and
 // reports whether it is a BARE column identifier, optionally table-qualified
 // ("age", "users.age").
@@ -350,6 +399,14 @@ func gormQuoteIdent(db *gorm.DB, name string) string {
 	}
 	return db.Statement.Quote(name)
 }
+
+// ExpandsNestedPreloadPaths implements figo.NestedPreloadPathExpander: GORM
+// treats "Orders.Items" as a PATH, binding the conditions supplied for it to
+// the leaf while fetching each intermediate relation with a query the adapter
+// never issues explicitly. figo therefore registers every prefix as a relation
+// of its own, so a PreloadFinalizer can attach the mandatory conditions that
+// intermediate query would otherwise run without.
+func (GormAdapter) ExpandsNestedPreloadPaths() bool { return true }
 
 // ApplyGorm applies pagination, preloads, where clauses, and sorting to a GORM DB instance.
 // The caller's handle is left untouched: everything is applied to a private
@@ -431,6 +488,15 @@ func ApplyGorm(f figo.Figo, trx *gorm.DB) *gorm.DB {
 	sortStrings(relations)
 
 	for _, k := range relations {
+		// Screen the relation label before it reaches GORM. Failing closed here
+		// matches what the filter and projection positions already do: an
+		// unscreenable identifier errors the DB rather than being dropped, so
+		// the preload can never run WITHOUT the mandatory conditions a
+		// PreloadFinalizer attached to the label it was registered under.
+		if err := gormRelationScreen(k); err != nil {
+			_ = trx.AddError(fmt.Errorf("figo: %w", err))
+			continue
+		}
 		v := preloadExprs[k]
 		var conv []clause.Expression
 		for _, e := range v {
@@ -470,7 +536,12 @@ func ApplyGorm(f figo.Figo, trx *gorm.DB) *gorm.DB {
 				// And/Or/Not still renders as nothing (see the figo.OrderBy case
 				// in toGormClauseWithFigo), which is what stops it being inlined
 				// into the WHERE clause as an unexecutable "AND `t`.`age` DESC".
-				if ce := gormOrderByClause(ob); ce != nil {
+				ce, err := gormOrderByClause(ob)
+				if err != nil {
+					_ = trx.AddError(fmt.Errorf("figo: %w", err))
+					continue
+				}
+				if ce != nil {
 					trx = trx.Clauses(ce)
 				}
 				continue
@@ -493,7 +564,10 @@ func ApplyGorm(f figo.Figo, trx *gorm.DB) *gorm.DB {
 	// converter (see the figo.OrderBy case there).
 	sort := f.GetSort()
 	if sort != nil {
-		if ce := gormOrderByClause(*sort); ce != nil {
+		ce, err := gormOrderByClause(*sort)
+		if err != nil {
+			_ = trx.AddError(fmt.Errorf("figo: %w", err))
+		} else if ce != nil {
 			trx = trx.Clauses(ce)
 		}
 	}
@@ -504,12 +578,21 @@ func ApplyGorm(f figo.Figo, trx *gorm.DB) *gorm.DB {
 // gormOrderByClause renders a sort spec as GORM's ORDER BY clause. Used only
 // from ApplyGorm, where trx.Clauses routes a clause.OrderBy to the ORDER BY
 // position.
-func gormOrderByClause(x figo.OrderBy) clause.Expression {
+func gormOrderByClause(x figo.OrderBy) (clause.Expression, error) {
 	var cols []clause.OrderByColumn
 	for _, c := range x.Columns {
 		// Defensively skip empty column names: they would render ORDER BY ``.
 		if c.Name == "" {
 			continue
+		}
+		// Screen the sort key exactly as the filter and projection positions
+		// are screened, and as adapters/raw.go's buildOrderBy screens it with
+		// validateIdent. Without this the two adapters DIVERGED in the same
+		// position: raw failed the render on a control byte or an empty dot
+		// segment, GORM returned ok=true and unexecutable SQL ("ORDER BY
+		// `.`.`.`"), turning an available 400 into an engine error at 500.
+		if err := gormIdentScreen("sort key", c.Name); err != nil {
+			return nil, err
 		}
 		// c.Name was normalized at parse time (see toGormClauseWithFigo).
 		col := clause.Column{Name: c.Name, Table: clause.CurrentTable}
@@ -523,9 +606,9 @@ func gormOrderByClause(x figo.OrderBy) clause.Expression {
 		cols = append(cols, clause.OrderByColumn{Column: col, Desc: c.Desc})
 	}
 	if len(cols) == 0 {
-		return nil
+		return nil, nil
 	}
-	return clause.OrderBy{Columns: cols}
+	return clause.OrderBy{Columns: cols}, nil
 }
 
 // gormDryRunSQL renders the statement for a configured GORM DB via DryRun and

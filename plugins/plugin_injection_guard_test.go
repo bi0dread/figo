@@ -935,12 +935,37 @@ func TestInformationalDiagnosticsAreNotRejections(t *testing.T) {
 		})
 	}
 
-	assert.True(t, informationalDiagnostic(
-		`empty element in list "[1,2,]" ignored (write "" for an explicit empty string)`))
-	assert.True(t, informationalDiagnostic(
-		`load=[Orders:...] filter "" produced no conditions; relation preloaded unfiltered`))
-	assert.False(t, informationalDiagnostic(`unrecognized token "a" (no operator found)`),
-		"a dropped conjunct must stay a rejection")
+	// The classification travels as a TYPE, not as words. A DSL that embeds
+	// the phrase the old substring test matched must still be refused: the
+	// diagnostics below are destructive (they report swallowed input), and
+	// reclassifying one turned a refusal into an unfiltered scan.
+	for _, dsl := range []string{
+		`load=[X:empty element in list`,
+		`name="empty element in list and tenant_id=42`,
+		`load=[X:produced no conditions; relation preloaded unfiltered`,
+	} {
+		t.Run("launder/"+dsl, func(t *testing.T) {
+			err, where := guarded(t, NewInjectionGuardPlugin(), dsl)
+			assert.Error(t, err, "a destructive diagnostic carrying an informational phrase must stay a rejection")
+			assert.Equal(t, "1=0", where, "a refused query must render the never-true pill")
+		})
+	}
+
+	// The genuinely informational diagnostics are still classified as such,
+	// straight out of BuildE.
+	for _, dsl := range []string{`id<in>[1,2,]`, `id=1 load=[Orders:]`} {
+		t.Run("informational/"+dsl, func(t *testing.T) {
+			f := figo.New()
+			f.SetNamingFunc(figo.NoChangeNaming)
+			_ = f.AddFiltersFromString(dsl)
+			parts := figo.DiagParts(f.BuildE(adapters.RawAdapter{}))
+			require.NotEmpty(t, parts, "expected a diagnostic to classify")
+			for _, part := range parts {
+				assert.True(t, figo.IsInformationalDiag(part),
+					"expected informational, got a rejection: %v", part)
+			}
+		})
+	}
 }
 
 // Real schemas hold names the first cut of the rule refused. The load-bearing

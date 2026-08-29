@@ -36,6 +36,8 @@ func (f *figo) Clone() Figo {
 		builtFromDSL: f.builtFromDSL,
 		namingFunc:   f.namingFunc, // shared transformer; assumed pure
 
+		allowNestedPreloads: f.allowNestedPreloads,
+
 		// Deep-copied reference-typed state.
 		clauses:           cloneExprs(f.clauses),
 		clausesAsked:      cloneExprs(f.clausesAsked),
