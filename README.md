@@ -1,6 +1,8 @@
 # figo — Go Dynamic Query Builder (v4)
 
-figo turns a compact, database-agnostic filter DSL into concrete queries for **GORM**, **raw SQL** (MySQL / PostgreSQL / SQLite dialects), **MongoDB**, and **Elasticsearch**. You parse one filter string (typically straight from an HTTP query parameter) into an internal expression AST, then let an adapter render it for whichever backend you target.
+figo is a **Go dynamic query builder and filter DSL** for **GORM**, **raw SQL** (MySQL / PostgreSQL / SQLite dialects), **MongoDB**, and **Elasticsearch**. Parse a filter string from an HTTP query parameter into an expression tree, then use an adapter to build a query for your backend.
+
+Use figo for dynamic API filtering, grouped conditions, sorting, pagination, and filtered relation loads. [Try the visual filter DSL playground](https://bi0dread.github.io/figo/), or jump to the [GORM filtering examples](#gorm-adapter) and [raw SQL query builder examples](#raw-sql-adapter).
 
 The core stays deliberately small — parse, build, render. Everything policy-shaped is an opt-in **plugin**: syntax validation & repair, field whitelisting, complexity limits, value validation, mandatory scopes (multi-tenant), caching, metrics, and audit logging.
 
