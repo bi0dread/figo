@@ -26,8 +26,8 @@
       .project-intro p { margin: 8px 0; }
       .project-intro a, .project-guide a { color: #9baeff; text-underline-offset: 3px; }
       .project-intro nav { display: flex; flex-wrap: wrap; gap: 8px 24px; }
-      #root { height: 85vh; min-height: 540px; }
-      #root .app { height: 100%; }
+      body > #root { height: auto; }
+      #root .app { height: 85vh; min-height: 540px; }
       .project-guide { padding-top: 32px; padding-bottom: 48px; }
       .project-guide section { margin: 0 0 32px; }
       .project-guide h2 { font-size: 24px; line-height: 1.3; }
@@ -49,15 +49,16 @@
       <nav aria-label="Project resources">
         <a href="https://github.com/bi0dread/figo">Source code on GitHub</a>
         <a href="https://github.com/bi0dread/figo#quick-start">Go quick start</a>
+        <a href="#live-data">Try live data filtering</a>
         <a href="#about-figo">Examples and documentation</a>
       </nav>
     </header>
-    <div id="root" role="region" aria-label="Visual filter DSL playground"></div>
+    <div id="root" role="region" aria-label="Visual filter DSL playground and sample data"></div>
     <main id="about-figo" class="project-guide">
       <section aria-labelledby="how-to-use">
         <h2 id="how-to-use">Try the visual filter builder</h2>
         <p>Add a Condition block, choose a field and operator, and connect it to the Query node. Combine conditions with AND, OR, and NOT blocks. Sort, Page, and Load blocks add sorting, pagination, and relation filters. Copy the generated DSL into your application.</p>
-        <p>The playground generates filter text in your browser. It does not run Go code or connect to your database. JavaScript is needed for the interactive builder; the examples and documentation below are available without it.</p>
+        <p>The playground generates filter text in your browser. The live data preview applies that DSL to sample accounts and orders, so you can see matching rows, sorting, and pagination immediately. It does not run Go code or connect to your database. JavaScript is needed for the interactive builder and preview; the examples and documentation below are available without it.</p>
       </section>
       <section aria-labelledby="api-filters">
         <h2 id="api-filters">Build database queries from API filters in Go</h2>

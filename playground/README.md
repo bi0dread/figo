@@ -10,7 +10,26 @@ into the **Query** node, and the resulting DSL string is generated live.
 npm install
 npm run dev      # http://localhost:5173
 npm run build    # static bundle in dist/
+npm run test:preview # live DSL/table regression checks
 ```
+
+## Live data examples
+
+Below the canvas, the live data preview parses the generated DSL string and applies
+it to 18 sample customer accounts and their orders. Six presets demonstrate nested
+conditions, active customers, revenue and date ranges, case-insensitive name search,
+pagination, and filtered Orders preloads. Loading a preset also updates the canvas.
+
+Edit the preview's DSL to try your own filters, or enable **Follow visual builder**
+to resume using the canvas output. **All source rows** shows the original dataset
+with badges for matching, excluded, and paginated-out rows. Expand a row's Orders
+button to compare the original orders with the query's filtered preload.
+
+This is a browser-side demonstration, not a database execution engine. Comparisons
+are typed, NULL predicates follow SQL three-valued logic, and sorting places NULLs
+last. Regex operators and relations other than Orders report an explicit error.
+Backend collation, date coercion, and NULL ordering can differ. The Go adapters
+remain authoritative for actual database queries.
 
 ## Blocks
 
