@@ -7,10 +7,99 @@
       href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🧩</text></svg>"
     />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>figo playground</title>
+    <title>figo — Go Dynamic Query Builder &amp; Filter DSL Playground</title>
+    <meta name="description" content="Build dynamic filters in Go with figo. Explore the filter DSL for GORM, SQL, MongoDB, and Elasticsearch in an interactive visual query builder." />
+    <meta name="google-site-verification" content="3cjIRsXMh2SYdhyo6cwNtLdJz1CLycFVe21W9vIx6Vg" />
+    <link rel="canonical" href="https://bi0dread.github.io/figo/" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="figo — Go Dynamic Query Builder &amp; Filter DSL Playground" />
+    <meta property="og:description" content="Explore figo's Go filter DSL for GORM, SQL, MongoDB, and Elasticsearch. Build filters visually, then use them in your Go application." />
+    <meta property="og:url" content="https://bi0dread.github.io/figo/" />
+    <meta property="og:site_name" content="figo" />
+    <meta name="twitter:card" content="summary" />
+    <meta name="twitter:title" content="figo — Go Dynamic Query Builder" />
+    <meta name="twitter:description" content="A Go filter DSL for GORM, SQL, MongoDB, and Elasticsearch, with an interactive visual playground." />
+    <style>
+      body { margin: 0; background: #0d1017; color: #c8d3f5; font: 14px/1.6 system-ui, sans-serif; }
+      .project-intro, .project-guide { max-width: 1040px; margin: 0 auto; padding: 24px; }
+      .project-intro h1 { margin: 0 0 8px; font-size: clamp(22px, 3vw, 32px); line-height: 1.25; }
+      .project-intro p { margin: 8px 0; }
+      .project-intro a, .project-guide a { color: #9baeff; text-underline-offset: 3px; }
+      .project-intro nav { display: flex; flex-wrap: wrap; gap: 8px 24px; }
+      #root { height: 85vh; min-height: 540px; }
+      #root .app { height: 100%; }
+      .project-guide { padding-top: 32px; padding-bottom: 48px; }
+      .project-guide section { margin: 0 0 32px; }
+      .project-guide h2 { font-size: 24px; line-height: 1.3; }
+      .project-guide pre { overflow-x: auto; padding: 16px; border: 1px solid #2a3350; border-radius: 8px; background: #121724; }
+      .project-guide code { font-family: ui-monospace, monospace; }
+      @media (max-width: 640px) {
+        .project-intro, .project-guide { padding-left: 16px; padding-right: 16px; }
+        #root .topbar { height: auto; min-height: 50px; flex-wrap: wrap; gap: 8px; padding: 10px; }
+        #root .tagline { display: none; }
+        #root .palette { width: 145px; padding: 10px 8px; }
+        #root .app { grid-template-rows: auto minmax(0, 1fr) auto; }
+      }
+    </style>
   </head>
   <body>
-    <div id="root"></div>
+    <header class="project-intro">
+      <h1>figo — Go dynamic query builder and filter DSL</h1>
+      <p>Build dynamic API filters for GORM, raw SQL, MongoDB, and Elasticsearch with one filter language. Try the visual playground below, then use the generated DSL in your Go application.</p>
+      <nav aria-label="Project resources">
+        <a href="https://github.com/bi0dread/figo">Source code on GitHub</a>
+        <a href="https://github.com/bi0dread/figo#quick-start">Go quick start</a>
+        <a href="#about-figo">Examples and documentation</a>
+      </nav>
+    </header>
+    <div id="root" role="region" aria-label="Visual filter DSL playground"></div>
+    <main id="about-figo" class="project-guide">
+      <section aria-labelledby="how-to-use">
+        <h2 id="how-to-use">Try the visual filter builder</h2>
+        <p>Add a Condition block, choose a field and operator, and connect it to the Query node. Combine conditions with AND, OR, and NOT blocks. Sort, Page, and Load blocks add sorting, pagination, and relation filters. Copy the generated DSL into your application.</p>
+        <p>The playground generates filter text in your browser. It does not run Go code or connect to your database. JavaScript is needed for the interactive builder; the examples and documentation below are available without it.</p>
+      </section>
+      <section aria-labelledby="api-filters">
+        <h2 id="api-filters">Build database queries from API filters in Go</h2>
+        <p>figo parses a filter string into an expression tree. An adapter translates that tree into a query for your backend. For example, an API can accept a filter for active users aged 18 or older, ordered by creation date:</p>
+        <pre><code>status="active" and age&gt;=18 sort=created_at:desc page=skip:0,take:20</code></pre>
+        <p>Install the Go package:</p>
+        <pre><code>go get github.com/bi0dread/figo/v4</code></pre>
+        <p>Build a parameterized SQL WHERE clause with the raw SQL adapter:</p>
+        <pre><code>package example
+
+import (
+    "github.com/bi0dread/figo/v4"
+    "github.com/bi0dread/figo/v4/adapters"
+)
+
+func ActiveUsersFilter() (string, []any, error) {
+    f := figo.New()
+    f.AddFiltersFromString(`status="active" and age&gt;=18`)
+    if err := f.BuildE(adapters.RawAdapter{}); err != nil {
+        return "", nil, err
+    }
+    return adapters.BuildRawWhere(f)
+}
+// Pass the returned WHERE clause and arguments to your database driver.</code></pre>
+        <p>For user-supplied filters, reject parse errors and configure the field, value, scope, and complexity policies your API needs. See the <a href="https://github.com/bi0dread/figo#quick-start">complete Go quick start</a> and <a href="https://github.com/bi0dread/figo#plugins">plugin documentation</a>.</p>
+      </section>
+      <section aria-labelledby="gorm-filters">
+        <h2 id="gorm-filters">Dynamic filtering with GORM</h2>
+        <p>Use the GORM adapter when your application already uses GORM. The same DSL can describe comparisons, grouped conditions, sorting, pagination, and filtered preloads. figo builds the filter; your application executes the query through GORM.</p>
+        <p>Read the <a href="https://github.com/bi0dread/figo#gorm-adapter">GORM adapter examples</a> to apply a built filter to a GORM query.</p>
+      </section>
+      <section aria-labelledby="supported-backends">
+        <h2 id="supported-backends">SQL, MongoDB, and Elasticsearch adapters</h2>
+        <p>The raw SQL adapter supports MySQL, PostgreSQL, and SQLite dialects. The MongoDB adapter produces BSON filters and find options. The Elasticsearch adapter produces query JSON. Backend behavior can differ for NULL values and other operations; check the adapter documentation for details.</p>
+        <ul>
+          <li><a href="https://github.com/bi0dread/figo#raw-sql-adapter">Raw SQL query builder examples</a></li>
+          <li><a href="https://github.com/bi0dread/figo#mongodb-adapter">MongoDB filter examples</a></li>
+          <li><a href="https://github.com/bi0dread/figo#elasticsearch-adapter">Elasticsearch query examples</a></li>
+          <li><a href="https://github.com/bi0dread/figo#the-dsl">Filter DSL operators and syntax</a></li>
+        </ul>
+      </section>
+    </main>
     <script type="module" src="/src/main.tsx"></script>
   </body>
 </html>
