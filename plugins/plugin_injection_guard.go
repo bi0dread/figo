@@ -603,12 +603,10 @@ func truncateReason(s string) string {
 // becomes a query that matches nothing.
 //
 // This hook runs at the end of EVERY Build — including one whose DSL produced
-// no filters at all — and it runs AFTER every ExprFilter, which is the only
-// place a refusal can survive. An empty OrExpr returned from FilterExpr or
-// handed to AddFilter is DELETED by FieldsPlugin's pruning (pruneExprFields
-// drops a logical node with no operands), so a pill installed anywhere earlier
-// would be laundered back into a filter-less match-everything query the moment
-// a FieldsPlugin was registered.
+// no filters at all — and it runs AFTER every ExprFilter, so it screens the
+// expressions that will actually render. Built-in field pruning preserves
+// empty boolean expressions, but custom filters may rewrite or remove them;
+// installing the refusal here keeps it out of their reach.
 //
 // Two things can trigger it. A latched AfterParse rejection, which is the DSL
 // path — by the time Build runs, AddFiltersFromString has already rolled the
@@ -881,26 +879,9 @@ func (p *InjectionGuardPlugin) screenSelectFields(fields map[string]bool, naming
 	return vs
 }
 
-// renderedName applies a naming func the way figo does: per dot-separated
-// segment, leaving an empty segment empty. Mirrors normalizeFieldName in the
-// core and normalizeColumnName in the raw adapter — converting the whole
-// string instead folds the qualifier into the column, because SnakeCaseNaming
-// treats '.' as a word separator.
+// renderedName uses the same path conversion as the parser and adapters.
 func renderedName(name string, naming figo.NamingFunc) string {
-	if naming == nil || name == "" {
-		return name
-	}
-	if !strings.Contains(name, ".") {
-		return naming(name)
-	}
-	segs := strings.Split(name, ".")
-	for i, s := range segs {
-		if s == "" {
-			continue
-		}
-		segs[i] = naming(s)
-	}
-	return strings.Join(segs, ".")
+	return figo.NormalizeFieldName(name, naming)
 }
 
 // allowMatcher returns a screen that applies the syntax rule AND the

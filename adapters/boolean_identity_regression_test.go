@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	figo "github.com/bi0dread/figo/v4"
+	"github.com/bi0dread/figo/v4/plugins"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
 	"gorm.io/driver/sqlite"
@@ -54,40 +55,54 @@ func TestBooleanEmptyGroupIdentities(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			for _, backend := range []string{"raw", "gorm", "mongo", "elasticsearch"} {
-				t.Run(backend, func(t *testing.T) {
-					f := figo.New()
-					f.AddFilter(tc.expr)
-					f.SetSelectFields("id")
-					got := []int{}
-					switch backend {
-					case "raw":
-						require.NoError(t, f.BuildE(RawAdapter{Dialect: SQLiteDialect}))
-						query, args, err := BuildRawSelect(f, "items")
-						require.NoError(t, err)
-						require.NoError(t, db.Raw(query, args...).Scan(&got).Error, query)
-					case "gorm":
-						require.NoError(t, f.BuildE(GormAdapter{}))
-						require.NoError(t, ApplyGorm(f, db.Table("items")).Scan(&got).Error)
-					case "mongo":
-						require.NoError(t, f.BuildE(MongoAdapter{}))
-						filter, err := BuildMongoFilter(f)
-						require.NoError(t, err)
-						got, err = evalFilterIDs(filter, docs)
-						require.NoError(t, err)
-					case "elasticsearch":
-						require.NoError(t, f.BuildE(ElasticsearchAdapter{}))
-						query, err := BuildElasticsearchQuery(f)
-						require.NoError(t, err)
-						for _, doc := range docs {
-							match, err := esEvalClause(query.Query, map[string]any(doc))
-							require.NoError(t, err)
-							if match {
-								got = append(got, doc["id"].(int))
+			for _, policy := range []string{"none", "ignore", "whitelist"} {
+				t.Run(policy, func(t *testing.T) {
+					for _, backend := range []string{"raw", "gorm", "mongo", "elasticsearch"} {
+						t.Run(backend, func(t *testing.T) {
+							f := figo.New()
+							if policy != "none" {
+								p := plugins.NewFieldsPlugin()
+								if policy == "ignore" {
+									p.AddIgnoreFields("unrelated")
+								} else {
+									p.SetAllowedFields("id")
+									p.EnableFieldWhitelist()
+								}
+								require.NoError(t, f.RegisterPlugin(p))
 							}
-						}
+							f.AddFilter(tc.expr)
+							f.SetSelectFields("id")
+							got := []int{}
+							switch backend {
+							case "raw":
+								require.NoError(t, f.BuildE(RawAdapter{Dialect: SQLiteDialect}))
+								query, args, err := BuildRawSelect(f, "items")
+								require.NoError(t, err)
+								require.NoError(t, db.Raw(query, args...).Scan(&got).Error, query)
+							case "gorm":
+								require.NoError(t, f.BuildE(GormAdapter{}))
+								require.NoError(t, ApplyGorm(f, db.Table("items")).Scan(&got).Error)
+							case "mongo":
+								require.NoError(t, f.BuildE(MongoAdapter{}))
+								filter, err := BuildMongoFilter(f)
+								require.NoError(t, err)
+								got, err = evalFilterIDs(filter, docs)
+								require.NoError(t, err)
+							case "elasticsearch":
+								require.NoError(t, f.BuildE(ElasticsearchAdapter{}))
+								query, err := BuildElasticsearchQuery(f)
+								require.NoError(t, err)
+								for _, doc := range docs {
+									match, err := esEvalClause(query.Query, map[string]any(doc))
+									require.NoError(t, err)
+									if match {
+										got = append(got, doc["id"].(int))
+									}
+								}
+							}
+							require.Equal(t, tc.want, got)
+						})
 					}
-					require.Equal(t, tc.want, got)
 				})
 			}
 		})

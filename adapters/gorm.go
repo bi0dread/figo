@@ -278,8 +278,8 @@ func gormStatementContext(db *gorm.DB) context.Context {
 }
 
 // gormIdentScreen refuses the two identifier classes quoting cannot repair —
-// a C0/DEL control byte and an empty name or dot-segment (the rationale is on
-// gormProjectionName below). It is shared by the SELECT-list screen there and
+// a C0/DEL control byte and an empty name or dot-segment. These can truncate SQL
+// or turn a column reference into a constant. It is shared by the SELECT screen and
 // the filter-position screen in toGormClauseWithFigo; the raw adapter's
 // validateIdent refuses the same two classes in every identifier position.
 // what names the position for the error message.
@@ -349,46 +349,52 @@ func gormRelationScreen(name string) error {
 	return nil
 }
 
-// gormProjectionName screens one projection name for the SELECT list and
-// reports whether it is a BARE column identifier, optionally table-qualified
-// ("age", "users.age").
-//
-// A bare identifier may be handed to GORM verbatim: unicode letters and digits,
-// '_', '$' and '.' between non-empty segments carry no whitespace, quote,
-// comment, parenthesis, operator or statement separator, so GORM's
-// clause.Column{Raw: true} fallback (which is what an entry that does not
-// resolve to a schema field renders as) cannot turn it into SQL structure. That
-// matters because the schema is not parsed yet when ApplyGorm runs, so the
-// adapter cannot tell which names GORM will resolve — and a resolved one is
-// quoted anyway.
-//
-// Anything else is not rejected, it is dialector-quoted by the caller before it
-// goes in — so an expression projection such as "COUNT(*)" renders as the column
-// `COUNT(*)` and fails with "no such column" rather than executing, which is the
-// rendering this adapter has had since the injection was closed.
-//
-// The error return is reserved for the two classes the raw adapter's
-// validateIdent also refuses, because quoting cannot turn either into a column
-// reference:
-//
-//   - a C0/DEL control byte. A NUL makes the rendered statement unparseable, and
-//     a driver that hands identifiers to the engine as C strings may instead
-//     TRUNCATE the name and read a different column.
-//   - an empty name or an empty dot segment ("", "..."). Each renders as a
-//     zero-length delimited identifier, i.e. a CONSTANT column: "..." projected
-//     `.`.`.` and came back with rows and no error, a silently wrong result set.
+// gormProjectionName screens projection identifiers and reports whether GORM
+// can safely try to resolve the name against its model before quoting it.
+// Bare names still need quoting if unresolved: letters and digits can spell
+// SQL constants (null, current_date, 123).
 func gormProjectionName(name string) (bare bool, err error) {
 	if err := gormIdentScreen("select field", name); err != nil {
 		return false, err
 	}
-	bare = true
 	for _, r := range name {
 		if !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '_' && r != '$' && r != '.' {
-			bare = false
-			break
+			return false, nil
 		}
 	}
-	return bare, nil
+	return true, nil
+}
+
+// gormQuoteProjectionFallbacks quotes names GORM did not resolve against its
+// model. Resolution must happen at query execution: the model may be supplied
+// later through Find or Model. Keep GORM's SELECT construction so Distinct,
+// Count and joined columns retain their normal behavior.
+//
+// ApplyGorm already owns a private Config through gormSafeClone. Copy the map
+// too, preserving any dialect/custom builder and leaving the caller untouched.
+func gormQuoteProjectionFallbacks(db *gorm.DB, names map[string]bool) {
+	builders := make(map[string]clause.ClauseBuilder, len(db.ClauseBuilders)+1)
+	for name, build := range db.ClauseBuilders {
+		builders[name] = build
+	}
+	previous := builders["SELECT"]
+	builders["SELECT"] = func(c clause.Clause, b clause.Builder) {
+		if sel, ok := c.Expression.(clause.Select); ok {
+			sel.Columns = append([]clause.Column(nil), sel.Columns...)
+			for i := range sel.Columns {
+				if sel.Columns[i].Raw && names[sel.Columns[i].Name] {
+					sel.Columns[i].Raw = false
+				}
+			}
+			c.Expression = sel
+		}
+		if previous != nil {
+			previous(c, b)
+		} else {
+			c.Build(b)
+		}
+	}
+	db.ClauseBuilders = builders
 }
 
 // gormQuoteIdent renders name as a delimited identifier using the DB's own
@@ -442,13 +448,12 @@ func ApplyGorm(f figo.Figo, trx *gorm.DB) *gorm.DB {
 		// may chain Distinct()/Joins() AFTER ApplyGorm returns and still get
 		// them applied.
 		//
-		// Feeding Selects is only safe because every name is screened first.
-		// GORM renders a Selects entry it cannot resolve to a schema field as
-		// clause.Column{Raw: true} — verbatim SQL — so a crafted name like
-		// "(SELECT/**/token/**/FROM/**/vaults)AS/**/x" used to execute as an
-		// expression and read another table (SQL injection; the naming func
-		// blocks spaces but not /**/ comments). See gormProjectionName.
+		// Bare names stay available for GORM's model field lookup; unresolved
+		// names are quoted by our SELECT builder. Other strings are quoted now
+		// so GORM cannot interpret expression syntax (including Count's special
+		// handling of a select string beginning with "count(").
 		names := make([]string, 0, len(sel))
+		fallbacks := make(map[string]bool, len(sel))
 		for _, name := range sortedKeys(sel) {
 			col := normalizeColumnName(f, name)
 			bare, err := gormProjectionName(col)
@@ -460,18 +465,18 @@ func ApplyGorm(f figo.Figo, trx *gorm.DB) *gorm.DB {
 				_ = trx.AddError(fmt.Errorf("figo: %w", err))
 				continue
 			}
-			if !bare {
-				// Not a bare identifier, so it must not go in verbatim: hand
-				// GORM the dialector-quoted form instead. Raw:true then emits
-				// an already-delimited identifier — the same rendering a
-				// clause.Column produces, and the same hardening the raw
-				// adapter's quoteIdent applies.
+			if bare {
+				fallbacks[col] = true
+			} else {
 				col = gormQuoteIdent(trx, col)
 			}
 			names = append(names, col)
 		}
 		if len(names) > 0 {
 			trx = trx.Select(names)
+			if len(fallbacks) > 0 {
+				gormQuoteProjectionFallbacks(trx, fallbacks)
+			}
 		}
 	}
 

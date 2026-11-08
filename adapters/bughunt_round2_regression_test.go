@@ -22,8 +22,8 @@ func TestRegr_SpacedOperatorWithSpecialFieldNames(t *testing.T) {
 		wantCol  string
 		wantArgs []any
 	}{
-		{`user.age > 5`, "`user_age` > ?", []any{int64(5)}},
-		{`profile.bio =^ "%dev%"`, "`profile_bio` LIKE ?", []any{"%dev%"}},
+		{`user.age > 5`, "`user`.`age` > ?", []any{int64(5)}},
+		{`profile.bio =^ "%dev%"`, "`profile`.`bio` LIKE ?", []any{"%dev%"}},
 		{`user-name = "jo"`, "`user_name` = ?", []any{"jo"}}, // snake_case normalizes '-' to '_'
 	}
 	for _, tc := range cases {
@@ -41,7 +41,7 @@ func TestRegr_SpacedOperatorWithSpecialFieldNames(t *testing.T) {
 	require.NoError(t, f.AddFiltersFromString(`a.b <bet> (1..2)`))
 	f.Build(RawAdapter{})
 	where, args, _ := BuildRawWhere(f)
-	assert.Equal(t, "`a_b` BETWEEN ? AND ?", where)
+	assert.Equal(t, "`a`.`b` BETWEEN ? AND ?", where)
 	assert.Equal(t, []any{int64(1), int64(2)}, args)
 }
 

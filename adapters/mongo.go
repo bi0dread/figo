@@ -195,16 +195,23 @@ func mongoProjectionFields(f figo.Figo) ([]string, error) {
 // MongoDB has no way to express "a plus a.b" other than "a".
 func mongoProjectionPaths(names []string) []string {
 	sort.Strings(names)
-	// An ancestor is a strict prefix, so it always sorts before its
-	// descendants: tracking the last KEPT key is enough to spot one.
+	// An ancestor sorts before its descendants, but need not be adjacent:
+	// "a-b" sorts between "a" and "a.b". Check every path prefix against
+	// the kept set rather than just the preceding key.
 	out := make([]string, 0, len(names))
-	last := ""
+	kept := make(map[string]bool, len(names))
 	for _, n := range names {
-		if n == last || (last != "" && strings.HasPrefix(n, last+".")) {
+		covered := kept[n]
+		for i := 0; i < len(n) && !covered; i++ {
+			if n[i] == '.' && kept[n[:i]] {
+				covered = true
+			}
+		}
+		if covered {
 			continue
 		}
 		out = append(out, n)
-		last = n
+		kept[n] = true
 	}
 	return out
 }

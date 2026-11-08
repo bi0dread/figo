@@ -1875,10 +1875,7 @@ func (f *figo) parsFieldsName(str string) string {
 // and plugins that need to match field names in their converted form
 // (e.g. FieldsPlugin's ignore matching).
 func convertFieldName(fn NamingFunc, str string) string {
-	if fn != nil {
-		return fn(str)
-	}
-	return str
+	return NormalizeFieldName(str, fn)
 }
 
 // ParseValue types a single DSL literal exactly the way the parser types
@@ -2189,12 +2186,38 @@ func isAllDigits(s string) bool {
 // place corrupted the first and last element into "(1" and "2)".
 func parseListLiteral(raw string, diags *[]error) []any {
 	s := strings.TrimSpace(raw)
-	if strings.HasPrefix(s, "[") && strings.HasSuffix(s, "]") {
-		s = strings.TrimPrefix(s, "[")
-		s = strings.TrimSuffix(s, "]")
-	} else if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
-		s = strings.TrimPrefix(s, "(")
-		s = strings.TrimSuffix(s, ")")
+	if len(s) > 0 && (s[0] == '[' || s[0] == '(') {
+		open, close := s[0], byte(']')
+		if open == '(' {
+			close = ')'
+		}
+		depth, end := 0, -1
+		quoted := false
+		for i := 0; i < len(s); i++ {
+			if s[i] == '"' {
+				quoted = !quoted
+			} else if !quoted {
+				switch s[i] {
+				case open:
+					depth++
+				case close:
+					depth--
+					if depth == 0 {
+						end = i
+					}
+				}
+			}
+			if end >= 0 {
+				break
+			}
+		}
+		if end != len(s)-1 {
+			// Keep the best-effort value, but never silently accept a list
+			// that absorbed subsequent conditions into an unclosed delimiter.
+			addDiag(diags, "unbalanced list delimiters in %q (expected closing %q)", raw, close)
+		} else {
+			s = s[1:end]
+		}
 	}
 	if s == "" {
 		return nil
@@ -2889,13 +2912,11 @@ func (f *figo) AddFiltersFromString(input string) error {
 //
 // The pill is written to clausesAsked as well as clauses, because clauses is
 // re-derived from it on every Build, and it is written HERE rather than left to
-// a plugin because nothing a plugin can reach is safe: an expression added
-// through AddFilter is subject to registered ExprFilters, and pruneExprFields
-// deletes a logical node with no operands — so merely registering a
-// FieldsPlugin laundered the refusal back into a match-everything query. The
-// empty-DSL path in BuildE runs no ExprFilters, so the pill written here
-// reaches the render intact, and Clone deep-copies it, so a clone of a refused
-// instance is refused too.
+// a plugin because an expression added through AddFilter is subject to
+// registered ExprFilters. Built-in field pruning preserves boolean constants,
+// but custom filters may still remove them. The empty-DSL path in BuildE runs
+// no ExprFilters, so the pill reaches the render intact. Clone deep-copies it,
+// so a clone of a refused instance is refused too.
 //
 // The instance stays refused until it is given a DSL that parses acceptably;
 // AddFiltersFromString("") does not reopen it.
@@ -3547,10 +3568,8 @@ func (f *figo) BuildE(adapter Adapter) error {
 	}
 
 	if pm != nil {
-		// The resource-guard pill must skip the filter pass: pruning rebuilds
-		// logical nodes and drops an empty OrExpr entirely (pruneExprFields),
-		// which would launder the refusal into a filter-less match-everything
-		// query the moment a FieldsPlugin is registered.
+		// The resource-guard pill must skip the filter pass so even a custom
+		// ExprFilter cannot remove it and turn a refusal into an unfiltered query.
 		if finalExpr != nil && !guardTripped {
 			finalExpr = pm.ExecuteExprFilters(f, finalExpr)
 		}
@@ -3877,7 +3896,14 @@ func normalizeExprFields(e Expr, naming func(string) string) Expr {
 // (SnakeCaseNaming turns '.' into '_': "users_first_name", a column that does
 // not exist) and break the documented Walk/SetNodeField qualification recipe.
 func normalizeFieldName(field string, naming func(string) string) string {
-	if field == "" {
+	return NormalizeFieldName(field, naming)
+}
+
+// NormalizeFieldName applies naming to each non-empty dot-separated segment.
+// Qualifiers and document paths remain intact; nil naming leaves field unchanged.
+// Empty segments remain empty so adapter identifier validation can reject them.
+func NormalizeFieldName(field string, naming NamingFunc) string {
+	if naming == nil || field == "" {
 		return field
 	}
 	if !strings.Contains(field, ".") {
@@ -3910,6 +3936,9 @@ func normalizeOperands(operands []Expr, naming func(string) string) []Expr {
 func pruneExprFields(expr Expr, keep func(field string) bool) Expr {
 	switch e := expr.(type) {
 	case AndExpr:
+		if !hasExprOperand(e.Operands) {
+			return e
+		}
 		operands := pruneOperands(e.Operands, keep)
 		if len(operands) == 0 {
 			return nil
@@ -3919,6 +3948,9 @@ func pruneExprFields(expr Expr, keep func(field string) bool) Expr {
 		}
 		return AndExpr{Operands: operands}
 	case OrExpr:
+		if !hasExprOperand(e.Operands) {
+			return e
+		}
 		operands := pruneOperands(e.Operands, keep)
 		if len(operands) == 0 {
 			return nil
@@ -3928,6 +3960,9 @@ func pruneExprFields(expr Expr, keep func(field string) bool) Expr {
 		}
 		return OrExpr{Operands: operands}
 	case NotExpr:
+		if !hasExprOperand(e.Operands) {
+			return e
+		}
 		operands := pruneOperands(e.Operands, keep)
 		if len(operands) == 0 {
 			return nil
@@ -3939,6 +3974,17 @@ func pruneExprFields(expr Expr, keep func(field string) bool) Expr {
 		}
 		return e
 	}
+}
+
+// An originally empty logical expression is a boolean constant, not a group
+// whose fields were removed by policy. Preserve it, including all-nil operands.
+func hasExprOperand(operands []Expr) bool {
+	for _, e := range operands {
+		if e != nil {
+			return true
+		}
+	}
+	return false
 }
 
 func pruneOperands(operands []Expr, keep func(field string) bool) []Expr {

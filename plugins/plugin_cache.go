@@ -527,7 +527,7 @@ func (k *cacheKeyBuf) reset() {
 var keyBufPool = sync.Pool{New: func() any { return &cacheKeyBuf{buf: make([]byte, 0, 512)} }}
 
 // cacheKeyPrefix namespaces the key; an empty key means "not cacheable".
-const cacheKeyPrefix = "figo:"
+const cacheKeyPrefix = "figo:v2:"
 
 // cacheKeyHashBytes is how much of the digest lands in the key.
 const cacheKeyHashBytes = 16
@@ -766,7 +766,7 @@ func writePluginFingerprint(w byteWriter, f figo.Figo) {
 	}
 }
 
-// namingFingerprint keys the naming strategy by BEHAVIOR rather than function
+// writeNamingFingerprint keys the naming strategy by BEHAVIOR rather than function
 // identity. The old %p encoding collided closures created at the same call
 // site (e.g. a per-tenant factory `func mk(prefix string) figo.NamingFunc`):
 // they share one code pointer regardless of captured state, so two instances
@@ -774,11 +774,9 @@ func writePluginFingerprint(w byteWriter, f figo.Figo) {
 // cross-tenant cache hits returned the wrong columns. Instead, the naming
 // func is applied to a canonical probe set — a few fixed strings plus the
 // instance's own pre-naming select fields and sort columns — and the outputs
-// are folded into the key.
-//
-// Limitation: behavior can only be sampled, not proven equal. A pathological
-// naming func that ignores its input (or its captured state) on every probe
-// string while still renaming real clause columns differently could collide.
+// are folded into the key. Use the same per-segment conversion as projection
+// rendering: probing only a whole dotted name misses changes to its segments.
+// Clause and sort names have already been converted and are keyed separately.
 func writeNamingFingerprint(w byteWriter, f figo.Figo) {
 	fn := f.GetNamingFunc()
 	if fn == nil {
@@ -800,7 +798,7 @@ func writeNamingFingerprint(w byteWriter, f figo.Figo) {
 		}
 	}
 	for _, probe := range probes {
-		out := fn(probe)
+		out := figo.NormalizeFieldName(probe, fn)
 		_, _ = w.WriteString(strconv.Itoa(len(out)))
 		_ = w.WriteByte(':')
 		_, _ = w.WriteString(out)
@@ -983,8 +981,10 @@ func (w *valueWalker) write(v reflect.Value, depth int) {
 		}
 		fmt.Fprintf(b, "%s@%x", v.Kind(), v.Pointer())
 	case reflect.String:
-		// Scalar fast paths: these render identically to %v but skip fmt's
-		// reflection dispatch, which dominated the fingerprint cost.
+		// Values may contain the delimiters and type markers of the enclosing
+		// structure. Frame every string, not just the outer key components.
+		_, _ = b.WriteString(strconv.Itoa(v.Len()))
+		_ = b.WriteByte(':')
 		_, _ = b.WriteString(v.String())
 	case reflect.Bool:
 		if v.Bool() {

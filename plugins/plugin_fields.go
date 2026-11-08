@@ -171,7 +171,7 @@ func (p *FieldsPlugin) FilterExpr(f figo.Figo, e figo.Expr) figo.Expr {
 		allowedConv := make(map[string]bool, len(allowed)*2)
 		for name := range allowed {
 			allowedConv[name] = true
-			allowedConv[fn(name)] = true
+			allowedConv[figo.NormalizeFieldName(name, fn)] = true
 		}
 		e = figo.PruneExprFields(e, func(field string) bool {
 			return allowedConv[field]
@@ -218,7 +218,7 @@ func newDenyMatcher(names []string, fn figo.NamingFunc) func(string) bool {
 		exact[n] = true
 		folded[canonicalPolicyName(n)] = true
 		if fn != nil {
-			c := fn(n)
+			c := figo.NormalizeFieldName(n, fn)
 			exact[c] = true
 			folded[canonicalPolicyName(c)] = true
 		}
@@ -227,14 +227,14 @@ func newDenyMatcher(names []string, fn figo.NamingFunc) func(string) bool {
 		if exact[field] {
 			return true
 		}
-		if fn != nil && exact[fn(field)] {
+		if fn != nil && exact[figo.NormalizeFieldName(field, fn)] {
 			return true
 		}
 		if folded[canonicalPolicyName(field)] || folded[terminalPolicyName(field)] {
 			return true
 		}
 		if fn != nil {
-			conv := fn(field)
+			conv := figo.NormalizeFieldName(field, fn)
 			if folded[canonicalPolicyName(conv)] || folded[terminalPolicyName(conv)] {
 				return true
 			}
@@ -276,14 +276,14 @@ func (p *FieldsPlugin) FinalizeClauses(f figo.Figo, clauses []figo.Expr) []figo.
 	allowedConv := make(map[string]bool, len(allowed)*2)
 	for _, name := range allowed {
 		allowedConv[name] = true
-		allowedConv[fn(name)] = true
+		allowedConv[figo.NormalizeFieldName(name, fn)] = true
 	}
 
 	permitted := func(name string) bool {
 		if denied(name) {
 			return false
 		}
-		if whitelist && !allowedConv[name] && !allowedConv[fn(name)] {
+		if whitelist && !allowedConv[name] && !allowedConv[figo.NormalizeFieldName(name, fn)] {
 			return false
 		}
 		return true

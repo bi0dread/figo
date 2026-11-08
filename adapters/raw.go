@@ -1042,28 +1042,5 @@ func floatLiteral(v float64) string {
 }
 
 func normalizeColumnName(f figo.Figo, name string) string {
-	// Apply the instance's naming func — the same conversion the parser runs,
-	// so a deliberately preserved camelCase name is not re-snake_cased here.
-	naming := f.GetNamingFunc() // never nil: SnakeCaseNaming is the default
-	// Convert PER '.'-SEPARATED SEGMENT, which is what the core does to a
-	// filter field (figo.go's normalizeFieldName) and what quoteIdent assumes.
-	// Converting the whole string folded the qualifier into the column, because
-	// SnakeCaseNaming treats '.' as a word separator: a projection of
-	// "users.firstName" became `users_first_name` while the SAME name in the
-	// WHERE clause rendered `users`.`first_name` — one identifier spelled two
-	// ways in one statement, and the projection's spelling names no column.
-	if !strings.Contains(name, ".") {
-		return naming(name)
-	}
-	segs := strings.Split(name, ".")
-	for i, s := range segs {
-		if s == "" {
-			// An empty segment is left alone so it stays empty and reaches
-			// validateIdent, which rejects it (A10/A7-6). Handing "" to a naming
-			// func could turn it into a non-empty name and slip past that guard.
-			continue
-		}
-		segs[i] = naming(s)
-	}
-	return strings.Join(segs, ".")
+	return figo.NormalizeFieldName(name, f.GetNamingFunc())
 }
