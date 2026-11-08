@@ -2135,29 +2135,14 @@ func parseScalarLiteral(raw string) any {
 	return s
 }
 
-// isNumericLiteral / isStringLiteral classify a typed DSL literal for the
-// <bet> bound-compatibility check.
-func isNumericLiteral(v any) bool {
-	switch v.(type) {
-	case int64, float64:
-		return true
-	}
-	return false
-}
-
-func isStringLiteral(v any) bool {
-	_, ok := v.(string)
-	return ok
-}
-
 // betBoundKind classifies a <bet> bound by the KIND of value it is, so the
 // compatibility check can compare kinds instead of asking two separate
 // yes/no questions about them.
 //
 // The pair of predicates could not express the third kind. parseScalarLiteral
 // tries parseDate before falling back to string, so a date-shaped bound comes
-// back as a time.Time — for which isNumericLiteral and isStringLiteral are BOTH
-// false. The old test required one of the bounds to be a string, so
+// back as a time.Time — which is neither a number nor a string.
+// The old test required one of the bounds to be a string, so
 // `price<bet>(10..2024-01-02)` passed the very guard whose comment says it
 // exists to stop a number paired with something that is not one: it rendered
 // BETWEEN 10 AND '2024-01-02 00:00:00+00', and since SQLite, MySQL and BSON all

@@ -78,7 +78,7 @@ func TestMongoAggregatePipelineLookupsSortedByRelation(t *testing.T) {
 			if !ok {
 				t.Fatalf("$lookup value should be a bson.D, got %T", elem.Value)
 			}
-			if from, ok := doc.Map()["from"].(string); ok {
+			if from, ok := requireBSONValue(t, doc, "from").(string); ok {
 				order = append(order, from)
 			}
 		}

@@ -222,45 +222,8 @@ func exprToSQL(d *SQLDialect, e figo.Expr) (string, []any, error) {
 		return fmt.Sprintf("%s NOT IN (%s)", d.quoteIdent(x.Field), placeholders), append([]any{}, x.Values...), nil
 	case figo.BetweenExpr:
 		return fmt.Sprintf("%s BETWEEN ? AND ?", d.quoteIdent(x.Field)), []any{x.Low, x.High}, nil
-	case figo.AndExpr:
-		return joinGroup(d, "AND", x.Operands)
-	case figo.OrExpr:
-		p, a, err := joinGroup(d, "OR", x.Operands)
-		if err != nil {
-			return "", nil, err
-		}
-		if p == "" {
-			// An OR with no renderable operands is a false disjunction: it must
-			// match NOTHING. Returning "" dropped the predicate entirely (a
-			// top-level empty OR made the WHERE clause vanish → every row
-			// matched) — the same fail-open the empty-IN guard above closes,
-			// and that Mongo ({"$nor":[{}]}) and Elasticsearch
-			// ({"match_none":{}}) also render explicitly. ES did NOT prevent it
-			// before hunt #7: an empty "should" list is zero Lucene clauses, and
-			// a clause-less bool query is match_all before minimum_should_match
-			// is even applied.
-			// An empty AND stays dropped: it is the true identity.
-			return "1=0", nil, nil
-		}
-		return p, a, nil
-	case figo.NotExpr:
-		if !hasNonNilOperand(x.Operands) {
-			return "", nil, nil
-		}
-		// figo.NotExpr means "none of the operands match": NOT(a OR b), matching
-		// Mongo's $nor and GORM's clause.Not. Joining with AND here rendered
-		// NOT(a AND b), which matches rows the other adapters exclude.
-		inner, args, err := joinGroup(d, "OR", x.Operands)
-		if err != nil {
-			return "", nil, err
-		}
-		if inner == "" {
-			// The operands rendered no predicate (vacuously true, e.g. an
-			// empty AND identity), so the negation matches NOTHING. Returning
-			// "" dropped the NOT entirely: fail open.
-			return "1=0", nil, nil
-		}
-		return fmt.Sprintf("NOT (%s)", inner), args, nil
+	case figo.AndExpr, figo.OrExpr, figo.NotExpr:
+		return logicalExprToSQL(d, e)
 	case figo.CustomExpr:
 		// The handler owns the fragment: it receives the field verbatim
 		// (unquoted) and returns SQL with '?' placeholders plus bind args.
@@ -305,15 +268,15 @@ func hasNonNilOperand(ops []figo.Expr) bool {
 	return false
 }
 
-// joinGroup renders a boolean group. The whole subtree goes into ONE buffer
+// logicalExprToSQL renders a boolean group. The whole subtree goes into ONE buffer
 // (see sqlWriter) — returning a fresh string per nesting level re-copied the
 // accumulated fragment at every level, so a tree the round-4 flattening cannot
 // collapse (alternating and/or, or a not-chain) cost O(output x depth): a
 // 152 KB filter burned 1.5 s and 5.7 GB of allocation to produce 216 KB of SQL,
 // while the other three adapters stayed linear on the same AST.
-func joinGroup(d *SQLDialect, op string, operands []figo.Expr) (string, []any, error) {
+func logicalExprToSQL(d *SQLDialect, e figo.Expr) (string, []any, error) {
 	var w sqlWriter
-	wrote, err := w.writeGroup(d, op, operands)
+	wrote, err := w.writeExpr(d, e)
 	if err != nil {
 		return "", nil, err
 	}
@@ -324,17 +287,16 @@ func joinGroup(d *SQLDialect, op string, operands []figo.Expr) (string, []any, e
 }
 
 // sqlWriter accumulates a rendered expression tree in place. Every method
-// reports whether it wrote a predicate, so an operand that renders to nothing
-// is rolled back (buffer AND args) exactly as the string-based joiner dropped
-// an empty part.
+// reports whether it wrote a predicate. An empty logical expression means true;
+// non-predicate leaves such as OrderBy are simply omitted.
 type sqlWriter struct {
 	buf  []byte
 	args []any
 }
 
-// writeGroup joins the operands with op, parenthesizing only when more than one
-// of them renders — byte-for-byte the output the string joiner produced.
-func (w *sqlWriter) writeGroup(d *SQLDialect, op string, operands []figo.Expr) (bool, error) {
+// writeGroup reports both whether it wrote a predicate and whether it saw a
+// true operand. OR must distinguish a true operand from ignored non-predicates.
+func (w *sqlWriter) writeGroup(d *SQLDialect, op string, operands []figo.Expr) (bool, bool, error) {
 	nonNil := 0
 	for _, e := range operands {
 		if e != nil {
@@ -342,9 +304,9 @@ func (w *sqlWriter) writeGroup(d *SQLDialect, op string, operands []figo.Expr) (
 		}
 	}
 	if nonNil == 0 {
-		return false, nil
+		return false, false, nil
 	}
-	start := len(w.buf)
+	start, argsStart := len(w.buf), len(w.args)
 	// Decide the paren before rendering (an insert afterwards would have to
 	// shift the group's bytes, reintroducing the quadratic). The rare case
 	// where operands drop and only one part survives is fixed up below.
@@ -353,6 +315,7 @@ func (w *sqlWriter) writeGroup(d *SQLDialect, op string, operands []figo.Expr) (
 		w.buf = append(w.buf, '(')
 	}
 	n := 0
+	sawTrue := false
 	for _, e := range operands {
 		if e == nil {
 			continue
@@ -365,18 +328,25 @@ func (w *sqlWriter) writeGroup(d *SQLDialect, op string, operands []figo.Expr) (
 		}
 		wrote, err := w.writeExpr(d, e)
 		if err != nil {
-			return false, err
+			return false, false, err
 		}
 		if !wrote {
 			w.buf = w.buf[:mark]
 			w.args = w.args[:argMark]
+			switch e.(type) {
+			case figo.AndExpr, figo.OrExpr, figo.NotExpr:
+				sawTrue = true
+			}
 			continue
 		}
 		n++
 	}
-	if n == 0 {
+	// Finish visiting every operand before simplifying so an unsupported
+	// expression cannot be hidden behind a true sibling. Discard its args too.
+	if n == 0 || (op == "OR" && sawTrue) {
 		w.buf = w.buf[:start]
-		return false, nil
+		w.args = w.args[:argsStart]
+		return false, sawTrue, nil
 	}
 	if paren {
 		if n == 1 {
@@ -387,7 +357,7 @@ func (w *sqlWriter) writeGroup(d *SQLDialect, op string, operands []figo.Expr) (
 			w.buf = append(w.buf, ')')
 		}
 	}
-	return true, nil
+	return true, sawTrue, nil
 }
 
 // writeExpr renders one expression. The logical nodes recurse in place; every
@@ -395,30 +365,33 @@ func (w *sqlWriter) writeGroup(d *SQLDialect, op string, operands []figo.Expr) (
 func (w *sqlWriter) writeExpr(d *SQLDialect, e figo.Expr) (bool, error) {
 	switch x := e.(type) {
 	case figo.AndExpr:
-		return w.writeGroup(d, "AND", x.Operands)
+		wrote, _, err := w.writeGroup(d, "AND", x.Operands)
+		return wrote, err
 	case figo.OrExpr:
-		wrote, err := w.writeGroup(d, "OR", x.Operands)
+		wrote, sawTrue, err := w.writeGroup(d, "OR", x.Operands)
 		if err != nil {
 			return false, err
 		}
-		if !wrote {
-			// See exprToSQL: an empty OR must match NOTHING, not vanish.
+		if !wrote && !sawTrue {
+			// An OR without predicates is false; an OR with a true operand
+			// is true even when that operand emitted no SQL.
 			w.buf = append(w.buf, "1=0"...)
+			return true, nil
 		}
-		return true, nil
+		return wrote, nil
 	case figo.NotExpr:
 		if !hasNonNilOperand(x.Operands) {
 			return false, nil
 		}
 		mark, argMark := len(w.buf), len(w.args)
-		// See exprToSQL: figo.NotExpr is NOT(a OR b) across all adapters.
+		// figo.NotExpr is NOT(a OR b) across all adapters.
 		w.buf = append(w.buf, "NOT ("...)
-		wrote, err := w.writeGroup(d, "OR", x.Operands)
+		wrote, _, err := w.writeGroup(d, "OR", x.Operands)
 		if err != nil {
 			return false, err
 		}
 		if !wrote {
-			// See exprToSQL: NOT over a vacuously-true operand matches NOTHING.
+			// NOT over a vacuously-true operand matches NOTHING.
 			w.buf = w.buf[:mark]
 			w.args = w.args[:argMark]
 			w.buf = append(w.buf, "1=0"...)

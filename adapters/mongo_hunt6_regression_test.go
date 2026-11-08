@@ -22,6 +22,19 @@ func ordersJoin() map[string]MongoJoin {
 	}
 }
 
+// requireBSONValue reads an ordered document without converting its nested
+// values, so assertions retain concrete types such as mongo.Pipeline.
+func requireBSONValue(t *testing.T, doc bson.D, key string) any {
+	t.Helper()
+	for _, elem := range doc {
+		if elem.Key == key {
+			return elem.Value
+		}
+	}
+	t.Fatalf("BSON document has no %q element: %#v", key, doc)
+	return nil
+}
+
 // lookupSubPipeline returns the `pipeline` of the first $lookup stage.
 func lookupSubPipeline(t *testing.T, pipe mongo.Pipeline) mongo.Pipeline {
 	t.Helper()
@@ -32,8 +45,9 @@ func lookupSubPipeline(t *testing.T, pipe mongo.Pipeline) mongo.Pipeline {
 			}
 			doc, ok := e.Value.(bson.D)
 			require.True(t, ok, "$lookup value should be a bson.D, got %T", e.Value)
-			sub, ok := doc.Map()["pipeline"].(mongo.Pipeline)
-			require.True(t, ok, "$lookup must carry a correlated sub-pipeline, got %#v", doc.Map()["pipeline"])
+			value := requireBSONValue(t, doc, "pipeline")
+			sub, ok := value.(mongo.Pipeline)
+			require.True(t, ok, "$lookup must carry a correlated sub-pipeline, got %#v", value)
 			return sub
 		}
 	}
@@ -74,7 +88,7 @@ func TestH12_PreloadFiltersRenderInsideLookupSubPipeline(t *testing.T) {
 
 		sub := lookupSubPipeline(t, pipe)
 		require.Len(t, sub, 2, "join condition + child filter: %v", sub)
-		childMatch, ok := sub[1].Map()["$match"].(bson.M)
+		childMatch, ok := requireBSONValue(t, sub[1], "$match").(bson.M)
 		require.True(t, ok, "got %#v", sub[1])
 		and, ok := childMatch["$and"].([]bson.M)
 		require.True(t, ok, "got %#v", childMatch)
@@ -100,7 +114,7 @@ func TestH12_PreloadFiltersRenderInsideLookupSubPipeline(t *testing.T) {
 		require.Len(t, sub, 2)
 		// {"Orders.status": {$ne: "paid"}} on an ARRAY path means "NO element is
 		// paid" — the opposite quantifier. Per child it means what it says.
-		assert.Equal(t, bson.M{"status": bson.M{"$ne": "paid"}}, sub[1].Map()["$match"])
+		assert.Equal(t, bson.M{"status": bson.M{"$ne": "paid"}}, requireBSONValue(t, sub[1], "$match"))
 		assert.NotContains(t, rootMatchKeys(t, pipe), "Orders.status")
 	})
 
@@ -113,10 +127,10 @@ func TestH12_PreloadFiltersRenderInsideLookupSubPipeline(t *testing.T) {
 
 		sub := lookupSubPipeline(t, pipe)
 		require.Len(t, sub, 2, "the tenant predicate must run inside the $lookup so other tenants' orders never enter the array: %v", sub)
-		assert.Equal(t, bson.M{"tenant_id": int64(7)}, sub[1].Map()["$match"])
+		assert.Equal(t, bson.M{"tenant_id": int64(7)}, requireBSONValue(t, sub[1], "$match"))
 
 		// The correlated join condition must still be present and first.
-		assert.Equal(t, bson.M{"$expr": bson.M{"$eq": []any{"$user_id", "$$figoLocal"}}}, sub[0].Map()["$match"])
+		assert.Equal(t, bson.M{"$expr": bson.M{"$eq": []any{"$user_id", "$$figoLocal"}}}, requireBSONValue(t, sub[0], "$match"))
 	})
 
 	t.Run("parent still needs at least one matching child", func(t *testing.T) {
@@ -264,7 +278,7 @@ func TestM6_AggregatePathHonorsSelectFields(t *testing.T) {
 	require.NoError(t, err)
 
 	last := pipe[len(pipe)-1]
-	proj, ok := last.Map()["$project"].(bson.D)
+	proj, ok := requireBSONValue(t, last, "$project").(bson.D)
 	require.True(t, ok, "the pipeline must end with a $project, got %v", pipe)
 	assert.Equal(t, bson.D{{Key: "Orders", Value: 1}, {Key: "a", Value: 1}, {Key: "b", Value: 1}}, proj,
 		"selected fields plus the lookup outputs, in a fixed order")
@@ -396,7 +410,7 @@ func TestL8_RootMatchOnRelationRunsAfterTheLookup(t *testing.T) {
 		f.Build(MongoAdapter{})
 		pipe, err := BuildMongoAggregatePipeline(f, ordersJoin())
 		require.NoError(t, err)
-		assert.Equal(t, bson.M{"a": int64(1)}, pipe[0].Map()["$match"], "filter first is the whole point: %v", pipe)
+		assert.Equal(t, bson.M{"a": int64(1)}, requireBSONValue(t, pipe[0], "$match"), "filter first is the whole point: %v", pipe)
 	})
 
 	t.Run("$text cannot be moved off the first stage", func(t *testing.T) {

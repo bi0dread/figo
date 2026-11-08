@@ -688,14 +688,8 @@ var basicSyntaxChecks = []struct {
 	{regexp.MustCompile(`^\s*or(\s|$)`), "expression starts with OR", "Remove OR or add field before it", false},
 }
 
-// validateBasicSyntax checks for common syntax errors
-func validateBasicSyntax(expr string) error {
-	err, _ := validateBasicSyntaxClassified(expr)
-	return err
-}
-
-// validateBasicSyntaxClassified is validateBasicSyntax plus the failing
-// check's gate eligibility (see validateDSLSyntaxClassified).
+// validateBasicSyntaxClassified checks for common syntax errors and reports
+// the failing check's gate eligibility (see validateDSLSyntaxClassified).
 func validateBasicSyntaxClassified(expr string) (error, bool) {
 	if idx := doubledEqualsIndex(expr); idx >= 0 {
 		// Gate-eligible: '==' inside an unquoted regex VALUE (email=~x==y)

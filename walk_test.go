@@ -94,9 +94,9 @@ func TestWalkLogicalNodesHaveNoField(t *testing.T) {
 	f.Walk(func(n Expr) {
 		if _, ok := n.(*AndExpr); ok {
 			sawAnd = true
-		}
-		if _, ok := NodeField(n); ok {
-			// fine
+			field, hasField := NodeField(n)
+			assert.False(t, hasField, "logical nodes should not report a field")
+			assert.Empty(t, field)
 		}
 	})
 	assert.True(t, sawAnd, "logical nodes should be visited")

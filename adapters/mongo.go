@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/bsontype"
 	"go.mongodb.org/mongo-driver/bson/primitive"
 	"go.mongodb.org/mongo-driver/mongo"
 	"go.mongodb.org/mongo-driver/mongo/options"
@@ -755,13 +754,13 @@ func mongoCheckRawDocument(field string, raw []byte, depth int) error {
 // documents and arrays can carry keys; every other BSON type is a leaf.
 func mongoCheckRawValue(field string, v bson.RawValue, depth int) error {
 	switch v.Type {
-	case bsontype.EmbeddedDocument:
+	case bson.TypeEmbeddedDocument:
 		doc, ok := v.DocumentOK()
 		if !ok {
 			return nil
 		}
 		return mongoCheckRawDocument(field, doc, depth)
-	case bsontype.Array:
+	case bson.TypeArray:
 		arr, ok := v.ArrayOK()
 		if !ok {
 			return nil
@@ -848,7 +847,7 @@ func buildMongoFilterFromExprs(exprs []figo.Expr, rc mongoRender) (bson.M, error
 		return bson.M{}, nil
 	}
 	// If multiple top-level expressions exist, combine with $and
-	parts, err := mongoOperands(exprs, rc)
+	parts, _, err := mongoOperands(exprs, rc)
 	if err != nil {
 		return nil, err
 	}
@@ -861,22 +860,26 @@ func buildMongoFilterFromExprs(exprs []figo.Expr, rc mongoRender) (bson.M, error
 	return bson.M{"$and": parts}, nil
 }
 
-// mongoOperands renders a set of operands, propagating the first error.
-func mongoOperands(ops []figo.Expr, rc mongoRender) ([]bson.M, error) {
+// mongoOperands renders every operand and reports whether any is match-all.
+// Empty documents may be omitted from AND, but must be retained for OR/NOR.
+func mongoOperands(ops []figo.Expr, rc mongoRender) ([]bson.M, bool, error) {
 	var parts []bson.M
+	sawTrue := false
 	for _, op := range ops {
 		if op == nil {
 			continue
 		}
 		m, err := mongoExpr(op, rc)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		if len(m) > 0 {
 			parts = append(parts, m)
+		} else if _, ignored := op.(figo.OrderBy); !ignored {
+			sawTrue = true
 		}
 	}
-	return parts, nil
+	return parts, sawTrue, nil
 }
 
 // Translate figo.Expr to MongoDB filter fragment
@@ -1020,44 +1023,32 @@ func mongoExpr(e figo.Expr, rc mongoRender) (bson.M, error) {
 			"$centerSphere": []any{[]float64{x.Longitude, x.Latitude}, km / earthRadiusKm},
 		}}}, nil
 	case figo.AndExpr:
-		parts, err := mongoOperands(x.Operands, rc)
+		parts, _, err := mongoOperands(x.Operands, rc)
 		if err != nil {
 			return nil, err
 		}
 		return logicalBSON("$and", parts), nil
 	case figo.OrExpr:
-		parts, err := mongoOperands(x.Operands, rc)
+		parts, sawTrue, err := mongoOperands(x.Operands, rc)
 		if err != nil {
 			return nil, err
 		}
-		return logicalBSON("$or", parts), nil
-	case figo.NotExpr:
-		nrc := rc.under()
-		parts := make([]bson.M, 0, len(x.Operands))
-		sawOperand := false
-		for _, op := range x.Operands {
-			if op == nil {
-				continue
-			}
-			sawOperand = true
-			m, err := mongoExpr(op, nrc)
-			if err != nil {
-				return nil, err
-			}
-			if len(m) == 0 {
-				// The operand rendered a match-all predicate ({}), so its
-				// negation matches NOTHING. mongoOperands dropped it, leaving
-				// {} — match everything: fail open (raw/ES: NOT(TRUE)=FALSE).
-				return bson.M{"$nor": []bson.M{{}}}, nil
-			}
-			parts = append(parts, m)
-		}
-		if !sawOperand {
-			// NOT of no operands stays the vacuous-true identity, like the
-			// raw adapter's "" and logicalBSON's empty $nor.
+		if sawTrue {
 			return bson.M{}, nil
 		}
-		return bson.M{"$nor": parts}, nil
+		return logicalBSON("$or", parts), nil
+	case figo.NotExpr:
+		parts, sawTrue, err := mongoOperands(x.Operands, rc.under())
+		if err != nil {
+			return nil, err
+		}
+		if sawTrue {
+			return bson.M{"$nor": []bson.M{{}}}, nil
+		}
+		if len(parts) == 0 && hasNonNilOperand(x.Operands) {
+			return bson.M{"$nor": []bson.M{{}}}, nil
+		}
+		return logicalBSON("$nor", parts), nil
 	case figo.OrderBy:
 		return bson.M{}, nil
 	default:

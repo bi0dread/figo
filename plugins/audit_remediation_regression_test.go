@@ -182,7 +182,7 @@ func TestF5_LaunderedDiagnosticStillFailsClosed(t *testing.T) {
 		`load=[X:produced no conditions; relation preloaded unfiltered`,
 	} {
 		t.Run(dsl, func(t *testing.T) {
-			err, where := guarded(t, NewInjectionGuardPlugin(), dsl)
+			where, err := guarded(t, NewInjectionGuardPlugin(), dsl)
 			assert.Error(t, err, "the rejection signal must survive")
 			assert.Equal(t, "1=0", where, "and the query must fail closed")
 		})
@@ -191,7 +191,7 @@ func TestF5_LaunderedDiagnosticStillFailsClosed(t *testing.T) {
 	// The genuinely informational cases are still not rejections.
 	for _, dsl := range []string{`id<in>[1,2,]`, `id=1 load=[Orders:]`} {
 		t.Run("informational/"+dsl, func(t *testing.T) {
-			err, where := guarded(t, NewInjectionGuardPlugin(), dsl)
+			where, err := guarded(t, NewInjectionGuardPlugin(), dsl)
 			assert.NoError(t, err, "an informational diagnostic must not become a rejection")
 			assert.NotEqual(t, "1=0", where)
 		})

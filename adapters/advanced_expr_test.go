@@ -84,16 +84,15 @@ func TestMongoAdvancedOperators(t *testing.T) {
 		// wire bytes run to run (hunt #6 L7).
 		txt, ok := m["$text"].(bson.D)
 		require.True(t, ok, "got %#v", m)
-		assert.Equal(t, "machine learning", txt.Map()["$search"])
-		_, hasLang := txt.Map()["$language"]
-		assert.False(t, hasLang, "language omitted when unset")
+		assert.Equal(t, bson.D{{Key: "$search", Value: "machine learning"}}, txt,
+			"language omitted when unset")
 	})
 
 	t.Run("FullTextSearchCarriesLanguage", func(t *testing.T) {
 		m := buildMongo(t, FullTextSearchExpr{Query: "hola", Language: "es"})
 		txt := m["$text"].(bson.D)
-		assert.Equal(t, "es", txt.Map()["$language"])
-		assert.Equal(t, "$search", txt[0].Key, "key order must be fixed, not map-random")
+		assert.Equal(t, bson.D{{Key: "$search", Value: "hola"}, {Key: "$language", Value: "es"}}, txt,
+			"key order must be fixed, not map-random")
 	})
 
 	t.Run("GeoDistanceUsesCenterSphereInRadians", func(t *testing.T) {

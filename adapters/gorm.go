@@ -29,23 +29,28 @@ func toGormClauseWithFigo(e figo.Expr, f figo.Figo) (clause.Expression, error) {
 	getFieldName := func(field string) string { return field }
 
 	// convertOperands maps a logical node's operand list, propagating the
-	// first conversion error.
-	convertOperands := func(operands []figo.Expr) ([]clause.Expression, error) {
+	// first conversion error. A nil rendering is true, not an absent operand;
+	// OR and NOT need to retain that fact even when other operands render.
+	convertOperands := func(operands []figo.Expr) ([]clause.Expression, bool, error) {
 		var parts []clause.Expression
+		sawTrue := false
 		for _, op := range operands {
 			if op == nil {
 				continue
 			}
 			part, err := toGormClauseWithFigo(op, f)
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			if part == nil {
+				if _, ignored := op.(figo.OrderBy); !ignored {
+					sawTrue = true
+				}
 				continue
 			}
 			parts = append(parts, part)
 		}
-		return parts, nil
+		return parts, sawTrue, nil
 	}
 
 	// Filter-position identifiers get the same two refusals the SELECT list
@@ -107,7 +112,7 @@ func toGormClauseWithFigo(e figo.Expr, f figo.Figo) (clause.Expression, error) {
 	case figo.BetweenExpr:
 		return clause.Expr{SQL: "? BETWEEN ? AND ?", Vars: []any{clause.Column{Name: getFieldName(x.Field)}, x.Low, x.High}}, nil
 	case figo.AndExpr:
-		parts, err := convertOperands(x.Operands)
+		parts, _, err := convertOperands(x.Operands)
 		if err != nil {
 			return nil, err
 		}
@@ -118,9 +123,12 @@ func toGormClauseWithFigo(e figo.Expr, f figo.Figo) (clause.Expression, error) {
 		}
 		return clause.And(parts...), nil
 	case figo.OrExpr:
-		parts, err := convertOperands(x.Operands)
+		parts, sawTrue, err := convertOperands(x.Operands)
 		if err != nil {
 			return nil, err
+		}
+		if sawTrue {
+			return nil, nil
 		}
 		if len(parts) == 0 {
 			// An OR with no renderable operands is a false disjunction: it
@@ -132,7 +140,7 @@ func toGormClauseWithFigo(e figo.Expr, f figo.Figo) (clause.Expression, error) {
 		}
 		if len(parts) == 1 {
 			// An OR of ONE operand is that operand (the raw adapter's
-			// joinGroup returns parts[0] here too). clause.Or of a single
+			// writer returns the single predicate here too). clause.Or of a single
 			// expression yields clause.OrConditions{1 expr}, a shape GORM's
 			// clause.Where treats as an "or condition": buildExprs joins it to
 			// the PRECEDING clause with " OR " instead of " AND ", and
@@ -144,27 +152,21 @@ func toGormClauseWithFigo(e figo.Expr, f figo.Figo) (clause.Expression, error) {
 		}
 		return clause.Or(parts...), nil
 	case figo.NotExpr:
-		parts, err := convertOperands(x.Operands)
+		parts, sawTrue, err := convertOperands(x.Operands)
 		if err != nil {
 			return nil, err
 		}
-		if len(parts) == 0 {
-			hasOperand := false
-			for _, op := range x.Operands {
-				if op != nil {
-					hasOperand = true
-					break
-				}
-			}
-			if !hasOperand {
-				// NOT of nothing is vacuously true: no predicate, like Mongo's
-				// empty $nor.
-				return nil, nil
-			}
-			// The operands rendered no predicate (vacuously true, e.g. an
-			// empty AND identity), so the negation matches NOTHING. Returning
-			// nil dropped the NOT entirely: fail open.
+		if sawTrue {
+			// NOT is NOR, so any true operand makes it false.
 			return clause.Expr{SQL: "1=0"}, nil
+		}
+		if len(parts) == 0 {
+			if hasNonNilOperand(x.Operands) {
+				// Preserve refusal of NOT over only non-predicate nodes.
+				return clause.Expr{SQL: "1=0"}, nil
+			}
+			// NOT of no operands is true.
+			return nil, nil
 		}
 		// NotExpr is NOR: NOT(op1 OR op2 ...). clause.Not is unusable here —
 		// it unwraps a lone AndConditions and distributes the negation over

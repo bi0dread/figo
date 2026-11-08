@@ -17,9 +17,9 @@ import (
 
 // guarded builds an instance carrying the guard, feeds it the DSL, and — like
 // a caller that ignores the returned error — builds anyway. It returns the
-// AddFiltersFromString error and the rendered WHERE, which is what proves the
+// rendered WHERE and the AddFiltersFromString error, which prove the
 // refusal narrows rather than widens.
-func guarded(t *testing.T, g *InjectionGuardPlugin, dsl string) (error, string) {
+func guarded(t *testing.T, g *InjectionGuardPlugin, dsl string) (string, error) {
 	t.Helper()
 	f := figo.New()
 	f.SetNamingFunc(figo.NoChangeNaming)
@@ -30,7 +30,7 @@ func guarded(t *testing.T, g *InjectionGuardPlugin, dsl string) (error, string) 
 
 	where, _, err := adapters.BuildRawWhere(f)
 	require.NoError(t, err)
-	return addErr, where
+	return where, addErr
 }
 
 // ---------------------------------------------------------------------------
@@ -44,7 +44,7 @@ func guarded(t *testing.T, g *InjectionGuardPlugin, dsl string) (error, string) 
 func TestReportedDSLIsRefusedAndFailsClosed(t *testing.T) {
 	const reported = `page=skip:0,take:50 and sort=median_price:desc or 1=1`
 
-	err, where := guarded(t, NewInjectionGuardPlugin(), reported)
+	where, err := guarded(t, NewInjectionGuardPlugin(), reported)
 
 	require.Error(t, err, "the reported DSL was accepted")
 	assert.Contains(t, err.Error(), `filter field "1"`)
@@ -204,8 +204,8 @@ func TestHostileIdentifiersAreRefused(t *testing.T) {
 		{`load=[Rel--:id=1]`, `preload relation "Rel--"`},
 
 		// invisible and bidi characters
-		{"a​b=1", `filter field`},
-		{"‮abc=1", `filter field`},
+		{"a\u200bb=1", `filter field`},
+		{"\u202eabc=1", `filter field`},
 
 		// dotted-name abuse (four segments is db.schema.table.column and is
 		// legal; five is not)
@@ -214,7 +214,7 @@ func TestHostileIdentifiersAreRefused(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.dsl, func(t *testing.T) {
-			err, where := guarded(t, NewInjectionGuardPlugin(), tc.dsl)
+			where, err := guarded(t, NewInjectionGuardPlugin(), tc.dsl)
 			require.Error(t, err, "accepted %q", tc.dsl)
 			assert.Contains(t, err.Error(), tc.want)
 			assert.Equal(t, "1=0", where, "%q did not fail closed", tc.dsl)
@@ -250,7 +250,7 @@ func TestLegitimateDSLPassesThrough(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.dsl, func(t *testing.T) {
-			err, where := guarded(t, NewInjectionGuardPlugin(), tc.dsl)
+			where, err := guarded(t, NewInjectionGuardPlugin(), tc.dsl)
 			assert.NoError(t, err, "wrongly refused %q", tc.dsl)
 			assert.Equal(t, tc.where, where)
 		})
@@ -269,7 +269,7 @@ func TestParseDiagnosticsAreRejectedByDefault(t *testing.T) {
 		`sort=median_price:desc--`, // direction silently flips desc -> asc
 	} {
 		t.Run(dsl, func(t *testing.T) {
-			err, where := guarded(t, NewInjectionGuardPlugin(), dsl)
+			where, err := guarded(t, NewInjectionGuardPlugin(), dsl)
 			require.Error(t, err, "accepted %q", dsl)
 			assert.Contains(t, err.Error(), "parse:")
 			assert.Equal(t, "1=0", where)
@@ -278,7 +278,7 @@ func TestParseDiagnosticsAreRejectedByDefault(t *testing.T) {
 
 	// Off, the partial render is what figo would have produced on its own.
 	g := NewInjectionGuardPlugin().RejectParseDiagnostics(false)
-	err, where := guarded(t, g, `a b=1`)
+	where, err := guarded(t, g, `a b=1`)
 	assert.NoError(t, err)
 	assert.Equal(t, "`b` = ?", where)
 }
@@ -292,23 +292,23 @@ func TestParseDiagnosticsAreRejectedByDefault(t *testing.T) {
 func TestAllowFieldsRejectsUnknownColumns(t *testing.T) {
 	g := NewInjectionGuardPlugin().AllowFields("median_price", "city")
 
-	err, where := guarded(t, g, `is_admin=1`)
+	where, err := guarded(t, g, `is_admin=1`)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not in the allowed field list")
 	assert.Equal(t, "1=0", where)
 
-	err, where = guarded(t, g, `median_price>=100 and city="tehran"`)
+	where, err = guarded(t, g, `median_price>=100 and city="tehran"`)
 	assert.NoError(t, err)
 	assert.Equal(t, "(`median_price` >= ? AND `city` = ?)", where)
 
 	// The allowlist covers the sort position too, which is where the reported
 	// DSL smuggled its payload in.
-	err, _ = guarded(t, g, `sort=is_admin:desc`)
+	_, err = guarded(t, g, `sort=is_admin:desc`)
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), `sort key "is_admin"`)
 
 	// A qualified spelling is accepted by its bare column.
-	err, _ = guarded(t, g, `orders.city="tehran"`)
+	_, err = guarded(t, g, `orders.city="tehran"`)
 	assert.NoError(t, err)
 }
 
@@ -367,18 +367,18 @@ func TestAllowFieldsMatchesTheNamingConvertedSpelling(t *testing.T) {
 
 func TestUnicodeIdentifiers(t *testing.T) {
 	strict := NewInjectionGuardPlugin()
-	err, _ := guarded(t, strict, `عنوان="x"`)
+	_, err := guarded(t, strict, `عنوان="x"`)
 	require.Error(t, err, "the default rule is ASCII-only")
 
 	loose := NewInjectionGuardPlugin().AllowUnicodeIdentifiers(true)
-	err, where := guarded(t, loose, `عنوان="x"`)
+	where, err := guarded(t, loose, `عنوان="x"`)
 	assert.NoError(t, err)
 	assert.Equal(t, "`عنوان` = ?", where)
 
 	// Still strict about what is not a letter: zero-width, bidi override and a
 	// bare combining mark are refused in both modes.
-	for _, dsl := range []string{"a​b=1", "‮abc=1", "́=1"} {
-		err, where := guarded(t, loose, dsl)
+	for _, dsl := range []string{"a\u200bb=1", "\u202eabc=1", "́=1"} {
+		where, err := guarded(t, loose, dsl)
 		require.Error(t, err, "unicode mode accepted %q", dsl)
 		assert.Equal(t, "1=0", where)
 	}
@@ -387,9 +387,9 @@ func TestUnicodeIdentifiers(t *testing.T) {
 // A refused name is never echoed raw into the message: printing a control byte
 // or a bidi override into a log line attacks whatever reads the log.
 func TestMessageDoesNotEchoInvisibleBytesRaw(t *testing.T) {
-	err, _ := guarded(t, NewInjectionGuardPlugin(), "a‮b=1")
+	_, err := guarded(t, NewInjectionGuardPlugin(), "a\u202eb=1")
 	require.Error(t, err)
-	assert.NotContains(t, err.Error(), "‮", "the bidi override was echoed verbatim")
+	assert.NotContains(t, err.Error(), "\u202e", "the bidi override was echoed verbatim")
 	assert.Contains(t, err.Error(), "U+202E")
 }
 
@@ -723,7 +723,7 @@ func TestGuardIsRaceFree(t *testing.T) {
 
 // The message itemises every distinct problem and repeats none of them.
 func TestViolationsAreItemisedAndDeduped(t *testing.T) {
-	err, _ := guarded(t, NewInjectionGuardPlugin(), `1=1 or 1=1 or 2=2`)
+	_, err := guarded(t, NewInjectionGuardPlugin(), `1=1 or 1=1 or 2=2`)
 	require.Error(t, err)
 	assert.Equal(t, 1, strings.Count(err.Error(), `filter field "1"`), "a repeated field was reported twice")
 	assert.Contains(t, err.Error(), `filter field "2"`)
@@ -929,7 +929,7 @@ func TestInformationalDiagnosticsAreNotRejections(t *testing.T) {
 		{`id=1 load=[Orders:]`, "`id` = ?"}, // a first-class core case
 	} {
 		t.Run(tc.dsl, func(t *testing.T) {
-			err, where := guarded(t, NewInjectionGuardPlugin(), tc.dsl)
+			where, err := guarded(t, NewInjectionGuardPlugin(), tc.dsl)
 			assert.NoError(t, err, "informational diagnostic became a rejection")
 			assert.Equal(t, tc.where, where)
 		})
@@ -945,7 +945,7 @@ func TestInformationalDiagnosticsAreNotRejections(t *testing.T) {
 		`load=[X:produced no conditions; relation preloaded unfiltered`,
 	} {
 		t.Run("launder/"+dsl, func(t *testing.T) {
-			err, where := guarded(t, NewInjectionGuardPlugin(), dsl)
+			where, err := guarded(t, NewInjectionGuardPlugin(), dsl)
 			assert.Error(t, err, "a destructive diagnostic carrying an informational phrase must stay a rejection")
 			assert.Equal(t, "1=0", where, "a refused query must render the never-true pill")
 		})
@@ -977,13 +977,13 @@ func TestIdentifierRuleMatchesRealSchemas(t *testing.T) {
 		`select=1`, `order=1`, `group=1`, `MixedCase=1`, `db.schema.tbl.col=1`,
 	}
 	for _, dsl := range accepted {
-		err, _ := guarded(t, NewInjectionGuardPlugin(), dsl)
+		_, err := guarded(t, NewInjectionGuardPlugin(), dsl)
 		assert.NoError(t, err, "wrongly refused %q", dsl)
 	}
 
 	refused := []string{`1=1`, `0=0`, `42=1`, `a.0.b=1`, `a.b.c.d.e=1`}
 	for _, dsl := range refused {
-		err, where := guarded(t, NewInjectionGuardPlugin(), dsl)
+		where, err := guarded(t, NewInjectionGuardPlugin(), dsl)
 		assert.Error(t, err, "accepted %q", dsl)
 		assert.Equal(t, "1=0", where)
 	}
@@ -1001,7 +1001,7 @@ func TestDocumentStoreRelaxation(t *testing.T) {
 		`@timestamp>"2024-01-01"`, `user-agent="curl"`,
 		`meta.tags.0="x"`, `profile.address.geo.lat=1`,
 	} {
-		err, _ := guarded(t, g, dsl)
+		_, err := guarded(t, g, dsl)
 		assert.NoError(t, err, "relaxed mode wrongly refused %q", dsl)
 	}
 
@@ -1009,7 +1009,7 @@ func TestDocumentStoreRelaxation(t *testing.T) {
 	// terminate or comment a statement is refused even if listed.
 	hard := NewInjectionGuardPlugin().AllowExtraRunes("`\";'")
 	for _, dsl := range []string{"`x`=1", `x;=1`, `x'y=1`} {
-		err, where := guarded(t, hard, dsl)
+		where, err := guarded(t, hard, dsl)
 		assert.Error(t, err, "AllowExtraRunes disabled the screen for %q", dsl)
 		assert.Equal(t, "1=0", where)
 	}
@@ -1020,10 +1020,10 @@ func TestDocumentStoreRelaxation(t *testing.T) {
 func TestSegmentLengthIsCountedInRunes(t *testing.T) {
 	g := NewInjectionGuardPlugin().AllowUnicodeIdentifiers(true)
 
-	err, _ := guarded(t, g, strings.Repeat("名", 22)+`=1`) // 22 runes, 66 bytes
+	_, err := guarded(t, g, strings.Repeat("名", 22)+`=1`) // 22 runes, 66 bytes
 	assert.NoError(t, err, "a 22-character column name was refused as 66 bytes")
 
-	err, _ = guarded(t, g, strings.Repeat("名", 65)+`=1`) // 65 runes
+	_, err = guarded(t, g, strings.Repeat("名", 65)+`=1`) // 65 runes
 	assert.Error(t, err, "the cap is not being enforced at all")
 }
 

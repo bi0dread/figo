@@ -89,8 +89,12 @@ function collapseDotSegments(ident: string): string {
  */
 const DIRECTIVE_IDENTS = ['sort', 'page', 'load']
 
+// Preload relations are Go field names (optionally dotted paths), not column
+// identifiers. Keep Unicode letters/digits in sync with gormRelationScreen.
+const RELATION_RE = /^[\p{L}_][\p{L}\p{Nd}_]*(?:\.[\p{L}_][\p{L}\p{Nd}_]*)*$/u
+
 /**
- * Field / relation names are bare tokens in the DSL — whitespace or operator
+ * Field names are bare tokens in the DSL — whitespace or operator
  * characters inside them cannot be expressed, so they are stripped, and an empty
  * dot segment is collapsed away.
  *
@@ -304,9 +308,13 @@ export function generateDsl(nodes: AppNode[], edges: Edge[]): DslResult {
   // load=[Rel:filter | Rel:filter]
   const loadSegments: string[] = []
   for (const n of incoming(root.id, 'load')) {
-    const relation = sanitizeIdent(String(n.data.relation ?? ''), 'Relation', warn)
+    const relation = String(n.data.relation ?? '').trim()
     if (relation === '') {
       warn('A load node is missing its relation name')
+      continue
+    }
+    if (!RELATION_RE.test(relation)) {
+      warn(`Invalid relation name "${relation}" — each segment must start with a letter or underscore and contain only letters, digits, or underscores`)
       continue
     }
     const filterNode = incoming(n.id, 'filter')[0]

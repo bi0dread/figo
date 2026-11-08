@@ -11,7 +11,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.mongodb.org/mongo-driver/bson"
-	"go.mongodb.org/mongo-driver/bson/bsontype"
 )
 
 // ---------------------------------------------------------------------------
@@ -60,7 +59,7 @@ func TestA5_2_OperatorKeyGuardSeesThroughBsonRawAndStructTags(t *testing.T) {
 		{"bson.Raw carrying $where", mustRaw(bson.M{"$where": "sleep(60000)||true"}), "$where"},
 		{"bson.Raw with a nested operator", mustRaw(bson.M{"a": bson.M{"$gt": 1}}), "$gt"},
 		{"bson.Raw with an operator inside an array", mustRaw(bson.M{"a": bson.A{bson.M{"$ne": nil}}}), "$ne"},
-		{"bson.RawValue embedded document", bson.RawValue{Type: bsontype.EmbeddedDocument, Value: mustRaw(bson.M{"$ne": nil})}, "$ne"},
+		{"bson.RawValue embedded document", bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: mustRaw(bson.M{"$ne": nil})}, "$ne"},
 		{"struct with a $-prefixed bson tag", a52TaggedOperator{}, "$ne"},
 		{"pointer to that struct", &a52TaggedOperator{}, "$ne"},
 		{"the tag one level down", a52NestedOperator{}, "$ne"},
@@ -87,7 +86,7 @@ func TestA5_2_OperatorKeyGuardSeesThroughBsonRawAndStructTags(t *testing.T) {
 		v    any
 	}{
 		{"bson.Raw with no operator key", mustRaw(bson.M{"name": "bob"})},
-		{"bson.RawValue holding a plain document", bson.RawValue{Type: bsontype.EmbeddedDocument, Value: mustRaw(bson.M{"name": "bob"})}},
+		{"bson.RawValue holding a plain document", bson.RawValue{Type: bson.TypeEmbeddedDocument, Value: mustRaw(bson.M{"name": "bob"})}},
 		{"bson.RawValue holding a string", mustRaw(bson.M{"k": "x"}).Lookup("k")},
 		{"a plain []byte is still binary data", []byte{1, 2, 3}},
 		{"a nil bson.Raw", bson.Raw(nil)},

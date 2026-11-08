@@ -208,5 +208,29 @@ const hasWarning = (name: string, warnings: string[], needle: string): void =>
   eq('CRITIQUE-1a unwired filter handle is silent', none.warnings.length, 0)
 }
 
+// Relation names use Go identifier segments, unlike general column names.
+// Invalid names must not reach GORM or mark the omitted load subtree active.
+{
+  const renderLoad = (relation: string) => generateDsl(
+    [root(), cond('c1', 'id', '>', '0'), cond('c2', 'total', '>', '100'), {
+      id: 'l1', type: 'load', position: { x: 300, y: 0 }, data: { relation },
+    }],
+    [edge('c1', 'root', 'filter'), edge('c2', 'l1', 'filter'), edge('l1', 'root', 'load')],
+  )
+  for (const relation of ['$dollar', '1234', 'Orders.$items', 'Orders.2Items', 'order-items', '~~~as~~~', 'Orders..Items']) {
+    const r = renderLoad(relation)
+    eq(`invalid relation ${relation} omitted`, r.dsl, 'id>0')
+    hasWarning(`invalid relation ${relation} warns`, r.warnings, 'Invalid relation name')
+    eq(`invalid relation ${relation} inactive`, r.active.has('l1'), false)
+    eq(`invalid relation ${relation} filter inactive`, r.active.has('c2'), false)
+  }
+  for (const relation of ['Orders', '_Orders2', 'Ürünler', 'سفارش۲', 'Orders.Items']) {
+    const r = renderLoad(relation)
+    eq(`valid relation ${relation} preserved`, r.dsl, `id>0 load=[${relation}:total>100]`)
+    eq(`valid relation ${relation} warn-free`, r.warnings.length, 0)
+    eq(`valid relation ${relation} active`, r.active.has('l1'), true)
+  }
+}
+
 console.log(`playground hunt#7 regression: ${checks - failures}/${checks} checks passed`)
 if (failures > 0) throw new Error(`${failures} playground regression check(s) failed`)
