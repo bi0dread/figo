@@ -456,14 +456,11 @@ func copyQuery(q figo.Query) figo.Query {
 	}
 }
 
-// copyArgsSlice shallow-copies a query args slice (nil stays nil).
+// copyArgsSlice copies the argument list and its nested containers, including
+// binary parameters. Reuse core expression-value copying so both paths preserve
+// named types and nil values, with the same bounds and opaque-value semantics.
 func copyArgsSlice(args []any) []any {
-	if args == nil {
-		return nil
-	}
-	out := make([]any, len(args))
-	copy(out, args)
-	return out
+	return figo.CloneExpr(figo.InExpr{Values: args}).(figo.InExpr).Values
 }
 
 // byteWriter is the sink the key/fingerprint writers render into: both
@@ -527,7 +524,7 @@ func (k *cacheKeyBuf) reset() {
 var keyBufPool = sync.Pool{New: func() any { return &cacheKeyBuf{buf: make([]byte, 0, 512)} }}
 
 // cacheKeyPrefix namespaces the key; an empty key means "not cacheable".
-const cacheKeyPrefix = "figo:v2:"
+const cacheKeyPrefix = "figo:v3:"
 
 // cacheKeyHashBytes is how much of the digest lands in the key.
 const cacheKeyHashBytes = 16
@@ -925,6 +922,10 @@ func (w *valueWalker) write(v reflect.Value, depth int) {
 		}
 		_ = b.WriteByte('}')
 	case reflect.Slice, reflect.Array:
+		if v.Kind() == reflect.Slice && v.IsNil() {
+			_, _ = b.WriteString("<nil-slice>")
+			return
+		}
 		_ = b.WriteByte('[')
 		for i := 0; i < v.Len(); i++ {
 			if w.unsound {
@@ -935,6 +936,10 @@ func (w *valueWalker) write(v reflect.Value, depth int) {
 		}
 		_ = b.WriteByte(']')
 	case reflect.Map:
+		if v.IsNil() {
+			_, _ = b.WriteString("<nil-map>")
+			return
+		}
 		entries := make([]string, 0, v.Len())
 		iter := v.MapRange()
 		for iter.Next() {

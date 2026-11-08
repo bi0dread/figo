@@ -1096,8 +1096,9 @@ func (f *figo) parseDSLDepth(expr string, diags *[]error, loadDepth int) *Node {
 		default:
 			j := i
 			ff := -1
-			parenDepth := 0   // balance of '(' opened *within* this token (e.g. BETWEEN's "(10..20)")
-			bracketDepth := 0 // balance of '[' for list values (<in>[...], <nin>[...])
+			parenDepth := 0             // balance of '(' opened *within* this token (e.g. BETWEEN's "(10..20)")
+			bracketDepth := 0           // balance of '[' for list values (<in>[...], <nin>[...])
+			parenthesizedValue := false // only IN/NOT IN/BETWEEN own whitespace inside (...)
 			for j < len(expr) {
 
 				if expr[j] == '"' && ff == -1 {
@@ -1125,13 +1126,10 @@ func (f *figo) parseDSLDepth(expr string, diags *[]error, loadDepth int) *Node {
 					continue
 				}
 
-				// Whitespace and the closing quote only terminate the token outside a
-				// bracketed list value; inside one, "[1, 2, 3]" stays a single token.
-				if isDSLSpace(expr[j]) && ff == -1 && bracketDepth == 0 {
-					break
-				}
-
-				if isDSLSpace(expr[j]) && ff == 0 && bracketDepth == 0 {
+				// Lists and ranges own whitespace inside their delimiters. Other
+				// unquoted literals still end at whitespace, even if they contain
+				// a '(' character, so they cannot absorb a following condition.
+				if isDSLSpace(expr[j]) && bracketDepth == 0 && (!parenthesizedValue || parenDepth == 0) {
 					break
 				}
 
@@ -1177,6 +1175,12 @@ func (f *figo) parseDSLDepth(expr string, diags *[]error, loadDepth int) *Node {
 					// the NOT (and turning "or(" into an implicit AND).
 					if tok := expr[i:j]; tok == "not" || tok == "and" || tok == "or" {
 						break
+					}
+					if parenDepth == 0 && bracketDepth == 0 {
+						prefix := expr[i:j]
+						parenthesizedValue = strings.HasSuffix(prefix, string(OperationIn)) ||
+							strings.HasSuffix(prefix, string(OperationNotIn)) ||
+							strings.HasSuffix(prefix, string(OperationBetween))
 					}
 					parenDepth++
 					j++
@@ -2181,10 +2185,10 @@ func isAllDigits(s string) bool {
 	return true
 }
 
-// parseListLiteral parses a list literal like [1,2,"x"] or ["a,b","c"].
-// Parenthesized lists (<in>(1,2)) are accepted too — leaving the parens in
-// place corrupted the first and last element into "(1" and "2)".
-func parseListLiteral(raw string, diags *[]error) []any {
+// unwrapValueDelimiters removes one balanced outer pair from a list or range.
+// Malformed input stays available for best-effort parsing, with a destructive
+// diagnostic so callers cannot silently accept absorbed trailing conditions.
+func unwrapValueDelimiters(raw string, diags *[]error) string {
 	s := strings.TrimSpace(raw)
 	if len(s) > 0 && (s[0] == '[' || s[0] == '(') {
 		open, close := s[0], byte(']')
@@ -2214,11 +2218,18 @@ func parseListLiteral(raw string, diags *[]error) []any {
 		if end != len(s)-1 {
 			// Keep the best-effort value, but never silently accept a list
 			// that absorbed subsequent conditions into an unclosed delimiter.
-			addDiag(diags, "unbalanced list delimiters in %q (expected closing %q)", raw, close)
+			addDiag(diags, "unbalanced value delimiters in %q (expected closing %q)", raw, close)
 		} else {
 			s = s[1:end]
 		}
 	}
+	return s
+}
+
+// parseListLiteral parses a list literal like [1,2,"x"] or ["a,b","c"].
+// Parenthesized lists (<in>(1,2)) are accepted too.
+func parseListLiteral(raw string, diags *[]error) []any {
+	s := unwrapValueDelimiters(raw, diags)
 	if s == "" {
 		return nil
 	}
@@ -2330,10 +2341,10 @@ func getClausesFromOperation(o Operation, field string, value any, diags *[]erro
 		return NotInExpr{Field: field, Values: list()}
 	case OperationBetween:
 		s := strings.TrimSpace(fmt.Sprintf("%v", value))
-		// strip optional parentheses
-		if strings.HasPrefix(s, "(") && strings.HasSuffix(s, ")") {
-			s = strings.TrimPrefix(s, "(")
-			s = strings.TrimSuffix(s, ")")
+		// Validate optional parentheses before stripping them. An unclosed
+		// range can otherwise absorb the following filters into string bounds.
+		if strings.HasPrefix(s, "(") {
+			s = unwrapValueDelimiters(s, diags)
 		}
 		// The bound separator must be found OUTSIDE quotes: a quoted low bound
 		// containing ".." (code <bet> "a..b".."c") split inside the value.

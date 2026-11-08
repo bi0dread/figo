@@ -361,6 +361,11 @@ func (c *valueCopier) copyAt(v any, depth int) any {
 }
 
 func (c *valueCopier) copyContainer(v any, rv reflect.Value, depth int) any {
+	// Preserve typed nil containers before the fast paths allocate a copy.
+	// A nil []byte binds SQL NULL; an allocated empty []byte binds an empty blob.
+	if (rv.Kind() == reflect.Slice || rv.Kind() == reflect.Map) && rv.IsNil() {
+		return v
+	}
 	switch t := v.(type) {
 	case []byte:
 		cp := make([]byte, len(t))
@@ -382,18 +387,12 @@ func (c *valueCopier) copyContainer(v any, rv reflect.Value, depth int) any {
 
 	switch rv.Kind() {
 	case reflect.Slice:
-		if rv.IsNil() {
-			return v // preserve nil-ness; a nil slice has nothing to share
-		}
 		cp := reflect.MakeSlice(rv.Type(), rv.Len(), rv.Len())
 		for i := 0; i < rv.Len(); i++ {
 			c.setCopied(cp.Index(i), rv.Index(i), depth)
 		}
 		return cp.Interface()
 	case reflect.Map:
-		if rv.IsNil() {
-			return v
-		}
 		cp := reflect.MakeMapWithSize(rv.Type(), rv.Len())
 		iter := rv.MapRange()
 		for iter.Next() {
