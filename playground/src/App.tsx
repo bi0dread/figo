@@ -1,4 +1,4 @@
-import { useCallback, useMemo, useRef } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   Background,
   BackgroundVariant,
@@ -19,6 +19,8 @@ import { edgeTypes } from './edges'
 import { Palette, type PaletteItem } from './Palette'
 import { DslPanel } from './DslPanel'
 import { generateDsl, type AppNode } from './dsl'
+import { DataPreview } from './DataPreview'
+import { sampleGraph } from './samples'
 
 type Kind = 'expr' | 'sort' | 'page' | 'load'
 
@@ -235,7 +237,9 @@ function defaultData(item: PaletteItem): Record<string, any> {
 function Flow() {
   const [nodes, setNodes, onNodesChange] = useNodesState<AppNode>(presetNodes())
   const [edges, setEdges, onEdgesChange] = useEdgesState<Edge>(presetEdges())
-  const { screenToFlowPosition, getNode } = useReactFlow()
+  const { screenToFlowPosition, getNode, fitView } = useReactFlow()
+  const [sampleId, setSampleId] = useState('complex')
+  const [sampleRevision, setSampleRevision] = useState(0)
   const wrapRef = useRef<HTMLDivElement>(null)
   const nodeSeq = useRef(0)
 
@@ -344,10 +348,18 @@ function Flow() {
     [addNode, screenToFlowPosition],
   )
 
-  const loadExample = useCallback(() => {
-    setNodes(presetNodes())
-    setEdges(presetEdges())
+  const loadSample = useCallback((id: string) => {
+    const graph = id === 'complex' ? { nodes: presetNodes(), edges: presetEdges() } : sampleGraph(id)
+    setNodes(graph.nodes)
+    setEdges(graph.edges)
+    setSampleId(id)
+    setSampleRevision((revision) => revision + 1)
   }, [setNodes, setEdges])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => { void fitView({ padding: 0.16, maxZoom: 1 }) }, 50)
+    return () => window.clearTimeout(timer)
+  }, [sampleRevision, fitView])
 
   const clearAll = useCallback(() => {
     setNodes((nds) => nds.filter((n) => n.type === 'root'))
@@ -355,12 +367,14 @@ function Flow() {
   }, [setNodes, setEdges])
 
   return (
+    <>
     <div className="app">
       <header className="topbar">
         <span className="brand">🧩 figo playground</span>
         <span className="tagline">drag figo operations, wire them up, read the DSL</span>
         <span className="spacer" />
-        <button onClick={loadExample}>Example</button>
+        <a href="#live-data">Live data ↓</a>
+        <button onClick={() => loadSample('complex')}>Example</button>
         <button onClick={clearAll}>Clear</button>
         <a href="https://github.com/bi0dread/figo" target="_blank" rel="noreferrer">
           GitHub ↗
@@ -396,6 +410,8 @@ function Flow() {
       </div>
       <DslPanel result={result} />
     </div>
+    <DataPreview dsl={result.dsl} sampleId={sampleId} revision={sampleRevision} onSample={loadSample} />
+    </>
   )
 }
 

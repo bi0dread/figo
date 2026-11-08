@@ -48,6 +48,8 @@ jobs:
       - run: npm ci
       # Same build the deploy runs: tsc --noEmit && vite build.
       - run: npm run build
+      - name: Live data preview regression
+        run: npm run test:preview
       # DSL-emitter regression checks (hunt #7). Compiled with the tsc that is
       # already a devDependency so no test runner has to be added; the script
       # throws on a failed check, which fails the step.

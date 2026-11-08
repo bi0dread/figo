@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite",
     "build": "tsc --noEmit && vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "test:preview": "tsc src/preview.test.ts --outDir node_modules/.cache/preview-tests --target es2022 --module esnext --moduleResolution bundler --skipLibCheck && node node_modules/.cache/preview-tests/preview.test.js"
   },
   "dependencies": {
     "@xyflow/react": "^12.8.2",
