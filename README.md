@@ -1,1115 +1,278 @@
-# figo — Go Dynamic Query Builder (v4)
+# figo
 
-figo turns a compact, database-agnostic filter DSL into concrete queries for **GORM**, **raw SQL** (MySQL / PostgreSQL / SQLite dialects), **MongoDB**, and **Elasticsearch**. You parse one filter string (typically straight from an HTTP query parameter) into an internal expression AST, then let an adapter render it for whichever backend you target.
+Build GORM, SQL, MongoDB, and Elasticsearch queries from a filter string:
 
-The core stays deliberately small — parse, build, render. Everything policy-shaped is an opt-in **plugin**: syntax validation & repair, field whitelisting, complexity limits, value validation, mandatory scopes (multi-tenant), caching, metrics, and audit logging.
-
-```
-"status=active and age<bet>(18..65) sort=created_at:desc page=skip:0,take:20"
-        │
-        ▼   parse → AST → adapter
-  GORM │ Raw SQL │ MongoDB │ Elasticsearch
+```text
+status="active" and age>=18 sort=age:desc page=skip:0,take:20
 ```
 
-- **Package:** `github.com/bi0dread/figo/v4`
-- **Go:** 1.23+
+**Go 1.23+ · v4 · BSD 2-Clause**
 
-## Installation
+[Quick start](#quick-start) · [DSL](#dsl) · [Adapters](#adapters) · [Plugins](#plugins) · [Programmatic filters](#programmatic-filters) · [Development](#development)
 
-```bash
+## Install
+
+```sh
 go get github.com/bi0dread/figo/v4
 ```
 
-The adapters and the built-in plugins live in subpackages:
-
-```go
-import (
-	figo "github.com/bi0dread/figo/v4"          // core: parse, build, render, plugin SPI
-	"github.com/bi0dread/figo/v4/adapters"      // RawAdapter, GormAdapter, MongoAdapter, ElasticsearchAdapter
-	"github.com/bi0dread/figo/v4/plugins"       // the eight built-in plugins
-)
-```
-
-## Design highlights
-
-- **Small core, explicit subpackages.** The root package is just parse → build → render plus the plugin SPI; the four adapters and the eight built-in plugins live in the `adapters` and `plugins` subpackages. Custom adapters and plugins build on the same exported interfaces (`Adapter`, `Query` with its exported `IsQuery()` marker, `Plugin`, `ExprFilter`, `ClauseFinalizer`), so third-party backends and policies are first-class.
-
-- **The adapter belongs to the render step, not construction.** `figo.New()` takes no arguments; pass the adapter to `Build(adapter)` (or set it earlier with `SetAdapterObject`). One parsed instance can be rebuilt against different backends; `Build(nil)` rebuilds in place with the adapter already set.
-
-  ```go
-  f := figo.New()
-  f.AddFiltersFromString(`status="active"`)
-  f.Build(adapters.GormAdapter{})
-  ```
-
-- **Policy is opt-in, per instance.** Nothing polices your queries until you register the plugin for it — `f.RegisterPlugin(plugins.NewFieldsPlugin())` and friends. Field ignore-lists/whitelists (`FieldsPlugin`), complexity limits (`LimitsPlugin`), value validation (`ValidationPlugin`), strict syntax checking or repair (`SyntaxPlugin`), mandatory multi-tenant scopes (`ScopePlugin`), identifier screening (`InjectionGuardPlugin`), caching (`CachePlugin`), metrics (`MetricsPlugin`), and audit logging (`AuditPlugin`) are all plugins; without registration, no pruning or enforcement happens. Each has a dedicated section below.
-
-- **Plugin hooks fire automatically, in registration order.** `BeforeQuery`/`AfterQuery` wrap every `GetSqlString`/`GetQuery` render (a hook error vetoes the render), `ExprFilter` prunes DSL and programmatic filters alike, and `FinalizeClauses` runs on every `Build` — the mechanism behind mandatory scopes. Within each hook, plugins run in the order they were registered.
-
-- **Dialect-aware raw SQL.** `RawAdapter{Dialect: adapters.PostgresDialect}` renders `"col"` identifiers, `$1..$N` placeholders, and the `~` regex operator; `adapters.SQLiteDialect` renders `"col"` with `?`; the zero value renders MySQL (backticks, `?`, `REGEXP`). String-literal escaping is per-dialect too (backslash doubling only on MySQL). The GORM adapter's regex operator is configured separately via `SetRegexSQLOperator`.
-
-- **Naming is one function.** Every field name passes through a single `NamingFunc`: `figo.SnakeCaseNaming` by default (leading underscores preserved, so `_id` stays `_id`), `figo.NoChangeNaming` to keep DSL names as written, or your own via `SetNamingFunc`. `figo.ParseValue` is the package-level literal typer the DSL uses for values.
-
-- **Fail-loud rendering.** An expression an adapter can't render is an error, never a silently dropped condition (which would return too many rows — or on a search index, everything). Identifiers are hardened against SQL injection (the MongoDB adapter likewise rejects `$`-prefixed field names, which would execute as operators), rendered SQL is deterministic, and empty `<in>` sets and empty `or` groups can't bypass filters — both render as match-nothing on every adapter.
-
-## Table of contents
-
-- [Core concept: parse once, render per adapter](#core-concept-parse-once-render-per-adapter)
-- [Quick start](#quick-start)
-- [The DSL](#the-dsl)
-  - [Comparison operators](#comparison-operators)
-  - [Pattern matching (LIKE / regex)](#pattern-matching-like--regex)
-  - [Set, range, and null operators](#set-range-and-null-operators)
-  - [Logical operators and precedence](#logical-operators-and-precedence)
-  - [Directives: sort, page, load](#directives-sort-page-load)
-  - [Value typing rules](#value-typing-rules)
-- [Building filters programmatically (`AddFilter`)](#building-filters-programmatically-addfilter)
-- [Adapters](#adapters)
-  - [GORM](#gorm-adapter)
-  - [Raw SQL](#raw-sql-adapter)
-  - [MongoDB](#mongodb-adapter)
-  - [Elasticsearch](#elasticsearch-adapter)
-  - [Writing your own adapter](#writing-your-own-adapter)
-- [The `Figo` API](#the-figo-api)
-- [Field safety: ignore lists & whitelist](#field-safety-ignore-lists--whitelist)
-- [Query complexity limits](#query-complexity-limits)
-- [Mandatory scopes (multi-tenant)](#mandatory-scopes-multi-tenant)
-- [Auditing](#auditing)
-- [Naming](#naming)
-- [Inspecting & transforming the AST](#inspecting--transforming-the-ast)
-- [Caching](#caching)
-- [Performance monitoring](#performance-monitoring)
-- [Plugins](#plugins)
-- [Validation](#validation)
-- [Input validation & repair](#input-validation--repair)
-- [Concurrency](#concurrency)
-- [Testing](#testing)
-- [Status of features](#status-of-features)
-- [License](#license)
-
-## Core concept: parse once, render per adapter
-
-A `Figo` instance is a mutable filter builder. The lifecycle is always:
-
-1. **`figo.New()`** — construct an instance (no adapter argument).
-2. **`AddFiltersFromString(dsl)`** — hand it a DSL string. This stores the DSL; it does **not** parse yet. Calling it again **replaces** the previous DSL.
-3. **`Build(adapter)`** — parse the DSL into an AST and select the adapter. `Build` is idempotent: calling it again rebuilds cleanly (clauses, preloads, and sort are reset from the DSL each time). Malformed constructs are skipped, never fatal; **`BuildE(adapter)`** is the same operation but returns an error describing everything the parser had to drop (unrecognized tokens, invalid operator values, malformed `sort=`/`page=`/`load=` directives). For user-supplied DSL, prefer `BuildE` and treat a non-nil error as a rejection — the built query does not express all of the input.
-4. **`GetSqlString` / `GetQuery`** (or an adapter helper like `BuildRawSelect`) — render the query.
-
-```go
-f := figo.New()
-f.AddFiltersFromString(`status="active" and age>18`)
-if err := f.BuildE(adapters.RawAdapter{}); err != nil {
-    // some of the DSL didn't parse — reject rather than run a broader query
-}
-
-where, args, err := adapters.BuildRawWhere(f)
-// where: "(`status` = ? AND `age` > ?)"
-// args:  []any{"active", int64(18)}
-```
-
-> **Note:** `New()` takes no adapter. Supply it at `Build(adapter)` or via `SetAdapterObject(adapter)`. `Build` takes exactly one adapter; pass `Build(nil)` to rebuild against whatever adapter was set previously (by an earlier `Build` or `SetAdapterObject`).
-
-**Defaults set by `New()`:** pagination starts at `skip:0, take:0` — `take:0` means *no limit*, so a query with no `page=` directive returns every matching row. Nothing caps a result set on your behalf; use `page=` in the DSL or `SetPage(skip, take)` when you want a page. Naming defaults to snake_case (`figo.SnakeCaseNaming`).
+Use `figo` for the builder, `figo/adapters` for backend output, and `figo/plugins` for optional policies.
 
 ## Quick start
 
-### GORM
+This example generates parameterized PostgreSQL without a database connection:
 
 ```go
 package main
 
 import (
 	"fmt"
+	"log"
 
 	figo "github.com/bi0dread/figo/v4"
 	"github.com/bi0dread/figo/v4/adapters"
-	"gorm.io/driver/sqlite"
-	"gorm.io/gorm"
 )
 
-type User struct {
-	ID     uint
-	Name   string
-	Age    int
-	Status string
-}
-
 func main() {
-	db, _ := gorm.Open(sqlite.Open("test.db"), &gorm.Config{})
-	_ = db.AutoMigrate(&User{})
-
 	f := figo.New()
-	f.AddFiltersFromString(`status="active" and age>=18 sort=age:desc page=skip:0,take:20`)
-	f.Build(adapters.GormAdapter{})
+	if err := f.AddFiltersFromString(`status="active" and age>=18 sort=age:desc page=skip:0,take:20`); err != nil {
+		log.Fatal(err)
+	}
+	if err := f.BuildE(adapters.RawAdapter{Dialect: adapters.PostgresDialect}); err != nil {
+		log.Fatal(err)
+	}
 
-	// Apply figo's filters, sort, and pagination onto a *gorm.DB and execute.
-	var users []User
-	adapters.ApplyGorm(f, db.Model(&User{})).Find(&users)
-
-	fmt.Println(users)
+	query, args, err := adapters.BuildRawSelect(f, "users", "id", "name")
+	if err != nil {
+		log.Fatal(err)
+	}
+	fmt.Println(query)
+	fmt.Println(args)
 }
 ```
 
-## The DSL
-
-A filter is a sequence of space-separated tokens: `field<operator>value` terms, the bare keywords `and` / `or` / `not`, parentheses for grouping, and the `sort=` / `page=` / `load=` directives. Whitespace (spaces, tabs, newlines) separates tokens; put a value in double quotes to keep whitespace or operator characters literal.
-
-```
-name="John Doe" and (age>18 or vip=true) and status<nin>["banned","deleted"]
+```text
+SELECT "id", "name" FROM "users" WHERE ("status" = $1 AND "age" >= $2) ORDER BY "age" DESC LIMIT 20
+[active 18]
 ```
 
-### Comparison operators
+Execute the query with its arguments through your database driver. Use `GetSqlString` on SQL adapters for display or logging; use bound parameters for execution.
 
-| Op | DSL | Meaning |
-|----|-----|---------|
-| `=` | `id=10` | Equals |
-| `!=` | `status!="deleted"` | Not equal |
-| `>` | `age>18` | Greater than |
-| `>=` | `score>=80` | Greater than or equal |
-| `<` | `price<100` | Less than |
-| `<=` | `count<=5` | Less than or equal |
+The workflow is **configure → add filters → build → render**:
 
-### Pattern matching (LIKE / regex)
+- `AddFiltersFromString` replaces the stored DSL and runs parse hooks. Check its error.
+- `BuildE(adapter)` parses the DSL and applies build policies. Reject a non-nil error for user input: the partial query may omit a requested condition. `Build` discards these diagnostics.
+- Render through an adapter helper and check its error too. Parse success does not guarantee that a backend supports the query.
 
-| Op | DSL | Meaning |
-|----|-----|---------|
-| `=^` | `name=^"%john%"` | LIKE (`%` = any run, `_` = one char) |
-| `!=^` | `name!=^"%admin%"` | NOT LIKE |
-| `.=^` | `name.=^"%john%"` | Case-insensitive LIKE (ILIKE) |
-| `=~` | `email=~"^[a-z]+@x\.com$"` | Regex match |
-| `!=~` | `phone!=~"^\+1"` | Regex not match |
+`figo.New()` takes no adapter. `BuildE(nil)` rebuilds with the current adapter. Use a fresh builder per request; concurrent rendering is supported after you finish configuring and building it.
 
-> **`=~` on MongoDB is screened.** Mongo evaluates `$regex` with PCRE2, which backtracks, while the pattern is validated with Go's RE2, which does not — so RE2 accepts `^(a+)+$` happily and Mongo then spends seconds on it. figo therefore refuses a DSL-supplied pattern longer than 512 bytes, or one whose shape is catastrophic: an unbounded quantifier (`*`, `+`, `{n,}`) applied to a group that itself contains an unbounded quantifier (`(a+)+`), a variable-length repetition (`(a?a?)*`, `(a{1,2})*`), or an *ambiguous* alternation — one whose branches can start with the same character (`(a|ab)*`). `(foo|bar)+` is fine. Refusal is a render error on that adapter, so the same DSL still renders on raw, GORM and Elasticsearch. This is a shape bound, not a cost bound: it refuses the known catastrophic constructions, not every expensive pattern.
+## DSL
 
-Per-backend translation of `=^`:
+Combine conditions with `and`, `or`, `not`, and parentheses:
 
-| Backend | Output |
-|---------|--------|
-| Raw SQL / GORM | `col LIKE ?` (arg `%john%`) |
-| MongoDB | anchored, metachar-escaped regex `\A.*john.*\z` |
-| Elasticsearch | `wildcard` query `*john*` (literal `*`/`?` in the value are escaped) |
-
-### Set, range, and null operators
-
-| Op | DSL | Meaning |
-|----|-----|---------|
-| `<in>` | `id<in>[1,2,3]` | Value in list |
-| `<nin>` | `status<nin>["a","b"]` | Value not in list |
-| `<bet>` | `price<bet>(10..100)` | Inclusive range |
-| `<null>` | `deleted_at<null>` | IS NULL |
-| `<notnull>` | `updated_at<notnull>` | IS NOT NULL |
-
-`x=null` and `x!=null` are shorthand for `<null>` / `<notnull>` — an unquoted `null` value becomes IS NULL / IS NOT NULL rather than a comparison against a literal.
-
-An **empty** `<in>[]` list is safe on every adapter: it renders a match-nothing predicate (SQL `1=0`, ES `match_none`, Mongo `$in: []`) instead of dropping the condition. Empty `<nin>[]` matches everything. A blank list part — a leading, trailing or doubled comma — is skipped rather than becoming an empty-string member, so `<in>[1,,2]` has two members and `<in>[,]` has none (i.e. it behaves as `<in>[]`).
-
-> **`<bet>` needs BOTH bounds.** A half-open range is rejected, and a rejected
-> predicate is **dropped from the clause tree** — so `price<bet>(10..)`,
-> `price<bet>(..100)` and the malformed `price<bet>(1...5)` do not filter at all
-> and the query returns every row. `Build()` is silent about it by design;
-> `BuildE()` reports it. If a filter's bounds come from user input, either
-> validate them yourself or use `BuildE` and refuse the request — do not assume a
-> missing bound degrades to an open-ended range, because it does not.
-
-### Logical operators and precedence
-
-`and`, `or`, `not` combine terms. Precedence, highest to lowest:
-
-1. `not`
-2. `and`
-3. `or`
-
-```go
-f.AddFiltersFromString(`a=1 and b=2 or c=3`)
-// (a=1 AND b=2) OR c=3
-
-f.AddFiltersFromString(`not deleted=true and active=true`)
-// (NOT deleted=true) AND active=true
-
-f.AddFiltersFromString(`(a=1 or a=2) and (b=3 or b=4)`)
-// parentheses override precedence
+```text
+name="John Doe" and (age>=18 or vip=true) and status<nin>["banned","deleted"]
 ```
 
-Two terms written next to each other with no connector are joined by an
-**implicit `and` with exactly the same precedence as a written `and`**:
-`a=1 b=2 or c=3` builds `(a=1 AND b=2) OR c=3`, identical to
-`a=1 and b=2 or c=3`.
+Precedence is `not` → `and` → `or`. Adjacent conditions imply `and`.
 
-**`not` semantics are uniform across adapters:** `not` over multiple operands means *none of them match* — `NOT (a OR b)` in SQL, `$nor` in MongoDB, `must_not` over all operands in Elasticsearch, `clause.Not` in GORM. The DSL only ever produces single-operand `not`; multi-operand forms come from building the AST directly with `AddFilter`.
+| Operation | Syntax | Example |
+|---|---|---|
+| Equal / not equal | `=` / `!=` | `status="active"` |
+| Compare | `>` / `>=` / `<` / `<=` | `age>=18` |
+| In / not in | `<in>` / `<nin>` | `id<in>[1,2,3]` |
+| Inclusive range | `<bet>` | `price<bet>(10..100)` |
+| Null / not null | `<null>` / `<notnull>` | `deleted_at<null>` |
+| LIKE / NOT LIKE | `=^` / `!=^` | `name=^"%john%"` |
+| Case-insensitive LIKE | `.=^` | `name.=^"%john%"` |
+| Regex / negated regex | `=~` / `!=~` | `name=~"^Jo"` |
 
-A leading `not` (`not deleted=true`) is valid and preserved across all entry paths, including the repair path.
+LIKE uses `%` for any sequence and `_` for one character. Regex behavior depends on the backend. MongoDB screens some expensive patterns, but the screen does not bound execution cost; restrict public regex input and set database timeouts.
 
-### Directives: sort, page, load
+### Values
 
-| Directive | DSL | Effect |
-|-----------|-----|--------|
-| `sort=` | `sort=name:asc,created_at:desc` | Ordering (multiple columns, comma-separated) |
-| `page=` | `page=skip:10,take:5` | Pagination (skip/offset + take/limit) |
-| `load=` | `load=[Orders:total>100 \| Profile:bio=^"%dev%"]` | Preloads / joins with their own filters |
+Unquoted numbers, booleans, `null`, and recognized dates become typed Go values. Other unquoted values become strings. Double quotes preserve strings: `code="0123"`, `flag="true"`, `date="2026-11-08"`.
 
-`load=` segments are separated by `|`; each is `Relation:filter`, where `filter` is itself a DSL expression. `take:0` and `skip:0` mean "no limit"/"no offset" consistently across adapters (GORM will **not** emit `LIMIT 0`).
+- Use quotes for spaces or operator characters. The DSL has no escape syntax for an embedded double quote; pass such values through `AddFilter`.
+- `x=null` and `x!=null` mean null and not-null checks.
+- `<in>[]` matches nothing; `<nin>[]` matches everything. Blank list entries are skipped.
+- `<bet>` requires two compatible bounds. Use `>=` or `<=` for an open-ended range.
+- Use ISO dates to avoid ambiguous slash formats. `figo.ParseValue` exposes the same literal conversion.
 
-Field names that merely *start* with a directive keyword (`sortOrder`, `pageCount`, `loadedAt`) are treated as ordinary fields — the `=` after the keyword is required for it to be a directive.
+### Sort, page, and preload
 
-### Value typing rules
+| Directive | Example |
+|---|---|
+| Sort, in priority order | `sort=created_at:desc,id:asc` |
+| Offset and limit | `page=skip:20,take:10` |
+| Related records with their own filters | `load=[Orders:total>100]` |
+| Multiple relations | `load=[Orders:total>100 \| Profile:active=true]` |
 
-figo types each literal exactly once, and **quoting is how you keep a value a string**:
+**Pagination defaults to `skip:0,take:0`.** On SQL and MongoDB, a non-positive take means no limit. Enforce a maximum page size after `BuildE`; a client can override a limit you set before parsing. `LimitsPlugin` limits query complexity, not returned rows.
 
-| DSL | Parsed value | Go type |
-|-----|--------------|---------|
-| `id=123` | `123` | `int64` |
-| `price=9.99` | `9.99` | `float64` |
-| `active=true` | `true` | `bool` |
-| `x=null` | IS NULL predicate | — |
-| `created=2023-01-02` | `2023-01-02` parsed | `time.Time` |
-| `code="0123"` | `"0123"` | `string` (quoting preserves it) |
-| `flag="true"` | `"true"` | `string` |
-| `status=active` | `"active"` | `string` (unquoted, non-numeric) |
-| `id<in>[1,"2",3]` | `[1, "2", 3]` | `[]any` (per-element typing) |
-
-Consequences worth knowing:
-
-- **Quoted numeric-looking values stay strings** — `code="0123"` is `"0123"`, not `123`. Use this for zip codes, phone numbers, and IDs with leading zeros.
-- **Unquoted dates** in common formats (`2006-01-02`, RFC3339, `01/02/2006`, …) parse to `time.Time`. Date format detection tries US (`MM/DD/YYYY`) before EU (`DD/MM/YYYY`) for ambiguous slash dates.
-- **Integers larger than int64** are kept as strings rather than silently degrading to a lossy `float64`.
-
-The package-level `figo.ParseValue(str)` exposes this same single-value typing if you need it outside the DSL (e.g. to coerce one incoming parameter the way figo would):
-
-```go
-figo.ParseValue("123")        // int64(123)
-figo.ParseValue(`"123"`)      // "123" (quoted -> string)
-figo.ParseValue("true")       // true
-figo.ParseValue("2023-01-02") // time.Time
-```
-
-## Building filters programmatically (`AddFilter`)
-
-Sometimes you don't want to build a DSL string — you already have typed values (from a struct, a form, another query layer) and want to add conditions directly. `AddFilter(exp Expr)` appends a node to the AST, bypassing the parser. You can use it on its own or mix it with a DSL.
-
-```go
-f := figo.New()
-f.AddFilter(figo.EqExpr{Field: "status", Value: "active"})
-f.AddFilter(figo.BetweenExpr{Field: "age", Low: int64(18), High: int64(65)})
-f.Build(adapters.RawAdapter{})
-
-where, args, err := adapters.BuildRawWhere(f)
-// where: "`status` = ? AND `age` BETWEEN ? AND ?"
-// args:  []any{"active", int64(18), int64(65)}
-```
-
-Multiple `AddFilter` clauses are combined with **AND** at the top level.
-
-> **Pass field names in their ORIGINAL spelling — do not pre-convert them.**
-> `AddFilter` and `SetSort` run the field names they are given through the
-> instance's `NamingFunc`, once, on the way in, exactly as the DSL parser does.
-> With the default `SnakeCaseNaming`, `AddFilter(EqExpr{Field: "userName"})`
-> filters on `user_name`. Conversion is applied per `.`-separated segment, so a
-> qualified name stays qualified. Both built-in naming funcs are idempotent, so
-> pre-converting is harmless with them — but under a **non-idempotent** custom
-> `NamingFunc`, `AddFilter(EqExpr{Field: f.GetNamingFunc()("x")})` converts twice
-> and filters on a column that does not exist.
-
-### Expression types
-
-Every node implements the `figo.Expr` interface. Values are used as-is (no re-parsing), so pass real Go types.
-
-| Constructor | Fields | Renders as |
-|-------------|--------|------------|
-| `EqExpr` | `Field, Value any` | `field = ?` |
-| `NeqExpr` | `Field, Value any` | `field != ?` |
-| `GtExpr` / `GteExpr` | `Field, Value any` | `field > ?` / `>=` |
-| `LtExpr` / `LteExpr` | `Field, Value any` | `field < ?` / `<=` |
-| `LikeExpr` | `Field, Value any` | `field LIKE ?` |
-| `ILikeExpr` | `Field, Value any` | case-insensitive LIKE |
-| `RegexExpr` | `Field, Value any` | regex match |
-| `InExpr` | `Field string, Values []any` | `field IN (…)` |
-| `NotInExpr` | `Field string, Values []any` | `field NOT IN (…)` |
-| `BetweenExpr` | `Field string, Low, High any` | `field BETWEEN ? AND ?` |
-| `IsNullExpr` | `Field string` | `field IS NULL` |
-| `NotNullExpr` | `Field string` | `field IS NOT NULL` |
-| `AndExpr` | `Operands []Expr` | `(a AND b AND …)` |
-| `OrExpr` | `Operands []Expr` | `(a OR b OR …)` |
-| `NotExpr` | `Operands []Expr` | `NOT (a OR b …)` — none of the operands match |
-
-Nest the logical types to express any structure:
-
-```go
-// (role = "admin" OR role = "mod") AND NOT (banned = true)
-f.AddFilter(figo.AndExpr{Operands: []figo.Expr{
-	figo.OrExpr{Operands: []figo.Expr{
-		figo.EqExpr{Field: "role", Value: "admin"},
-		figo.EqExpr{Field: "role", Value: "mod"},
-	}},
-	figo.NotExpr{Operands: []figo.Expr{
-		figo.EqExpr{Field: "banned", Value: true},
-	}},
-}})
-```
-
-### Ordering matters: call `AddFilter` *after* `Build()`
-
-`Build()` recompiles the AST from the DSL and, when a DSL is present, **resets the clause list** first. So an `AddFilter` call made *before* `Build()` is discarded if there's also a DSL. Two safe patterns:
-
-```go
-// A) No DSL — AddFilter only. Build() with an empty DSL keeps your clauses.
-f := figo.New()
-f.AddFilter(figo.EqExpr{Field: "status", Value: "active"})
-f.Build(adapters.RawAdapter{})            // clauses preserved
-
-// B) DSL + programmatic — add AFTER Build so it isn't wiped.
-f := figo.New()
-f.AddFiltersFromString(`name="x"`)
-f.Build(adapters.RawAdapter{})
-f.AddFilter(figo.InExpr{Field: "role", Values: []any{"admin", "mod"}})
-where, _, _ := adapters.BuildRawWhere(f)  // "`name` = ? AND `role` IN (?,?)"
-```
-
-`AddFilter` clauses are still subject to a registered `FieldsPlugin`'s [ignore list and whitelist](#field-safety-ignore-lists--whitelist) — a disallowed or ignored field is pruned just as it would be from DSL input.
+Nested preload paths such as `Orders.Items` are disabled by default. Keep them disabled for untrusted queries that depend on tenant scopes: combining nested paths with field pruning can bypass an intermediate relation's scope. Parent scopes do not scope child records; see [Plugins](#plugins).
 
 ## Adapters
 
-The four adapters live in the `adapters` subpackage (`import "github.com/bi0dread/figo/v4/adapters"`). All consume the same AST. Pass one to `Build()` (or `SetAdapterObject`), then use `GetSqlString` / `GetQuery` or the adapter's package-level helpers.
+Pass one of these to `BuildE`:
 
-`GetQuery(ctx)` returns a backend-specific value (all implement the `figo.Query` interface); type-assert to the concrete type:
+| Backend | Adapter | Render or execute |
+|---|---|---|
+| MySQL | `adapters.RawAdapter{}` | `BuildRawSelect` / `BuildRawWhere` |
+| PostgreSQL | `adapters.RawAdapter{Dialect: adapters.PostgresDialect}` | Same helpers, `$1` placeholders |
+| SQLite | `adapters.RawAdapter{Dialect: adapters.SQLiteDialect}` | Same helpers, `?` placeholders |
+| GORM | `adapters.GormAdapter{}` | `ApplyGorm` |
+| MongoDB | `adapters.MongoAdapter{}` | `AdapterMongoGetFind` / `BuildMongoAggregatePipeline` |
+| Elasticsearch | `adapters.ElasticsearchAdapter{}` | `BuildElasticsearchQuery` |
 
-| Adapter | `ctx` argument | `GetQuery` returns | `GetSqlString` returns |
-|---------|----------------|--------------------|------------------------|
-| `RawAdapter{}` | table name `string` or `RawContext{Table}` | `SQLQuery{SQL, Args}` | SQL with literals interpolated (for display) |
-| `GormAdapter{}` | `*gorm.DB` | `SQLQuery{SQL, Args}` | SQL via GORM DryRun, literals interpolated |
-| `MongoAdapter{}` | `nil`, or `"AGG"` + joins for aggregation | `MongoFindQuery{Filter, Options}` / `MongoAggregateQuery{Pipeline, Options}` | `""` (no SQL form — use `GetQuery` or the `BuildMongo*` helpers) |
-| `ElasticsearchAdapter{}` | `nil` | `ElasticsearchQueryWrapper{Query}` | the query as compact JSON |
+### GORM
 
-Each adapter also has package-level helpers that skip the generic API: `AdapterRawGetSql`, `AdapterGormGetSql`, `AdapterMongoGetFind` / `AdapterMongoGetAggregate`, plus the `Build*` functions shown per adapter below.
-
-### GORM adapter
+After building with `GormAdapter`, apply the query to your model:
 
 ```go
-f := figo.New()
-f.AddFiltersFromString(`status="active" and age>=18 sort=age:desc page=skip:0,take:20`)
-f.Build(adapters.GormAdapter{})
-
-// Option A: apply onto a *gorm.DB and execute yourself
 var users []User
-adapters.ApplyGorm(f, db.Model(&User{})).Find(&users)
-
-// Option B: render the SQL string (DryRun) for logging/inspection
-sql := f.GetSqlString(db.Model(&User{}))           // full SELECT
-where := f.GetSqlString(db.Model(&User{}), "WHERE") // just the WHERE segment
-
-// Option C: get placeholder SQL + args
-q := f.GetQuery(db.Model(&User{})).(figo.SQLQuery)
-// q.SQL, q.Args
+if err := adapters.ApplyGorm(f, db.Model(&User{})).Find(&users).Error; err != nil {
+	return err
+}
 ```
 
-`ApplyGorm` sets limit/offset, select fields, preloads, where clauses, and sort. A `*gorm.DB` that already carries a caller scope (e.g. a tenant filter `db.Where("org_id = ?", id)`) keeps that scope — figo's filters are applied **on top of** it, not instead of it.
+`ApplyGorm` preserves caller filters and adds Figo's conditions, projection, sort, page, and preloads. Check the returned DB's `Error`. Use a fresh base handle when rebuilding a Figo instance; reusing a handle that already carries its applied state can retain stale filters.
 
-If the AST contains an expression the GORM adapter cannot render (the Mongo/ES-only advanced types, or a `CustomExpr` without a handler), `ApplyGorm` records the error on the `*gorm.DB` via `AddError` instead of silently dropping the condition — GORM's callbacks are guarded by `db.Error == nil`, so the widened query never executes and `Find(...).Error` reports the cause. `GetSqlString`/`GetQuery` fail the render the same way.
+### Raw SQL
 
-### Raw SQL adapter
+`BuildRawSelect(f, table, columns...)` returns SQL, arguments, and an error. `BuildRawWhere(f)` returns the condition fragment and arguments. `SetSelectFields` takes precedence over the helper's column arguments; no projection means `SELECT *`.
 
-Dialect-aware: the zero value targets MySQL (backtick identifiers, `?` placeholders, `REGEXP`); set `Dialect` for PostgreSQL (`"col"`, `$1..$N`, `~`) or SQLite (`"col"`, `?`, `REGEXP`).
+`load=` contributes nothing to the raw adapter's SELECT. Use `BuildRawPreloads(f)` to get each relation's `Where` and `Args`, then supply your own join keys or child queries.
+
+### MongoDB
+
+For a find query, get the filter and options together:
 
 ```go
-f := figo.New()
-f.AddFiltersFromString(`id=1 and name="test" sort=id:desc page=skip:0,take:20`)
-f.Build(adapters.RawAdapter{})                                 // MySQL (default)
-
-// PostgreSQL rendering:
-f.Build(adapters.RawAdapter{Dialect: adapters.PostgresDialect})
-q := f.GetQuery(adapters.RawContext{Table: "users"}).(figo.SQLQuery)
-// q.SQL: SELECT * FROM "users" WHERE ("id" = $1 AND "name" = $2) ORDER BY "id" DESC LIMIT 20
-
-// Custom variant (e.g. case-insensitive Postgres regex):
-pg := *adapters.PostgresDialect
-pg.RegexOperator = "~*"
-f.Build(adapters.RawAdapter{Dialect: &pg})
-
-f.Build(adapters.RawAdapter{})
-
-// Full SELECT
-sql, args, err := adapters.BuildRawSelect(f, "users")
-// sql:  "SELECT * FROM `users` WHERE (`id` = ? AND `name` = ?) ORDER BY `id` DESC LIMIT 20"
-// args: []any{int64(1), "test"}
-
-// Explicit column list (used when no AddSelectFields were set)
-sql, args, err = adapters.BuildRawSelect(f, "users", "id", "name")
-
-// Just the WHERE fragment
-where, whereArgs, err := adapters.BuildRawWhere(f)
-
-// Or via the generic API with a table name / RawContext
-sql = f.GetSqlString("users")
-sql = f.GetSqlString(adapters.RawContext{Table: "users"}, "SELECT", "FROM", "WHERE", "SORT")
-q := f.GetQuery(adapters.RawContext{Table: "users"}).(figo.SQLQuery) // q.SQL + q.Args
+filter, opts, err := adapters.AdapterMongoGetFind(f)
+if err != nil {
+	return err
+}
+// Pass filter and opts to collection.Find.
 ```
 
-With no `conditionType` arguments you get the full SELECT; otherwise only the named segments are emitted, in the order you list them. Recognized segment keywords (case-insensitive): `SELECT`, `FROM`, `JOIN`, `WHERE`, `ORDER BY` / `SORT`, `LIMIT`, `OFFSET`, `PAGE` (LIMIT + OFFSET together). A keyword outside that set fails the render (`ok=false`) rather than being ignored. `JOIN` and `GROUP BY` are recognized but emit **nothing** — they are accepted so existing callers that list them keep working; see the preload note below for `JOIN`.
-
-Identifiers are quote-escaped per dialect — embedded quote runes are doubled (values are always parameterized) — so field/table names can't break out of quoting. The `Build*` helpers (`BuildRawWhere`, `BuildRawSelect`, `BuildRawPreloads`) pick up the dialect from the instance's adapter, including `$N` numbering on Postgres. They return an error for any expression the raw adapter cannot render (e.g. the Mongo/ES-only advanced expression types) instead of silently dropping the condition; the `RawAdapter` methods likewise fail (`ok=false`) rather than emit SQL that omits a predicate.
-
-Two classes of identifier fail the render outright rather than being quoted into SQL the engine cannot parse — a field name, sort key, projection column or table name is rejected when it **contains a C0 control byte or DEL**, or when it is **empty or has an empty dot segment** (`""`, `"..."`, `"a..b"` and `".a"` under a naming func that preserves dots). Both used to emit unexecutable SQL with `ok=true`. Failing closed is the deliberate choice: falling back to `*` for a bad projection column would widen it past what the caller asked for.
-
-> `RawAdapter.GetSqlString` / `GetQuery` take the dialect from the **receiver**, so `RawAdapter{Dialect: adapters.PostgresDialect}.GetSqlString(f, ctx)` renders Postgres even if the instance's stored adapter says otherwise. The normal path — `f.GetSqlString(...)` dispatching to the stored adapter — is unaffected, since receiver and stored adapter are the same there. The package-level `Build*` helpers still read the instance and still fall back to MySQL when it holds no raw adapter.
-
-**`load=` contributes nothing to the raw adapter's SELECT.** It is not rendered as a `JOIN`, it does not appear in the `JOIN` segment, and its arguments are not in the statement's arg list. `BuildRawPreloads` is the *only* way to get at the relation predicates:
+For `load=[Orders:total>100]`, provide the relation mapping:
 
 ```go
-f.AddFiltersFromString(`id>0 load=[Orders:total>100]`)
-f.Build(adapters.RawAdapter{})
-
-sql, args, err := adapters.BuildRawSelect(f, "users")
-// sql:  "SELECT * FROM `users` WHERE `id` > ?"   <- no JOIN, no `total` predicate
-// args: []any{int64(0)}                          <- no preload args
-
-preloads, err := adapters.BuildRawPreloads(f)     // map[string]RawPreload
-// preloads["Orders"] == RawPreload{Where: "`total` > ?", Args: []any{int64(100)}}
-```
-
-Take the `Where`/`Args` from that map and build your own join or second query with it. This is the same separation GORM has (`Preload` issues a separate query) and it is deliberate: the raw adapter has no schema metadata, so it cannot know a relation's join key. Earlier versions did emit a `JOIN <relation> ON <preload filter>` — but with no `ON` key it was a cartesian product that changed the primary row set, so it was removed. If you relied on that JOIN, build it yourself from `BuildRawPreloads`.
-
-Two consequences worth knowing if you are upgrading: preload arguments no longer lead the arg list, so Postgres `$N` numbering of your `WHERE` shifts down accordingly; and a relation name is no longer rendered into SQL at all.
-
-### MongoDB adapter
-
-```go
-f := figo.New()
-f.AddFiltersFromString(`status="active" and age>=18 sort=age:desc page=skip:0,take:20`)
-f.Build(adapters.MongoAdapter{})
-
-// Filter + find options directly
-filter, err := adapters.BuildMongoFilter(f)   // bson.M
-opts := adapters.BuildMongoFindOptions(f)      // *options.FindOptions (sort/limit/skip)
-
-// Or via the generic API — returns MongoFindQuery
-q := f.GetQuery(nil).(adapters.MongoFindQuery) // q.Filter, q.Options
-
-// Aggregation pipeline with joins ($lookup) — pass "AGG" and a joins map
 joins := map[string]adapters.MongoJoin{
-	"orders": {From: "orders", LocalField: "_id", ForeignField: "user_id", As: "orders"},
+	"Orders": {From: "orders", LocalField: "_id", ForeignField: "user_id", As: "orders"},
 }
 pipeline, err := adapters.BuildMongoAggregatePipeline(f, joins)
-```
-
-The `joins` map is keyed by the **relation name exactly as it appears in
-`load=`**, and the match is case-sensitive: `load=[Orders:total>100]` needs the
-key `"Orders"`, not `"orders"`. A key that doesn't match leaves the generated
-`$lookup` without `localField`/`foreignField`, which MongoDB rejects at
-execution time.
-
-`$in`/`$nin` always receive a real array (never `null`), so empty-list filters don't error at the server.
-
-### Elasticsearch adapter
-
-```go
-f := figo.New()
-f.AddFiltersFromString(`name=^"%john%" and age>=18 sort=age:desc page=skip:0,take:20`)
-f.AddSelectFields("id", "name", "age")
-f.Build(adapters.ElasticsearchAdapter{})
-
-query, err := adapters.BuildElasticsearchQuery(f) // adapters.ElasticsearchQuery (Query/Sort/From/Size/Source)
-
-// Or via the generic API — returns ElasticsearchQueryWrapper.
-// This never fails and never returns nil: see the fail-closed note below.
-q := f.GetQuery(nil).(adapters.ElasticsearchQueryWrapper) // q.Query is the ElasticsearchQuery
-_ = q.GetSQL()  // the query as compact JSON (GetArgs() is nil — ES has no bind params)
-
-// JSON string forms
-jsonStr, err := adapters.GetElasticsearchQueryString(f)         // pretty
-compact, err := adapters.GetElasticsearchQueryStringCompact(f)  // compact
-
-// Fluent builder
-esq := adapters.NewElasticsearchQueryBuilder().
-	FromFigo(f).
-	AddSort("name", true).
-	SetPagination(0, 10).
-	SetSource("id", "name").
-	Build()
-
-// The builder can also emit JSON directly
-jsonStr, err = adapters.NewElasticsearchQueryBuilder().FromFigo(f).ToJSON()  // or ToJSONCompact()
-```
-
-`AddSelectFields` maps to `_source`, `page=` maps to `from`/`size`, `sort=` maps to the ES sort array. `ElasticsearchQuery` is JSON-ready (`Query`, `Sort`, `From`, `Size`, `Source` fields with the right tags), so you can marshal it straight into a search request body.
-
-#### How the ES adapter reports a query it cannot render
-
-This is the one adapter whose `(string, bool)` contract is not "false means it failed", and it matters, so it is spelled out:
-
-- `ElasticsearchAdapter.GetSqlString` / `GetQuery` — and therefore `f.GetSqlString(nil)` / `f.GetQuery(nil)` — return **`ok=true` with a fail-closed `{"query":{"match_none":{}}}` body** when the query cannot be rendered (a `load=` preload, an unsupported expression type, an unmarshalable value). They do not return `""`/`nil`. That is deliberate: an *empty* ES search body means `match_all`, so returning nothing would have widened the query to the whole index, and `figo.GetSqlString`/`GetQuery` discard the value whenever `ok=false`. Checking `if q == nil` or `if !ok` will therefore never fire.
-- The error is still fully observable, just on a different channel: **`BuildElasticsearchQuery`**, **`GetElasticsearchQueryString`** / **`GetElasticsearchQueryStringCompact`**, and the fluent builder's **`Err()`** / **`BuildE()`**. Use one of those if you need to distinguish "matches nothing" from "could not be rendered" — the JSON body alone cannot tell you, since `match_none` is also a legitimate rendering (an empty `<in>` set, a null range bound).
-- `f.BuildE(adapters.ElasticsearchAdapter{})` reports parse diagnostics, **not** adapter render errors — those surface only at render time, on the channels above.
-
-The fluent builder's `FromFigo` has no error return and defers it to `ToJSON`/`ToJSONCompact`/`Err()`; after a deferred error `Build()` returns a `match_none` query.
-
-### Cross-backend semantics: NULL rows and the ES size cap
-
-The adapters render the same AST, but the backends do not agree on what a
-missing value is. SQL uses three-valued logic: a row where the column is NULL
-makes `!=`, `<in>`, `<nin>`, and any `not (...)` predicate evaluate to
-UNKNOWN, so the raw and GORM adapters **exclude NULL rows** from all of those.
-MongoDB and Elasticsearch have no UNKNOWN:
-
-- `field != v` — Mongo's `$ne` and ES's `must_not term` **match** documents
-  where the field is null or missing; SQL excludes those rows.
-- `field <nin> [..]` — same divergence: `$nin` / negated `terms` match
-  null-or-missing documents, SQL's `NOT IN` never does.
-- `field <in> [.., null]` — a `null` in the list matches null-or-missing
-  documents on Mongo; on SQL, `IN (.., NULL)` can never match a NULL row.
-  Elasticsearch rejects a null inside a `terms` list outright (HTTP 400 for
-  the whole search), so the ES adapter normalizes it to the SQL reading before
-  it ever reaches the server: `<in>` (and the programmatic
-  `ArrayOverlapsExpr`) **drop** the nulls — `[1,null]` renders `terms:[1]`, and
-  an all-null list renders `match_none` — while `<nin>` and
-  `ArrayContainsExpr` **fail closed to `match_none`**, because dropping the
-  null there would widen the predicate: SQL's `x NOT IN (…,NULL)` is UNKNOWN
-  for every row and can never be true. Mongo's `$nin` keeps the null, so
-  `<nin>` with a null in the list is the one operator where Mongo and ES
-  disagree by design.
-- `not (...)` — Mongo's `$nor` and ES's `must_not` match documents where the
-  inner predicate is false *or* the field is absent; SQL's `NOT` still
-  excludes rows where the inner predicate involved a NULL.
-
-If NULL/missing rows matter to a negated filter, make the intent explicit with
-`<null>` / `<notnull>` instead of relying on negation.
-
-One more backend limit: Elasticsearch cannot express figo's `take:0`
-("no limit") — a request without `size` returns only 10 hits, and Elasticsearch
-validates **`from + size`** against `index.max_result_window` (default 10000),
-not `size` alone. So for `take:0` the ES adapter renders the largest size that
-still fits the window at the requested offset — `max_result_window - from`, not
-a flat 10000. Since `take:0` is also `New()`'s default, this is what a query
-that never mentions `page=` renders on ES:
-
-| `page=`                  | rendered                  |
-| ------------------------ | ------------------------- |
-| `skip:0,take:0`          | `"size": 10000`           |
-| `skip:5,take:0`          | `"from": 5, "size": 9995` |
-| `skip:9999,take:0`       | `"from": 9999, "size": 1` |
-
-An explicit `take:N` is passed through unchanged and is *not* clamped, so
-`skip:10000,take:20` renders as written and Elasticsearch will reject it — that
-is the server's rule to enforce, not figo's. An offset at or past the window
-cannot be expressed as a `take:0` query at all: there is no size that fits.
-Results beyond the window need `search_after` or a scroll, or a larger
-`index.max_result_window` on the index (the adapter assumes the default).
-
-Relatedly, the ES adapter has no preload path, so `load=` is a render error —
-see the fail-closed note above for which calls report it and which return
-`ok=true` with a `match_none` body.
-
-### Writing your own adapter
-
-An adapter is anything implementing the two-method `figo.Adapter` interface, so you can target another backend (or another SQL dialect) yourself:
-
-```go
-type Adapter interface {
-	GetSqlString(f Figo, ctx any, conditionType ...string) (string, bool)
-	GetQuery(f Figo, ctx any, conditionType ...string) (Query, bool)
+if err != nil {
+	return err
 }
+// Pass pipeline to collection.Aggregate.
 ```
 
-Walk `f.GetClauses()` / `f.GetPreloads()` (the `Expr` AST), honor `f.GetPage()`, `f.GetSort()`, and `f.GetSelectFields()`, and return a query value. `figo.Query` is a marker interface with an exported method, so your adapter can define its own typed result:
+Join-map keys must match the DSL relation label, including case. `BuildMongoAggregatePipeline` returns an error for missing mappings. Use scalar join keys, and keep lookup aliases separate from root fields used by mandatory scopes: a lookup can overwrite those fields before the scope runs.
 
-```go
-type MyQuery struct{ /* ... */ }
+The adapter converts valid 24-character hex strings on `_id` to ObjectIDs. Configure other fields with `MongoAdapter{ObjectIDFields: []string{"_id", "user_id"}}`; an explicit empty slice disables conversion.
 
-func (MyQuery) IsQuery() {}
-```
+### Elasticsearch
 
-(`figo.SQLQuery` fits most custom SQL dialects if you'd rather reuse it.) The core exposes the AST utilities adapters and filters need — `figo.ExprField`, `figo.PruneExprFields`, `figo.CloneExpr`, `figo.NodeField`/`figo.SetNodeField` — and the `adapters` package is itself the reference implementation. Pass an instance to `Build(myAdapter)` and the generic `GetSqlString` / `GetQuery` API routes through it.
+`BuildElasticsearchQuery` returns a JSON-ready query and an error. `SetSelectFields` controls `_source`; sorting and pagination map to `sort`, `from`, and `size`. Use `GetElasticsearchQueryString` or `GetElasticsearchQueryStringCompact` for JSON output.
 
-## The `Figo` API
+On adapter render errors, `ElasticsearchAdapter.GetQuery` / `GetSqlString` return `match_none` with `ok=true`. Checking `if q == nil` or `if !ok` will therefore never fire. Use `BuildElasticsearchQuery` to detect these errors; query-hook vetoes through `f.GetQuery` / `f.GetSqlString` can still return nil or an empty string.
 
-`figo.New()` returns the `Figo` interface. The most commonly used methods:
+For `take:0`, the adapter uses `max(0, max_result_window - from)`, assuming a 10,000-result window. Explicit positive limits pass through unchanged. Keep pagination within that window; deeper pagination needs a separate `search_after` or scroll implementation.
 
-**Filters & building**
+### Backend differences
 
-```go
-AddFiltersFromString(dsl string) error
-AddFilter(exp Expr)                 // add a programmatic AST node
-Build(adapter Adapter)              // pass nil to rebuild with the current adapter
-BuildE(adapter Adapter) error       // Build + an error for everything the parser dropped
-GetClauses() []Expr
-GetPreloads() map[string][]Expr
-GetDSL() string
-```
-
-**Rendering**
-
-```go
-GetSqlString(ctx any, conditionType ...string) string
-GetQuery(ctx any, conditionType ...string) Query
-```
-
-Cached rendering lives on the `CachePlugin` (see [Caching](#caching)): `cp.GetCachedSqlString(f, ctx)` / `cp.GetCachedQuery(f, ctx)`.
-
-`GetQuery` gives placeholder SQL + args for execution; `GetSqlString` on the SQL adapters interpolates literals, making it the display/logging form. For a view of the parsed AST itself, use `Explain()`.
-
-**Pagination & sorting**
-
-```go
-SetPage(skip, take int)
-SetPageString(v string)             // "skip:10,take:5"
-SetPageStringE(v string) error      // same, but reports malformed/ignored segments (valid ones still apply)
-GetPage() Page                      // returns a copy — use SetPage to change it
-SetSort(sort *OrderBy)              // nil clears; copied in
-GetSort() *OrderBy                  // returns a copy
-```
-
-> A page or sort set through `SetPage`/`SetSort` belongs to the caller and survives `Build`. A `page=`/`sort=` directive in the DSL still wins, and a value that came *from* a directive is cleared when the DSL is replaced.
-
-**Adapter & inspection**
-
-```go
-SetAdapterObject(adapter Adapter)
-GetAdapterObject() Adapter
-Explain() string                    // human-readable AST tree
-Clone() Figo                        // deep copy
-Walk(visit func(Expr))              // traverse/mutate the AST
-```
-
-**Plugins**
-
-```go
-RegisterPlugin(plugin Plugin) error // Initialize is called; rolled back if it errors
-UnregisterPlugin(name string) error
-SetPluginManager(m *PluginManager)
-GetPluginManager() *PluginManager   // never nil; empty when no plugin was registered
-```
-
-> `GetPluginManager()` **always returns a usable manager and never returns
-> `nil`** — on a fresh instance, on a `Clone()` of one, and even after
-> `SetPluginManager(nil)`. An instance that has never registered a plugin gets an
-> empty manager, so `ListPlugins()`, `GetPlugin(name)` and the `Execute*` helpers
-> are all safe to call without a nil check.
->
-> Because of that, `f.GetPluginManager() == nil` is **not** a test for "this
-> instance has no plugins" — it is never true. Use `len(f.GetPluginManager().ListPlugins()) > 0`,
-> or `_, ok := f.GetPluginManager().GetPlugin("cache")` for a specific one.
-
-**Field & select control** — `AddSelectFields(...)` (widens the projection) / `SetSelectFields(...)` (replaces it; no arguments restores `SELECT *`) / `GetSelectFields()` (`map[string]bool`), `SetNamingFunc(fn)` / `GetNamingFunc()`. Ignore/whitelist state lives on the `FieldsPlugin`, complexity limits on the `LimitsPlugin`.
-
-> `GetPage()` returns a **copy** of the page. Mutating it has no effect — call `SetPage(skip, take)` to change pagination.
-
-## Rejecting nonsense identifiers (injection guard)
-
-`InjectionGuardPlugin` screens every **column identifier** a query is about to address and rejects the request — failing closed — when one of them is not a name a column can have.
-
-It exists because of a real report. The DSL
-
-```
-page=skip:0,take:50 and sort=median_price:desc or 1=1
-```
-
-built `WHERE `1` = ?` — a filter whose field is the literal `1`. A `page=`/`sort=`/`load=` directive is consumed as a statement and its connector is discarded, so the `or` vanished and `1=1` became the whole top-level filter. `AddFiltersFromString` returned `nil`, `BuildE` returned `nil` and `Explain()` printed `1 = 1`, so the service had no signal at all: it ran the query, the engine refused it, and the driver error — which quotes the entire statement — came back to the caller as schema disclosure.
-
-**This is not SQL injection.** Values are bound (`?`/`$n`) and identifiers are quote-doubled by every adapter, so `1=1` reaches the engine as one quoted identifier and cannot break out of it. The defect is that an invented identifier reached the database at all, with no way to reject the request.
-
-```go
-g := plugins.NewInjectionGuardPlugin()
-g.AllowFields("median_price", "city", "title") // optional, and the part that stops probing
-f.RegisterPlugin(g)
-
-if err := f.AddFiltersFromString(userDSL); err != nil {
-    return c.Status(400).JSON(fiber.Map{"error": "invalid filters"})
-}
-// figo-injection-guard: rejected 1 identifier(s): filter field "1": segment "1"
-// is only digits, which names no column
-```
-
-Check *that* error — it is the only signal. figo keeps a plugin's parse-hook error on the `AddFiltersFromString` call that produced it, so a later `BuildE` returns `nil` for a query this plugin has refused; a caller validating only through `BuildE` sees nothing and simply gets a query that matches nothing. `Rejected(f)` answers after the fact if that suits your call shape better.
-
-**What it screens** — every identifier position untrusted DSL can reach: filter fields, sort keys, preload relation names, preload conditions and the select-field set. A column must be one to four dot-separated segments of at most 64 characters, made of letters, digits, `_` and `$`, with **no segment composed solely of digits** — the reported bug's exact shape. That last clause is the load-bearing one; a leading digit on its own is fine, because MySQL allows `2fa_enabled`. The rule is deliberately narrower than "what an adapter can quote": every adapter can quote `1`, `x--`, `x;drop` and a backtick and render them inert, and every one of them is still a name no column has.
-
-Names are screened in the spelling that will be **rendered**, i.e. after the naming func. That matters for select fields, the one position figo converts at render time rather than on the way in — screening the stored spelling both missed a name that only becomes hostile after conversion and refused `first-name`, which figo's own default naming func is documented to accept and which renders as `first_name`.
-
-Beyond the reported case this also catches `price<>500` — `<>` is not a figo operator, so the field silently absorbs `<` and the operator becomes `>` — along with `x--=1`, `` `x`=1 ``, `sort=1:desc`, `` load=[Rel`x:id=1] `` and identifiers carrying zero-width or bidi characters.
-
-Field names on Mongo and Elasticsearch are not SQL columns and legitimately break this rule. One line relaxes it for them, and the escape hatch cannot switch the screen off — a quote rune, `;` or a control byte stays refused however it is configured:
-
-```go
-g.AllowExtraRunes("-@").AllowNumericSegments(true).SetMaxSegments(8) // @timestamp, user-agent, meta.tags.0
-```
-
-**It fails closed, and that is load bearing.** A caller that ignores the error gets `1=0` (raw/GORM), `{"$nor":[{}]}` (Mongo) or `match_none` (Elasticsearch) — never a wider query. Hostile `ORDER BY` and `SELECT` entries are stripped from the same render, since reaching the engine at all is what leaked the schema, and a SELECT list is resolved before any row is filtered.
-
-That half is not the plugin's doing: **figo keeps a rejected query closed itself** (see [rejection narrows](#a-rejection-narrows)), which is the only place it can be done safely. Every route a plugin can reach turned out to be prunable or escapable, and each hole turned a refusal into a full unfiltered scan — strictly worse than the malformed query being refused. On top of that, every `Build` **re-screens** the clause list, sort and projection it is about to render, which catches a hostile name that never went through the DSL at all (`AddFilter`, `SetSort`, `SetSelectFields`); state set after the last `Build` is screened by the next one. A panic while screening — the application's naming func runs over attacker-chosen names — becomes an ordinary refusal rather than escaping.
-
-One limit worth knowing: a refusal caused *only* by a hostile `sort=`/projection entry is self-healing, because the guard strips the offending entry, so a second `Build` on the same instance runs the remainder of the query rather than `1=0`. One request means one `Build`, so this matters only if you build twice.
-
-**Options** (all chainable):
-
-| Method | Default | Effect |
-| --- | --- | --- |
-| `AllowFields(names...)` | none | Restrict every position — filter fields, sort keys, select fields **and preload relation names** — to these names. Matches in both spellings (`AllowFields("City")` accepts `city=` under snake_case, and `AllowFields("median_price")` accepts `medianPrice=`), and a qualified name by its bare column. Applies to DSL input only, so a `ScopePlugin`'s injected column does not have to be listed. |
-| `AllowUnicodeIdentifiers(bool)` | `false` | Accept any Unicode letter. Still refuses combining marks, format characters and bidi overrides — but not homoglyphs, so pair it with `AllowFields`. |
-| `RejectParseDiagnostics(bool)` | `true` | Treat a parser diagnostic as a rejection. A dropped conjunct *widens*: `a b=1` renders `` WHERE `b` = ? `` with the `a` silently gone. Behaviour-neutral diagnostics are never a rejection either way — a blank list part (`<in>[1,2,]`, which the README documents as skipped) and an unconditioned `load=[Orders:]`. |
-| `AllowExtraRunes(runes)` | none | Extra characters allowed inside a segment, e.g. `"-@"` for Mongo/ES field names. A hard floor still applies: the three quote runes, `;` and every control byte are refused whatever is listed. It is a floor, not a list of everything dangerous — admitting `-` also admits `x--`, which the adapters render backtick-quoted and inert. |
-| `AllowNumericSegments(bool)` | `false` | Permit an all-digit segment (`meta.tags.0`). Keep it off on SQL — that is the reported bug's shape. |
-| `ScreenCustomExpr(bool)` | `false` | Screen `CustomExpr.Field`. Exempt by default because its handler receives the field verbatim and owns its own quoting, exactly as the SQL adapters treat it — and no DSL can produce one. |
-| `SetMaxSegments(n)` / `SetMaxSegmentLength(n)` | 4 / 64 | Segments per identifier, characters per segment. |
-| `SetMaxLatched(n)` | 4096 | Bound on the table of recorded reasons (reporting only — the refusal itself is core's). |
-
-`CheckDSL(dsl, naming)` runs the same screen without a figo instance, for validating before you build. `Rejected(f)` reports what an instance was refused for — including the programmatic path, which has no error channel of its own since `AddFilter` returns nothing and a clause finalizer cannot fail a `Build`. `Release(f)` clears a refusal.
-
-> **Do not combine it with a `FieldsPlugin` whitelist.** The whitelist *prunes* a disallowed field and answers 200 over a wider set; this plugin *rejects*. Because `FieldsPlugin`'s `ExprFilter` runs before the guard sees the final clause list, a field the whitelist prunes is one the guard can no longer refuse. `AllowFields` covers every position the whitelist does, so use one or the other per instance.
-
-## Field safety: ignore lists & whitelist
-
-Because DSL usually comes from untrusted input, figo gives you two ways to constrain which fields a caller may filter on — both live on the `FieldsPlugin`. Register it **before** adding filters. Both prune the built AST — dropping a condition never leaves a dangling `and`/`or`/`not` behind, and both apply to DSL filters and to programmatic `AddFilter` clauses alike (the plugin implements the `ExprFilter` hook, which `Build` and `AddFilter` run on every expression entering the clause tree).
-
-**Ignore list** — silently drop specific fields:
-
-```go
-f := figo.New()
-fp := plugins.NewFieldsPlugin()
-fp.AddIgnoreFields("password", "internal_notes")
-f.RegisterPlugin(fp)
-
-f.AddFiltersFromString(`name="x" and password="y"`)
-f.Build(adapters.RawAdapter{})
-// only name survives
-```
-
-Ignore names match both the raw and naming-converted spelling, so `AddIgnoreFields("user_name")` also blocks `userName` under the snake_case strategy.
-
-**Whitelist** — allow *only* listed fields:
-
-```go
-fp := plugins.NewFieldsPlugin()
-fp.SetAllowedFields("name", "age", "status")
-fp.EnableFieldWhitelist()
-f.RegisterPlugin(fp)
-
-f.AddFiltersFromString(`name="x" and secret="y"`) // secret is dropped
-f.Build(adapters.RawAdapter{})
-
-// Also on the plugin: DisableFieldWhitelist(), IsFieldAllowed(field), IsFieldWhitelistEnabled(), GetAllowedFields()
-```
-
-Like ignore names, whitelist names match both the raw and naming-converted spelling — `SetAllowedFields("userName")` allows the parsed `user_name` field under the default snake_case strategy.
-
-**Select fields** — restrict returned columns (SQL `SELECT`, ES `_source`). Selects are projection state consumed by the adapters, so they stay on the instance itself:
-
-```go
-f.AddSelectFields("id", "name", "email")
-```
-
-## Query complexity limits
-
-`LimitsPlugin` guards against pathological untrusted DSL: once registered, every `AddFiltersFromString` call is measured and fails when a limit is exceeded. A zero value disables that particular limit.
-
-```go
-lp := plugins.NewLimitsPlugin(plugins.DefaultQueryLimits()) // nesting 10, filter fields 50, params 100, expressions 200, sort columns 32
-f.RegisterPlugin(lp)
-
-err := f.AddFiltersFromString(hugeUntrustedDSL)
-// e.g. "plugin figo-limits AfterParse error: query exceeds MaxParameterCount: 250 > 100"
-```
-
-**Nesting depth counts logical nesting as a user reads the query**, not parser
-tree levels: a bare condition or one flat connector chain
-(`a=1 and b=2 and ... and z=9`, any length) is depth 1, and each embedded
-group of a *different* connector adds a level — `a=1 and (b=2 or c=3)` is
-depth 2. Field/parameter/expression counts are what they say.
-
-Limits are measured after any registered field pruning, i.e. on the query that would actually run — including clauses a `ScopePlugin` injects.
-
-## Mandatory scopes (multi-tenant)
-
-`ScopePlugin` guarantees that server-side filters are present in **every** built query — the row-level-security pattern for multi-tenant apps. The scope is injected at the end of every `Build`, including a build with no filters at all, so an unfiltered query cannot escape it; it's injected after whitelist pruning, so callers can't strip it either.
-
-```go
-sp := plugins.NewScopePlugin(figo.EqExpr{Field: "tenant_id", Value: tenantID})
-f.RegisterPlugin(sp)
-
-f.AddFiltersFromString(untrustedDSL) // whatever the caller sends...
-f.Build(adapters.RawAdapter{})
-// ...the rendered WHERE always includes AND `tenant_id` = ?
-```
-
-Multiple scopes are ANDed in; `sp.AddScope(...)` adds more. Rebuilds never duplicate an already-present scope.
-
-> **Security note — preloads are NOT scoped by default.** The scope guards the top-level query only. A relation pulled in with `load=[Orders:...]` is fetched by a separate query on GORM (and is an unfiltered array on Mongo), so a child row belonging to another tenant comes back inside a correctly scoped parent. Which column scopes a child table is a property of that table and is not inferred from the parent — register it explicitly with `sp.AddPreloadScope("Orders", figo.EqExpr{Field: "tenant_id", Value: tenantID})`, or `sp.AddPreloadScopeAll(...)` to apply conditions to every preloaded relation.
->
-> **Preload scopes are keyed by the exact relation label.** `AddPreloadScope` does a byte-exact lookup, so a scope registered for `"Items"` does **not** apply when the same relation is reached as `Orders.Items` — register it under every path spelling the DSL can produce, or use `AddPreloadScopeAll`, which covers every segment of every path. Nothing warns when a path segment has no registered scope.
->
-> **Nested (dotted) preload paths are refused by default.** `load=[Orders.Items:...]` is a *path* through the association graph, not a longer relation name, so it can reach relations the application never named — and a relation nobody named cannot have had a scope registered for it. `BuildE` reports it and the relation is not preloaded at all. Turn it on with `f.SetAllowNestedPreloads(true)` when the DSL is authored by something you trust, or when `AddPreloadScopeAll` covers every reachable relation. With it on, figo registers every prefix of a dotted label as a relation in its own right (on GORM, the only adapter that treats the label as a path), so a scope registered for `"Orders"` reaches the intermediate query GORM would otherwise issue unscoped. Paths deeper than 8 relations are refused regardless.
-
-## Auditing
-
-`AuditPlugin` records every parsed DSL and every rendered statement — for compliance logs and "what did it actually run?" debugging. Entries go to an optional `log/slog` logger and a bounded in-memory history (on cached paths, only real renders are recorded — not cache hits).
-
-The history is bounded on two axes — the entry count you pass, and a byte budget — because an entry holds the caller's own DSL and the hooks run before the parser's size cap. A recorded DSL or result longer than 4096 bytes is stored as a prefix ending `… (truncated, N bytes total)`.
-
-```go
-ap := plugins.NewAuditPlugin(slog.Default(), 100) // nil logger = history only; size 0 = log only
-f.RegisterPlugin(ap)
-
-// ... parse and render ...
-for _, e := range ap.History() { // oldest first
-	fmt.Println(e.At, e.Kind, e.DSL, e.Result)
-}
-```
-
-## Naming
-
-By default figo converts DSL field names to `snake_case` (so `userName` → `user_name`). Naming is a single `NamingFunc` — pick a built-in or supply your own; it applies to the DSL and every adapter's column normalization (they never disagree).
-
-```go
-f.SetNamingFunc(figo.NoChangeNaming)  // keep names verbatim
-f.SetNamingFunc(figo.SnakeCaseNaming) // default
-
-// Or any custom function:
-f.SetNamingFunc(func(field string) string {
-	return "t_" + field
-})
-
-f.SetNamingFunc(nil) // reset to the default (SnakeCaseNaming)
-```
-
-The regex SQL operator for `=~`/`!=~` has a per-adapter home:
-
-- **Raw adapter**: comes from the dialect — `REGEXP` on MySQL/SQLite, `~` on Postgres. Customize by copying a dialect (`pg := *adapters.PostgresDialect; pg.RegexOperator = "~*"`).
-- **GORM adapter**: uses the **package-level** setting (process-wide, safe to change concurrently):
-
-```go
-figo.SetRegexSQLOperator("REGEXP") // MySQL / SQLite (default)
-figo.SetRegexSQLOperator("~")      // PostgreSQL, case-sensitive
-figo.SetRegexSQLOperator("~*")     // PostgreSQL, case-insensitive
-op := figo.GetRegexSQLOperator()
-```
-
-## Inspecting & transforming the AST
-
-**`Explain()`** renders the parsed AST as an indented tree — handy for debugging precedence/grouping without a database:
-
-```go
-f.AddFiltersFromString(`id=1 and (age>20 or active=true)`)
-f.Build(adapters.RawAdapter{})
-fmt.Println(f.Explain())
-// AND
-//  ├── id = 1
-//  └── OR
-//      ├── age > 20
-//      └── active = true
-```
-
-Strings are quoted in the output so `name = "john"` is visually distinct from `active = true`; multiple top-level clauses appear under a synthetic `AND` root (matching how the builders combine them); an unparsed instance yields `(no filters)`.
-
-**`Clone()`** deep-copies an instance (clauses, preloads, and nested operand slices are independent — mutating the clone never affects the original).
-
-**`Walk(visit)`** traverses every clause and preload, letting you rewrite nodes in place. The visitor receives a pointer to each node; use `NodeField` / `SetNodeField` to read and rewrite field names generically. `Walk` rebuilds operand slices rather than mutating shared ones, and runs your visitor outside its internal lock (so a visitor may call other `Figo` methods safely).
-
-```go
-// Qualify every field with a table prefix
-f.Walk(func(n figo.Expr) {
-	if field, ok := figo.NodeField(n); ok {
-		figo.SetNodeField(n, "users."+field)
-	}
-})
-```
-
-Dotted names are first-class on every adapter: the SQL adapters quote each
-segment (`users.first_name` renders `` `users`.`first_name` `` on MySQL,
-`"users"."first_name"` on PostgreSQL — a real table-qualified reference, with
-injection hardening intact), and MongoDB/Elasticsearch treat them as document
-paths.
-
-A package-level `figo.Walk(expr, visit)` is also available for traversing a standalone `Expr` tree (it returns the rewritten expression).
-
-## Caching
-
-Caching ships as a plugin, not core figo state: a `CachePlugin` caches rendered SQL/query results keyed by the full instance state (DSL, clauses, page, sort, field sets, naming, adapter type, regex operator, context). One plugin can serve many `Figo` instances.
-
-```go
-cp := plugins.NewCachePlugin(plugins.CacheConfig{
-	Enabled:         true,
-	TTL:             5 * time.Minute,
-	MaxSize:         1000,          // 0 = unlimited; LRU eviction at capacity
-	CleanupInterval: time.Minute,   // background expiry sweep
-})
-
-sql := cp.GetCachedSqlString(f, adapters.RawContext{Table: "users"})
-q := cp.GetCachedQuery(f, adapters.RawContext{Table: "users"})
-
-stats := cp.Stats() // hits, misses, size, hit rate
-cp.Clear()
-cp.Close()          // stops the owned cache's cleanup goroutine
-
-// Or inject your own implementation of the QueryCache interface:
-cp.SetCache(myCache)   // GetCache() / GetConfig() read the current state
-```
-
-Cache keys are type-aware — `a = int64(1)` and `a = "1"` never collide even when instances share a cache. A cache the plugin created itself stops its background goroutine when it's replaced, `Close`d, or when the plugin is garbage-collected. `NewInMemoryCache(config)` is available if you want to manage one directly (call `Stop()` when done).
-
-> **The render context has to be keyable by *contents*, and a `*gorm.DB` is not.**
-> The key includes the ctx, so the plugin has to fingerprint it. When it cannot do
-> that soundly — over its 64-node budget, deeper than 10 levels, or holding a
-> non-nil func/chan/unsafe pointer — it **bypasses the cache entirely**: no `Get`,
-> no `Set`, the render goes straight through. A `*gorm.DB` is exactly that case (a
-> graph of thousands of nodes, mostly mutable connection-pool state), so
-> **`CachePlugin` caches nothing on the GORM path** and `Stats()` stays at zero
-> there. That is a deliberate fail-safe: the alternative is keying on where the
-> value lives, which served the wrong table whenever an address was reused.
-> `RawContext`, a table-name string, and `nil` all fingerprint fine.
->
-> Worth pairing with the caveat in [Plugins](#plugins): a cache **hit** skips
-> `BeforeQuery`, so a plugin that vetoes a render is not consulted for a cached
-> result.
-
-## Performance monitoring
-
-Monitoring ships as a plugin, not core figo state: a `MetricsPlugin` wraps a `PerformanceMonitor` you attach to whatever produces metrics — typically the `CachePlugin`.
-
-```go
-mp := plugins.NewMetricsPlugin(true)
-
-cp := plugins.NewCachePlugin(plugins.CacheConfig{Enabled: true, TTL: time.Minute})
-cp.SetPerformanceMonitor(mp.PerformanceMonitor)
-
-// ... render through cp ...
-
-m := mp.GetMetrics()
-// m.QueryCount, m.CacheHits, m.CacheMisses, m.AverageLatency, m.ErrorCount, ...
-mp.Reset()
-```
-
-The cache plugin's `GetCachedSqlString` / `GetCachedQuery` record latency and hit/miss outcomes into the attached monitor. A bare `plugins.NewPerformanceMonitor(true)` works too, and you can record manually via `mon.RecordQuery(latency, cacheHit, err)`.
+- **Preloads:** GORM fetches children without removing parents. MongoDB filters the joined array and removes parents with no matching child when a child filter exists. Raw SQL exposes child predicates for you to execute. Elasticsearch rejects preloads.
+- **Nulls:** SQL nulls and document-store null/missing fields differ, especially under negation and list membership. Use explicit `<null>` / `<notnull>` checks where the distinction matters.
+- **Advanced expressions:** JSON paths, array containment/overlap, full-text search, and geo distance are programmatic features for MongoDB and Elasticsearch. SQL adapters return unsupported-expression errors.
+- **Custom SQL:** `CustomExpr` works on raw SQL and GORM. Its handler owns identifier quoting and must return SQL with bind arguments. Document adapters reject it.
 
 ## Plugins
 
-Register plugins to hook into the parse, build, and render pipelines. Each plugin implements `Name`, `Version`, `Initialize`, `BeforeParse`, `AfterParse`, `BeforeQuery`, `AfterQuery` — and may optionally implement the `ExprFilter` hook (per-expression transform/prune; see [Field safety](#field-safety-ignore-lists--whitelist)) and/or the `ClauseFinalizer` hook (whole-clause-list transform at the end of every `Build`; see [Mandatory scopes](#mandatory-scopes-multi-tenant)).
+Register policies **before** `AddFiltersFromString`. Import `github.com/bi0dread/figo/v4/plugins`.
+
+| Plugin | Use it to |
+|---|---|
+| `InjectionGuardPlugin` | Reject invalid identifiers; restrict DSL fields with `AllowFields` |
+| `FieldsPlugin` | Prune ignored or non-whitelisted fields from filters, sort, and explicit projections |
+| `LimitsPlugin` | Bound nesting, fields, parameters, expressions, and sort columns |
+| `ValidationPlugin` | Validate field values with rules or custom handlers |
+| `ScopePlugin` | Add mandatory root conditions at build time; configure child scopes separately |
+| `SyntaxPlugin` | Check syntax; enable input repair only when intended |
+| `CachePlugin` | Cache rendered queries, not database results |
+| `MetricsPlugin` | Record measurements through its monitor, including attached cache activity |
+| `AuditPlugin` | Record parse attempts and rendered queries |
+
+For a tenant-scoped query, register the scope using an identity from your application:
 
 ```go
-f.RegisterPlugin(myPlugin)   // Initialize is called; rolled back if it errors
-f.UnregisterPlugin("my-plugin")
+scope := plugins.NewScopePlugin(figo.EqExpr{Field: "tenant_id", Value: tenantID})
+scope.AddPreloadScope("Orders", figo.EqExpr{Field: "tenant_id", Value: tenantID})
+
+for _, p := range []figo.Plugin{
+	plugins.NewInjectionGuardPlugin(),
+	plugins.NewLimitsPlugin(plugins.DefaultQueryLimits()),
+	scope,
+} {
+	if err := f.RegisterPlugin(p); err != nil {
+		return err
+	}
+}
+// Now call AddFiltersFromString, BuildE, and the adapter helper.
 ```
 
-All hooks fire automatically:
+`AddPreloadScope` matches exact relation labels. Use `AddPreloadScopeAll` only when the same condition fits each child model. Keep the nested-preload and MongoDB alias limitations above in mind.
 
-- `BeforeParse` / `AfterParse` inside `AddFiltersFromString` (`BeforeParse` can rewrite the DSL; an error from either **refuses the instance** — see [rejection narrows](#a-rejection-narrows) — so a rejected DSL is never left armed for a later `Build`, even if the caller ignores the error).
+Default complexity limits: nesting **10**, filter fields **50**, parameters **100**, expressions **200**, sort columns **32**. Zero or negative values disable a limit. Measurement includes preload filters and runs after field pruning, excluding injected scopes.
 
-### A rejection narrows
+`FieldsPlugin` drops disallowed conditions; use `InjectionGuardPlugin.AllowFields` when you want rejection instead. Set returned fields with `f.SetSelectFields("id", "name")`: registering a field policy alone does not replace the default `SELECT *`.
 
-When a plugin's `BeforeParse` or `AfterParse` rejects a DSL, figo drops the DSL **and replaces the clause list with the never-true clause**. Every later `Build` on that instance renders `1=0` / `{"$nor":[{}]}` / `match_none` until it is given a DSL that parses acceptably; `AddFiltersFromString("")` does not reopen it, and `Clone` deep-copies the refusal.
+Query hooks wrap `f.GetQuery` / `f.GetSqlString`, not direct adapter helpers. Cache hits skip those hooks, so keep per-request authorization outside the cache. GORM contexts bypass caching. Treat cached MongoDB/Elasticsearch results as read-only, and close owned cache plugins when finished.
 
-This is a change of behaviour, and the reason for it is that the alternative was backwards. A rejection used to restore the *previous* DSL, so a caller that ignored the error ran an older, broader query than the one it had just been refused — and on a fresh per-request instance, where the previous DSL is none at all, refusing a filter produced a completely **unfiltered** query. Refusing a malformed request must never return more rows than granting it would have.
+`GetPluginManager()` is never nil. Use `ListPlugins()` to inspect registrations. See the [plugin guide](PLUGIN_SYSTEM_GUIDE.md) for hook interfaces and configuration examples.
 
-It applies to every rejecting plugin — `ValidationPlugin`, `LimitsPlugin`, `SyntaxPlugin` and `InjectionGuardPlugin` alike — and it is done in core because nothing a plugin can reach is safe: an expression added through `AddFilter` is deleted by a registered `FieldsPlugin` policy, and a verdict remembered per instance is lost by `Clone`.
-- `FilterExpr` (optional) on every expression entering the clause tree — `Build` and `AddFilter` alike.
-- `FinalizeClauses` (optional) once at the end of every `Build`, even one with no filters.
-- `BeforeQuery` / `AfterQuery` around every `GetSqlString` / `GetQuery` render. A `BeforeQuery` error vetoes the render (`""` / `nil` is returned); an `AfterQuery` error vetoes the rendered result the same way — useful for authorization, auditing, and logging. On the cached paths (`CachePlugin.GetCached*`) they fire on misses, when a render actually happens, not on hits.
+## Programmatic filters
 
-Hooks run on a snapshot outside the manager's lock, so a hook may call back into the manager without deadlocking. Query hooks must not render through the same instance (that would recurse).
-
-**Nine built-in plugins** cover the common policies — each documented in its own section above: [`SyntaxPlugin`](#input-validation--repair), [`FieldsPlugin`](#field-safety-ignore-lists--whitelist), [`LimitsPlugin`](#query-complexity-limits), [`ValidationPlugin`](#validation), [`ScopePlugin`](#mandatory-scopes-multi-tenant), [`InjectionGuardPlugin`](#rejecting-nonsense-identifiers-injection-guard), [`CachePlugin`](#caching), [`MetricsPlugin`](#performance-monitoring), [`AuditPlugin`](#auditing).
-
-See [PLUGIN_SYSTEM_GUIDE.md](PLUGIN_SYSTEM_GUIDE.md) for a full walkthrough with example plugins.
-
-## Validation
-
-Validation ships as a plugin, not core figo state: create a `ValidationPlugin`, attach rules to fields, and register it on the instance. Built-in validators include `required`, `min_length`, and `email`.
+Use typed Go values with `AddFilter`:
 
 ```go
-vp := plugins.NewValidationPlugin()
-vp.RegisterValidator(plugins.EmailValidator{})
-vp.AddRule(plugins.ValidationRule{Field: "email", Rule: "email", Message: "invalid email"})
-f.RegisterPlugin(vp)
-
-// Once registered, every AddFiltersFromString call is validated via the
-// AfterParse hook — parsing fails on the first rule violation:
-err := f.AddFiltersFromString(`email="not-an-email"`) // error
-
-// One-off checks work directly on the plugin:
-if err := vp.Validate("email", "not-an-email"); err != nil {
-	// handle
+f := figo.New()
+f.AddFilter(figo.EqExpr{Field: "status", Value: "active"})
+f.AddFilter(figo.InExpr{Field: "role", Values: []any{"admin", "editor"}})
+if err := f.BuildE(adapters.RawAdapter{}); err != nil {
+	return err
 }
 ```
 
-Rule handlers run on a snapshot (a handler may safely call back into the plugin). The former core validation manager (`NewValidationManager`, `SetValidationManager`, `AddValidationRule`, `RegisterValidator`, `ValidateField` on `Figo`) has been removed in favor of this plugin.
+Top-level expressions combine with AND. Use `AndExpr`, `OrExpr`, and `NotExpr` to group them; a multi-operand `NotExpr` means `NOT (a OR b)`.
 
-## Input validation & repair
+**Mixing DSL and Go expressions:** add programmatic filters after `BuildE`. Rebuilding a non-empty DSL replaces them. Put mandatory conditions in `ScopePlugin` so they survive rebuilds.
 
-`AddFiltersFromString` stores input as-is. Syntax validation (and optional auto-repair) ships as a plugin: register a `SyntaxPlugin` and its `BeforeParse` hook validates every DSL before parsing.
+| Task | API |
+|---|---|
+| Preserve field spelling | `f.SetNamingFunc(figo.NoChangeNaming)` before adding filters |
+| Select returned fields | `f.SetSelectFields("id", "name")` before building |
+| Set pagination | `f.SetPage(skip, take)`; apply server caps after building |
+| Inspect the AST | `f.Explain()` / `f.GetClauses()` / `f.GetPreloads()` |
+| Copy query state | `f.Clone()`; plugins and adapters remain shared |
+| Rewrite expressions | `f.Walk(...)` with `figo.NodeField` / `figo.SetNodeField` |
 
-```go
-// Strict: reject malformed DSL with a structured error
-f.RegisterPlugin(plugins.NewSyntaxPlugin(false))
-err := f.AddFiltersFromString(`name = = 5`) // *figo.ParseError (wrapped)
+Default naming converts `userName` to `user_name` and preserves dotted paths. Pass original field names to `AddFilter` and `SetSort`; pre-converting can apply a custom naming function twice.
 
-// Repair mode: fix common malformations first, validate what remains
-f2 := figo.New()
-f2.RegisterPlugin(plugins.NewSyntaxPlugin(true))
-err = f2.AddFiltersFromString(`(name="john" and age>25`) // adds missing ')'
+Implement `figo.Adapter` for another backend, or `figo.Plugin` and its optional hooks for another policy. Inspect the exported interfaces with `go doc github.com/bi0dread/figo/v4`.
 
-// Structured errors
-var perr *figo.ParseError
-if errors.As(err, &perr) {
-	fmt.Printf("%s at line %d col %d\n", perr.Message, perr.Line, perr.Column)
-}
+## Development
+
+```sh
+go test ./...
+go test -race ./...
+go vet ./...
 ```
 
-Repairs cover unmatched parentheses/quotes/brackets and dangling trailing/leading `and`/`or`. A leading `not` is **not** treated as malformed and is never stripped. Repair means querying something other than what the caller literally sent — enable it deliberately.
+The tests use in-memory SQLite and MongoDB/Elasticsearch query assertions; no live database services are required.
 
-## Concurrency
-
-A `Figo` instance is guarded by an internal `sync.RWMutex`, and the ancillary collaborators (the plugin manager and each built-in plugin) carry their own locks. Read-render methods (`GetSqlString`, `GetQuery`, the cache plugin's `GetCached*`) are safe to call concurrently after `Build`, plugin hooks and expression filters run outside the instance lock (so they may call back into read methods), and the package is race-clean under `go test -race`.
-
-For concurrent **writers** — multiple goroutines calling `AddFiltersFromString`/`Build` on the *same* instance — prefer giving each goroutine its own instance (or a `Clone()`), since those mutate shared builder state. The safe, common pattern:
-
-```go
-base := figo.New()
-base.AddFiltersFromString(`status="active"`)
-base.Build(adapters.RawAdapter{})
-
-var wg sync.WaitGroup
-for i := 0; i < 10; i++ {
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		// concurrent reads on the same built instance are safe
-		_ = base.GetSqlString(adapters.RawContext{Table: "users"})
-	}()
-}
-wg.Wait()
-```
-
-## Testing
-
-```bash
-go test ./...            # unit + adapter tests
-go test -race ./...      # race detector
-```
-
-No live databases are needed: the MongoDB adapter tests use the BSON encoder directly, the Elasticsearch adapter tests assert on the generated query JSON, and the GORM tests run against in-memory SQLite. Tests are split across the three packages — core behavior in the root (`figo_test`), adapter rendering in `adapters/`, plugin behavior and integration in `plugins/`.
-
-Runnable usage examples live in [examples/example_usage.go](examples/example_usage.go) (currently Elasticsearch-focused; the Quick start and adapter sections above cover the other backends).
-
-## Status of features
-
-Fully wired end-to-end: the DSL and all operators above, the four adapters (raw SQL with MySQL/PostgreSQL/SQLite dialects), select-field control, naming funcs, pagination/sort/preloads, the `Explain`/`Clone`/`Walk` AST tools, the full plugin hook surface (parse, expression-filter, clause-finalizer, and query hooks), and the nine built-in plugins: `SyntaxPlugin` (validation & repair), `FieldsPlugin` (ignore/whitelist), `LimitsPlugin` (complexity limits), `ValidationPlugin` (value rules), `ScopePlugin` (mandatory filters), `InjectionGuardPlugin` (identifier screening), `CachePlugin`, `MetricsPlugin`, and `AuditPlugin`.
-
-Advanced expression types (programmatic `AddFilter` only — no DSL syntax) render on the document-store adapters:
-
-- **MongoDB**: `JsonPathExpr` → dotted-path match (`data.user.name`), `ArrayContainsExpr` → `$all`, `ArrayOverlapsExpr` → `$in`, `FullTextSearchExpr` → `$text`/`$search` (top-level only; rejected inside preload matches), `GeoDistanceExpr` → `$geoWithin`/`$centerSphere` with km/m/mi unit conversion to radians. The adapter also converts valid hex-string values to `primitive.ObjectID` on `_id` by default — configure with `MongoAdapter{ObjectIDFields: []string{"_id", "user_id"}}` (an explicit empty slice disables it).
-- **Elasticsearch**: `JsonPathExpr` → dotted-field `term`/`range`/`exists`, `ArrayContainsExpr` → `bool.must` of per-value `term`s, `ArrayOverlapsExpr` → `terms`, `FullTextSearchExpr` → `match` (or `multi_match` when no field is set; `Language` becomes the analyzer), `GeoDistanceExpr` → `geo_distance` with km/m/mi units.
-
-`CustomExpr` renders on the **SQL adapters** (raw SQL and GORM): its handler receives the field verbatim plus the operator and value, and returns a SQL fragment with `?` placeholders and bind args. The Mongo and Elasticsearch adapters reject it — its output is a SQL fragment.
-
-Partial / not yet wired (defined in the API but without adapter support):
-
-- Advanced expression types on the **SQL adapters** (raw SQL and GORM) — these return an "unsupported expression" error rather than rendering. Nothing is silently dropped: the raw `Build*` helpers return the error, `RawAdapter` fails the render (`ok=false`), and `ApplyGorm` records it on the `*gorm.DB` so the query never executes.
-
-
-## Playground
-
-Try the DSL in the browser — a drag-and-drop query builder that generates figo DSL live:
-**<https://bi0dread.github.io/figo/>** (source in [playground/](playground/)).
-
-[![figo playground — drag-and-drop DSL builder](playground/screenshot.png)](https://bi0dread.github.io/figo/)
-
-## License
-
-BSD 2-Clause. See [LICENSE](LICENSE).
+- [Runnable Elasticsearch examples](examples/example_usage.go)
+- [Plugin guide](PLUGIN_SYSTEM_GUIDE.md)
+- [Live visual query builder](https://bi0dread.github.io/figo/) and [playground setup](playground/README.md)
+- [BSD 2-Clause license](LICENSE)
